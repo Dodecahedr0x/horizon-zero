@@ -30,8 +30,8 @@ pub const MAGIC_PROGRAM: Pubkey = Pubkey::new_from_array(ephemeral_rollups_sdk::
 /// Queues the rollup's commits. Unchecked under LiteSVM.
 #[cfg(not(feature = "inline-mock-magic"))]
 pub const MAGIC_CONTEXT: Pubkey = Pubkey::new_from_array(ephemeral_rollups_sdk::consts::MAGIC_CONTEXT_ID.to_bytes());
-/// Owns a delegated account's Solana copy. LiteSVM delegates nothing.
-#[cfg(not(feature = "inline-mock-magic"))]
+/// Owns a delegated account's Solana copy. LiteSVM delegates nothing, but the hand-read of Config
+/// accepts this owner in both builds, so the tests can stand in for a delegated Config.
 pub const DELEGATION_PROGRAM: Pubkey =
     Pubkey::new_from_array(ephemeral_rollups_sdk::consts::DELEGATION_PROGRAM_ID.to_bytes());
 
@@ -41,17 +41,20 @@ fn program_identity_bump() -> u8 {
 }
 
 // `#[ephemeral]` adds `process_undelegation`, which the delegation program calls on Solana to hand
-// an undelegated account back to this program. LiteSVM delegates nothing.
+// an undelegated account back to this program. Compiled out under inline-mock-magic: LiteSVM has no
+// delegation program.
 #[cfg_attr(not(feature = "inline-mock-magic"), ephemeral)]
 #[program]
 pub mod horizon_zero {
     use super::*;
 
-    pub fn initialize(ctx: Context<Initialize>, fee_bps: u16) -> Result<()> {
+    /// `validator` is the rollup validator every delegate instruction delegates to. Nothing changes it.
+    pub fn initialize(ctx: Context<Initialize>, fee_bps: u16, validator: Pubkey) -> Result<()> {
         require!(fee_bps <= fees::MAX_FEE_BPS, HorizonError::FeeTooHigh);
         ctx.accounts.config.admin = ctx.accounts.admin.key();
         ctx.accounts.config.fee_bps = fee_bps;
         ctx.accounts.config.fees = 0;
+        ctx.accounts.config.validator = validator;
         ctx.accounts.config.bump = ctx.bumps.config;
         let (identity, bump) = Pubkey::find_program_address(&[b"identity"], &ID);
         require_keys_eq!(identity, ctx.accounts.identity.key(), HorizonError::BadPda);
@@ -80,8 +83,7 @@ pub mod horizon_zero {
         cols: u8,
         rows: u8,
     ) -> Result<()> {
-        let admin = config_admin(&ctx.accounts.config)?;
-        require_keys_eq!(admin, ctx.accounts.admin.key(), HorizonError::NotAdmin);
+        require_admin(&ctx.accounts.config, &ctx.accounts.admin.key())?;
         let board = Geometry { cols: cols as i32, rows: rows as i32 };
         require!(board.playable(), HorizonError::BadGrid);
         let ground = &mut ctx.accounts.battleground;
@@ -406,8 +408,7 @@ pub mod horizon_zero {
 
     /// Solana, admin only: creates the treasury Outbox `[b"outbox", config]`, which pays the admin.
     pub fn init_treasury_outbox(ctx: Context<InitTreasuryOutbox>) -> Result<()> {
-        let admin = config_admin(&ctx.accounts.config)?;
-        require_keys_eq!(admin, ctx.accounts.admin.key(), HorizonError::NotAdmin);
+        require_admin(&ctx.accounts.config, &ctx.accounts.admin.key())?;
         ctx.accounts.outbox.owner = ctx.accounts.admin.key();
         ctx.accounts.outbox.amount = 0;
         ctx.accounts.outbox.bump = ctx.bumps.outbox;
@@ -449,78 +450,75 @@ pub mod horizon_zero {
         Ok(())
     }
 
-    /// Solana: delegates the owner's Player to the rollup validator `validator`.
+    /// Solana: delegates the owner's Player to Config's rollup validator.
     #[cfg(not(feature = "inline-mock-magic"))]
-    pub fn delegate_player(ctx: Context<DelegatePlayer>, validator: Pubkey) -> Result<()> {
+    pub fn delegate_player(ctx: Context<DelegatePlayer>) -> Result<()> {
+        let config = read_config(&ctx.accounts.config)?;
         require_owned(&ctx.accounts.player)?;
         let owner = ctx.accounts.owner.key();
-        ctx.accounts.delegate_player(&ctx.accounts.owner, &[b"player", owner.as_ref()], delegation(validator))?;
+        ctx.accounts.delegate_player(&ctx.accounts.owner, &[b"player", owner.as_ref()], delegation(&config))?;
         Ok(())
     }
 
-    /// Solana: delegates the owner's Outbox to `validator`, before each withdrawal. An Outbox that
+    /// Solana: delegates the owner's Outbox to Config's rollup validator, before each withdrawal. An Outbox that
     /// still holds an unreleased withdrawal is refused, so the payment is not locked back into the
     /// rollup.
     #[cfg(not(feature = "inline-mock-magic"))]
-    pub fn delegate_outbox(ctx: Context<DelegateOutbox>, validator: Pubkey) -> Result<()> {
+    pub fn delegate_outbox(ctx: Context<DelegateOutbox>) -> Result<()> {
+        let config = read_config(&ctx.accounts.config)?;
         require!(read_outbox(&ctx.accounts.outbox)?.amount == 0, HorizonError::OutboxBusy);
         let owner = ctx.accounts.owner.key();
-        ctx.accounts.delegate_outbox(&ctx.accounts.owner, &[b"outbox", owner.as_ref()], delegation(validator))?;
+        ctx.accounts.delegate_outbox(&ctx.accounts.owner, &[b"outbox", owner.as_ref()], delegation(&config))?;
         Ok(())
     }
 
-    /// Solana, admin only: delegates Config to `validator`.
+    /// Solana, admin only: delegates Config to its own rollup validator.
     #[cfg(not(feature = "inline-mock-magic"))]
-    pub fn delegate_config(ctx: Context<DelegateConfigAccount>, validator: Pubkey) -> Result<()> {
-        let admin = config_admin(&ctx.accounts.config)?;
-        require_keys_eq!(admin, ctx.accounts.admin.key(), HorizonError::NotAdmin);
+    pub fn delegate_config(ctx: Context<DelegateConfig>) -> Result<()> {
+        let config = require_admin(&ctx.accounts.config, &ctx.accounts.admin.key())?;
         require_owned(&ctx.accounts.config)?;
-        ctx.accounts.delegate_config(&ctx.accounts.admin, &[b"config"], delegation(validator))?;
+        ctx.accounts.delegate_config(&ctx.accounts.admin, &[b"config"], delegation(&config))?;
         Ok(())
     }
 
-    /// Solana, admin only: delegates battleground `battleground_id` to `validator`.
+    /// Solana, admin only: delegates battleground `battleground_id` to Config's rollup validator.
     #[cfg(not(feature = "inline-mock-magic"))]
-    pub fn delegate_battleground(
-        ctx: Context<DelegateBattleground>,
-        battleground_id: u8,
-        validator: Pubkey,
-    ) -> Result<()> {
-        let admin = config_admin(&ctx.accounts.config)?;
-        require_keys_eq!(admin, ctx.accounts.admin.key(), HorizonError::NotAdmin);
+    pub fn delegate_battleground(ctx: Context<DelegateBattleground>, battleground_id: u8) -> Result<()> {
+        let config = require_admin(&ctx.accounts.config, &ctx.accounts.admin.key())?;
         require_owned(&ctx.accounts.battleground)?;
         let seeds: &[&[u8]] = &[b"battleground", &[battleground_id]];
-        ctx.accounts.delegate_battleground(&ctx.accounts.admin, seeds, delegation(validator))?;
+        ctx.accounts.delegate_battleground(&ctx.accounts.admin, seeds, delegation(&config))?;
         Ok(())
     }
 
-    /// Solana, admin only: delegates the treasury Outbox to `validator`, before each claim. Same
+    /// Solana, admin only: delegates the treasury Outbox to Config's rollup validator, before each claim. Same
     /// rule as `delegate_outbox`: an unreleased claim is refused.
     #[cfg(not(feature = "inline-mock-magic"))]
-    pub fn delegate_treasury_outbox(ctx: Context<DelegateTreasuryOutbox>, validator: Pubkey) -> Result<()> {
-        let admin = config_admin(&ctx.accounts.config)?;
-        require_keys_eq!(admin, ctx.accounts.admin.key(), HorizonError::NotAdmin);
+    pub fn delegate_treasury_outbox(ctx: Context<DelegateTreasuryOutbox>) -> Result<()> {
+        let config = require_admin(&ctx.accounts.config, &ctx.accounts.admin.key())?;
         require!(read_outbox(&ctx.accounts.outbox)?.amount == 0, HorizonError::OutboxBusy);
-        let config = ctx.accounts.config.key();
-        ctx.accounts.delegate_outbox(&ctx.accounts.admin, &[b"outbox", config.as_ref()], delegation(validator))?;
+        let key = ctx.accounts.config.key();
+        ctx.accounts.delegate_outbox(&ctx.accounts.admin, &[b"outbox", key.as_ref()], delegation(&config))?;
         Ok(())
     }
 }
 
 /// A delegate instruction's account must be this program's: one that does not exist yet would be
-/// assigned to the delegation program empty, and one already delegated belongs to it.
+/// assigned to the delegation program empty, and one already delegated belongs to it. The seeds
+/// constraint's prefix (`player`, `config`, `battleground`) already says which type it is, and only
+/// this program creates accounts at those addresses, so no discriminator check is needed.
 #[cfg(not(feature = "inline-mock-magic"))]
 fn require_owned(info: &AccountInfo) -> Result<()> {
     require_keys_eq!(*info.owner, ID, HorizonError::BadPda);
     Ok(())
 }
 
-/// What every delegate instruction asks the delegation program for: the rollup validator the caller
-/// names (the SDK's default identity is not the local rollup's), and the SDK's default commit
-/// frequency.
+/// What every delegate instruction asks the delegation program for: the rollup validator pinned in
+/// Config (the SDK's default identity is not the local rollup's), and the SDK's default commit
+/// frequency, `u32::MAX` ms, so nothing schedules commits.
 #[cfg(not(feature = "inline-mock-magic"))]
-fn delegation(validator: Pubkey) -> ephemeral_rollups_sdk::cpi::DelegateConfig {
-    ephemeral_rollups_sdk::cpi::DelegateConfig { validator: Some(validator), ..Default::default() }
+fn delegation(config: &Config) -> ephemeral_rollups_sdk::cpi::DelegateConfig {
+    ephemeral_rollups_sdk::cpi::DelegateConfig { validator: Some(config.validator), ..Default::default() }
 }
 
 /// The shared step of `fund_outbox` and `fund_treasury_outbox`: moves `amount` from `source` to an
@@ -542,20 +540,24 @@ fn fill_outbox(
     Ok(())
 }
 
-/// Config's admin, read by hand for the instructions that run on Solana. Once Config is delegated,
-/// its Solana copy is owned by the delegation program, and a typed `Account<Config>` would refuse
-/// it; the data stays the same. The address must be the `[b"config"]` PDA.
-/// It trusts the last committed Config, which is sound only because `admin` never changes after
-/// `initialize`.
-fn config_admin(info: &AccountInfo) -> Result<Pubkey> {
-    #[cfg(not(feature = "inline-mock-magic"))]
-    let owned = *info.owner == ID || *info.owner == DELEGATION_PROGRAM;
-    #[cfg(feature = "inline-mock-magic")]
-    let owned = *info.owner == ID;
-    require!(owned, HorizonError::BadPda);
+/// Config read by hand, for the instructions that run on Solana. Once Config is delegated, its
+/// Solana copy is owned by the delegation program, and a typed `Account<Config>` would refuse it;
+/// the data stays the same. The owner must be this program or the delegation program, and the
+/// address the `[b"config"]` PDA.
+/// It trusts the last committed Config, which is sound only for the fields Solana reads, `admin` and
+/// `validator`, because nothing changes either after `initialize`.
+fn read_config(info: &AccountInfo) -> Result<Config> {
+    require!(*info.owner == ID || *info.owner == DELEGATION_PROGRAM, HorizonError::BadPda);
     let config = Config::try_deserialize(&mut &info.try_borrow_data()?[..])?;
     verify_pda(&[b"config"], &info.key(), config.bump)?;
-    Ok(config.admin)
+    Ok(config)
+}
+
+/// [`read_config`], and `signer` must be its admin.
+fn require_admin(info: &AccountInfo, signer: &Pubkey) -> Result<Config> {
+    let config = read_config(info)?;
+    require_keys_eq!(config.admin, *signer, HorizonError::NotAdmin);
+    Ok(config)
 }
 
 /// An Outbox read by hand: it must be owned by this program and carry the Outbox discriminator.
@@ -1157,7 +1159,7 @@ pub struct CreateBattleground<'info> {
     /// Must be Config's admin, checked in the handler.
     #[account(mut)]
     pub admin: Signer<'info>,
-    /// CHECK: read by hand (see `config_admin`), so it works whether or not Config is delegated
+    /// CHECK: read by hand (see `read_config`), so it works whether or not Config is delegated
     pub config: UncheckedAccount<'info>,
     #[account(
         init,
@@ -1354,7 +1356,7 @@ pub struct InitTreasuryOutbox<'info> {
     /// Must be Config's admin, checked in the handler.
     #[account(mut)]
     pub admin: Signer<'info>,
-    /// CHECK: read by hand (see `config_admin`), so it works whether or not Config is delegated
+    /// CHECK: read by hand (see `read_config`), so it works whether or not Config is delegated
     pub config: UncheckedAccount<'info>,
     #[account(init, payer = admin, space = 8 + Outbox::INIT_SPACE, seeds = [b"outbox", config.key().as_ref()], bump)]
     pub outbox: Account<'info, Outbox>,
@@ -1409,6 +1411,8 @@ pub struct DelegatePlayer<'info> {
     /// Pays the delegation rent.
     #[account(mut)]
     pub owner: Signer<'info>,
+    /// CHECK: read by hand (see `read_config`) for the rollup validator
+    pub config: UncheckedAccount<'info>,
     /// CHECK: the owner's Player, by its seeds; the delegation program takes it over
     #[account(mut, del, seeds = [b"player", owner.key().as_ref()], bump)]
     pub player: UncheckedAccount<'info>,
@@ -1421,6 +1425,8 @@ pub struct DelegateOutbox<'info> {
     /// Pays the delegation rent.
     #[account(mut)]
     pub owner: Signer<'info>,
+    /// CHECK: read by hand (see `read_config`) for the rollup validator
+    pub config: UncheckedAccount<'info>,
     /// CHECK: the owner's Outbox, by its seeds; read by hand (see `read_outbox`)
     #[account(mut, del, seeds = [b"outbox", owner.key().as_ref()], bump)]
     pub outbox: UncheckedAccount<'info>,
@@ -1429,11 +1435,11 @@ pub struct DelegateOutbox<'info> {
 #[cfg(not(feature = "inline-mock-magic"))]
 #[delegate]
 #[derive(Accounts)]
-pub struct DelegateConfigAccount<'info> {
+pub struct DelegateConfig<'info> {
     /// Must be Config's admin, checked in the handler. Pays the delegation rent.
     #[account(mut)]
     pub admin: Signer<'info>,
-    /// CHECK: read by hand (see `config_admin`)
+    /// CHECK: read by hand (see `read_config`)
     #[account(mut, del, seeds = [b"config"], bump)]
     pub config: UncheckedAccount<'info>,
 }
@@ -1446,7 +1452,7 @@ pub struct DelegateBattleground<'info> {
     /// Must be Config's admin, checked in the handler. Pays the delegation rent.
     #[account(mut)]
     pub admin: Signer<'info>,
-    /// CHECK: read by hand (see `config_admin`), so it works whether or not Config is delegated
+    /// CHECK: read by hand (see `read_config`), so it works whether or not Config is delegated
     pub config: UncheckedAccount<'info>,
     /// CHECK: the battleground, by its seeds; the delegation program takes it over
     #[account(mut, del, seeds = [b"battleground".as_ref(), &[battleground_id][..]], bump)]
@@ -1460,7 +1466,7 @@ pub struct DelegateTreasuryOutbox<'info> {
     /// Must be Config's admin, checked in the handler. Pays the delegation rent.
     #[account(mut)]
     pub admin: Signer<'info>,
-    /// CHECK: read by hand (see `config_admin`), so it works whether or not Config is delegated
+    /// CHECK: read by hand (see `read_config`), so it works whether or not Config is delegated
     pub config: UncheckedAccount<'info>,
     /// CHECK: the treasury Outbox, by its seeds; read by hand (see `read_outbox`)
     #[account(mut, del, seeds = [b"outbox", config.key().as_ref()], bump)]

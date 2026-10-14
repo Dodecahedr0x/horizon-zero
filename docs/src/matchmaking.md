@@ -90,7 +90,7 @@ The Player's lamports are split by its counters (see [Player](accounts.md#player
 
 Money enters and leaves the Player in the rollup, without undelegating the Player.
 
-**Top-up.** A lamport transfer into the Player lands in free lamports. In the rollup the client sends it through the eSPL program's delegated lamports transfer (`lamportsDelegatedTransfer` in the TypeScript SDK). The rollup credits the Player with the exact amount. The wallet pays the amount plus 300 000 lamports and the transaction fee. The credit exists only in the rollup until the Player is committed. `fund_budget` then moves free lamports into the budget.
+**Top-up.** A lamport transfer into the Player lands in free lamports. In the rollup the client sends it through the eSPL program's delegated lamports transfer (`lamportsDelegatedTransfer` in the TypeScript SDK). The rollup credits the Player with the exact amount. The wallet pays the amount plus 300 000 lamports and the transaction fee. The credit exists only in the rollup. Nothing commits the Player, so its Solana copy keeps the data and lamports it had when it was delegated; money reaches Solana only through a withdrawal. `fund_budget` then moves free lamports into the budget.
 
 **Withdrawal.** Lamports leave the rollup through the wallet's one-shot [Outbox](accounts.md#outbox--49-bytes). The client sends one rollup transaction with two instructions:
 
@@ -108,8 +108,8 @@ sequenceDiagram
   participant DLP as delegation program
   participant Base as horizon-zero (Solana)
   opt the Outbox is not delegated (a previous withdrawal undelegated it)
-    Wallet->>Base: delegate_outbox(validator), refused while outbox.amount != 0 (OutboxBusy)
-    Base->>DLP: delegate the Outbox to the rollup validator
+    Wallet->>Base: delegate_outbox, refused while outbox.amount != 0 (OutboxBusy)
+    Base->>DLP: delegate the Outbox to config.validator
   end
   Wallet->>ER: fund_outbox(amount)
   ER->>ER: free, then winnings, then budget, never locked (BalanceShort)
@@ -132,9 +132,9 @@ sequenceDiagram
 
 **A half-sent withdrawal.** If `fund_outbox` lands without `withdraw`, the lamports wait in the delegated Outbox, and `OutboxBusy` blocks another `fund_outbox`. A later `withdraw` on its own schedules the release. No instruction moves the lamports back to the Player.
 
-A funded Outbox blocks the next `fund_outbox` with `OutboxBusy` until it is released. `fund_outbox` also refuses a move that would leave the Player holding less than its rent plus `budget + winnings + locked` (`BalanceShort`). Every withdrawal also ends the Outbox's delegation, so before the next one the client sends `delegate_outbox(validator)` on Solana, paid by the wallet. It refuses an Outbox whose `amount` is not 0 (`OutboxBusy`): a withdrawal that is undelegated but not yet released is released first, so it is never locked back into the rollup. On the local stack one delegation session cost the wallet about 300 000 lamports, or 0.0003 SOL, plus transaction fees: 3 138 960 lamports of delegation record and metadata rent at delegation, of which 2 838 960 come back at undelegation.
+A funded Outbox blocks the next `fund_outbox` with `OutboxBusy` until it is released. `fund_outbox` also refuses a move that would leave the Player holding less than its rent plus `budget + winnings + locked` (`BalanceShort`). Every withdrawal also ends the Outbox's delegation, so before the next one the client sends `delegate_outbox` on Solana, paid by the wallet. It delegates to the rollup validator pinned in Config. It refuses an Outbox whose `amount` is not 0 (`OutboxBusy`): a withdrawal that is undelegated but not yet released is released first, so it is never locked back into the rollup. On the local stack one delegation session cost the wallet about 300 000 lamports, or 0.0003 SOL, plus transaction fees: 3 138 960 lamports of delegation record and metadata rent at delegation, of which 2 838 960 come back at undelegation.
 
-**Fee claim.** Fees collect on Config (`config.fees`, on top of its rent). The admin creates the treasury Outbox `[b"outbox", config]` once on Solana with `init_treasury_outbox`. A claim is the same two-instruction rollup transaction: `fund_treasury_outbox` moves all of `config.fees` to the treasury Outbox, records the admin as its owner and sets `config.fees` to 0 (`HZ_OUTBOX_FUND`), and `claim_fees` schedules its commit-and-undelegate with the same `release_outbox` action, which pays the admin (`HZ_CLAIM`). Only the admin can send either instruction (`NotAdmin`). With no fees, `fund_treasury_outbox` fails with `NothingToWithdraw`. If `fund_treasury_outbox` lands without `claim_fees`, the fees wait in the delegated treasury Outbox until a later `claim_fees`; no instruction moves them back to Config. Like the player Outbox, every claim ends the treasury Outbox's delegation, so before the next claim the admin sends `delegate_treasury_outbox(validator)` on Solana, with the same `OutboxBusy` rule. `init_treasury_outbox` and `delegate_treasury_outbox` read Config by hand, so they work whether or not Config is delegated. See [Delegation](accounts.md#delegation).
+**Fee claim.** Fees collect on Config (`config.fees`, on top of its rent). The admin creates the treasury Outbox `[b"outbox", config]` once on Solana with `init_treasury_outbox`. A claim is the same two-instruction rollup transaction: `fund_treasury_outbox` moves all of `config.fees` to the treasury Outbox, records the admin as its owner and sets `config.fees` to 0 (`HZ_OUTBOX_FUND`), and `claim_fees` schedules its commit-and-undelegate with the same `release_outbox` action, which pays the admin (`HZ_CLAIM`). Only the admin can send either instruction (`NotAdmin`). With no fees, `fund_treasury_outbox` fails with `NothingToWithdraw`. If `fund_treasury_outbox` lands without `claim_fees`, the fees wait in the delegated treasury Outbox until a later `claim_fees`; no instruction moves them back to Config. Like the player Outbox, every claim ends the treasury Outbox's delegation, so before the next claim the admin sends `delegate_treasury_outbox` on Solana, with the same `OutboxBusy` rule. `init_treasury_outbox` and `delegate_treasury_outbox` read Config by hand, so they work whether or not Config is delegated. See [Delegation](accounts.md#delegation).
 
 ## VRF request
 

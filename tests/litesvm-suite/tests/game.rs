@@ -27,6 +27,10 @@ const BUDGET: u16 = 8;
 const VAULT: Address = address!("MagicVau1t999999999999999999999999999999999");
 const MAGIC: Address = address!("Magic11111111111111111111111111111111111111");
 const SYSTEM: Address = address!("11111111111111111111111111111111");
+/// The local rollup validator's identity, which `initialize` pins in Config.
+const VALIDATOR: Address = address!("mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev");
+/// Owns a delegated account's Solana copy.
+const DELEGATION: Address = address!("DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh");
 /// What a helper deposits when it registers a wallet that has no Player yet.
 const DEPOSIT: u64 = 200_000_000;
 /// Free lamports `cover_stake` leaves on a Player for a battle's rent.
@@ -152,7 +156,7 @@ fn setup_on(svm: LiteSVM) -> Env {
         &[ix(
             program,
             vec![meta(admin.pubkey(), true, true), meta(config, true, false), meta(identity, true, false), meta(SYSTEM, false, false)],
-            disc("initialize", &500u16.to_le_bytes()),
+            disc("initialize", &[&500u16.to_le_bytes()[..], VALIDATOR.as_ref()].concat()),
         )],
     );
 
@@ -391,7 +395,7 @@ fn fee_is_capped_and_only_the_admin_sets_it() {
     let mut env = setup();
     let set = |env: &Env, signer: &Keypair, bps: u16| ix(env.program, vec![meta(signer.pubkey(), false, true), meta(env.config, true, false)], disc("set_fee", &bps.to_le_bytes()));
     let data = env.svm.get_account(&env.config).unwrap().data;
-    assert_eq!(data.len(), 51);
+    assert_eq!(data.len(), CONFIG_LEN);
     assert_eq!(u16::from_le_bytes([data[40], data[41]]), 500, "initialize stored the fee rate");
     let admin = env.admin.insecure_clone();
     send_expect_reason_with(&mut env, &admin, |env| vec![set(env, &admin, 1_001)], "FeeTooHigh");
@@ -1487,7 +1491,7 @@ fn send_with(env: &mut Env, payer: &Keypair, build: impl Fn(&Env) -> Vec<Instruc
 }
 
 const OUTBOX_LEN: usize = 49;
-const CONFIG_LEN: usize = 51;
+const CONFIG_LEN: usize = 83;
 /// LiteSVM's fee for a transaction with one signature.
 const TX_FEE: u64 = 5_000;
 /// The rollup's magic context, written by every commit. The mock build does not check it.
@@ -1735,41 +1739,49 @@ fn solana_admin_checks_read_config_by_hand() {
     let admin = env.admin.insecure_clone();
     let stranger = Keypair::new();
     env.fund(&stranger);
+    let data = env.svm.get_account(&env.config).unwrap().data;
+    assert_eq!(data.len(), CONFIG_LEN);
+    assert_eq!(Address::try_from(&data[50..82]).unwrap(), VALIDATOR, "initialize pinned the rollup validator");
 
-    // `create_battleground` reads Config by hand too: the fixture's three grounds went through it,
-    // and a stranger is refused.
-    let ground = pda(&[b"battleground", &[3]], &env.program).0;
+    // `create_battleground` and `init_treasury_outbox` read Config by hand. The treasury Outbox's
+    // seeds follow the account passed as Config, so each call names the Outbox of that account.
     let mut args = vec![3u8];
     args.extend_from_slice(&BUDGET.to_le_bytes());
     args.extend_from_slice(&STAKE.to_le_bytes());
     args.extend_from_slice(&[8, 6]);
+    let ground = pda(&[b"battleground", &[3]], &env.program).0;
     let create = |env: &Env, signer: &Keypair, config: Address| {
         let accounts = vec![meta(signer.pubkey(), true, true), meta(config, false, false), meta(ground, true, false), meta(SYSTEM, false, false)];
         ix(env.program, accounts, disc("create_battleground", &args))
     };
-    send_expect_reason_with(&mut env, &stranger, |env| vec![create(env, &stranger, env.config)], "NotAdmin");
-
-    // `init_treasury_outbox` with something other than Config. The treasury Outbox's seeds follow
-    // the account passed as Config, so each call names the Outbox of that account.
-    let init = |env: &Env, config: Address| {
+    let init = |env: &Env, signer: &Keypair, config: Address| {
         let outbox = pda(&[b"outbox", config.as_ref()], &env.program).0;
-        let accounts = vec![meta(admin.pubkey(), true, true), meta(config, false, false), meta(outbox, true, false), meta(SYSTEM, false, false)];
+        let accounts = vec![meta(signer.pubkey(), true, true), meta(config, false, false), meta(outbox, true, false), meta(SYSTEM, false, false)];
         ix(env.program, accounts, disc("init_treasury_outbox", &[]))
     };
+
     // A program account of another type: the admin's Player.
     let player = player_pda(&env, &admin.pubkey());
-    send_expect_reason_with(&mut env, &admin, |env| vec![init(env, player)], "AccountDiscriminatorMismatch");
-    // Config's own bytes at another address, owned by this program, then by the system program.
-    let copy = Address::new_unique();
+    send_expect_reason_with(&mut env, &admin, |env| vec![init(env, &admin, player)], "AccountDiscriminatorMismatch");
+    // Config's own bytes at another address, owned by this program.
     let config = env.svm.get_account(&env.config).unwrap();
+    let copy = Address::new_unique();
     env.svm.set_account(copy, config.clone()).unwrap();
-    send_expect_reason_with(&mut env, &admin, |env| vec![init(env, copy)], "BadPda");
+    send_expect_reason_with(&mut env, &admin, |env| vec![init(env, &admin, copy)], "BadPda");
     send_expect_reason_with(&mut env, &admin, |env| vec![create(env, &admin, copy)], "BadPda");
-    env.svm.set_account(copy, Account { owner: SYSTEM, ..config }).unwrap();
-    send_expect_reason_with(&mut env, &admin, |env| vec![init(env, copy)], "BadPda");
+    // The real Config owned by a foreign program: only the owner check is wrong.
+    env.svm.set_account(env.config, Account { owner: SYSTEM, ..config.clone() }).unwrap();
+    send_expect_reason_with(&mut env, &admin, |env| vec![init(env, &admin, env.config)], "BadPda");
+    send_expect_reason_with(&mut env, &admin, |env| vec![create(env, &admin, env.config)], "BadPda");
 
-    // The real Config still passes.
-    send_with(&mut env, &admin, |env| vec![init(env, env.config)]);
+    // The real Config as a delegated Config's Solana copy, owned by the delegation program: the admin
+    // still passes both, and a stranger is still refused.
+    env.svm.set_account(env.config, Account { owner: DELEGATION, ..config.clone() }).unwrap();
+    send_expect_reason_with(&mut env, &stranger, |env| vec![create(env, &stranger, env.config)], "NotAdmin");
+    send_expect_reason_with(&mut env, &stranger, |env| vec![init(env, &stranger, env.config)], "NotAdmin");
     let logs = send_with(&mut env, &admin, |env| vec![create(env, &admin, env.config)]);
     assert!(logs.iter().any(|line| line.contains(&format!("HZ_BATTLEGROUND {ground} 3"))));
+    send_with(&mut env, &admin, |env| vec![init(env, &admin, env.config)]);
+    assert_eq!(outbox_state(&env, &treasury_outbox(&env)), (admin.pubkey(), 0));
+    env.svm.set_account(env.config, config).unwrap();
 }

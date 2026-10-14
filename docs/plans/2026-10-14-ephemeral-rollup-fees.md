@@ -26,8 +26,8 @@
   - No escrow account needs to exist.
   - Import `FoldableIntentBuilder` explicitly.
   - The delegation program appends three accounts to `release_outbox`; Anchor treats them as remaining accounts.
-- **Delegate with `DelegateConfig { validator: Some(<rollup validator identity>) }`.** Locally the identity is `mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev`; the SDK's default validator is a different key. Pass the validator as an instruction argument or an optional account, so it is never a hardcoded constant.
-- **Delegated accounts must be committed now and then.** Lamports that are topped up, staked or withdrawn reach Solana only when the Player is committed. Set a `commit_frequency_ms` on Player delegation; the default from `DelegateConfig::default()` is acceptable.
+- **Delegate with `DelegateConfig { validator: Some(<rollup validator identity>) }`.** Locally the identity is `mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev`; the SDK's default validator is a different key. It is never a hardcoded constant: `initialize(fee_bps, validator)` pins it in `Config.validator`, nothing changes it, and every delegate instruction reads it from Config (decided in Task 11 review, so a wrong per-call validator cannot strand a Player that nothing undelegates).
+- **No scheduled commits (user decision, Task 11 review).** Every delegation keeps `DelegateConfig::default()`'s commit frequency, `u32::MAX` ms, and nothing commits Config, Battlegrounds or Players. Their Solana copies keep their delegation-time data; balances live in the rollup, and money leaves it only through the Outbox.
 - **The local stack needs two additions:**
   - It must create and fund the eSPL rent PDA (`initRentPdaIx`, 1 SOL), or top-ups fail with "insufficient lamports 300000, need 890880".
   - It must run a second `vrf-oracle` against the rollup (`--rpc-url http://127.0.0.1:7799 --websocket-url ws://127.0.0.1:7800`) for the ephemeral queue `Sc9MJUngNbQXSXGP3F67KvKwVnhaYn6kcioxXNVowYT`.
