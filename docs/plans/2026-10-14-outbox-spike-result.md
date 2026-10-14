@@ -203,3 +203,22 @@ npm install
 ./stack.sh &                               # waits for "stack ready"
 node run.mjs                               # sametx; also --mode=single|split|note|typed, --holder-pays
 ```
+
+## Follow-up: can `release_outbox` run inside the rollup?
+
+**No, on the local stack (ephemeral-validator 0.14.10).** A third party can send a permissionless `release_outbox` to the rollup RPC. It never takes effect, and the later base action still pays the full amount exactly once. Script: `spike/outbox/er-release.mjs` on `spike/outbox`, scenarios A to D, 0.02 SOL each.
+
+| Case | Rollup result | Afterwards |
+| --- | --- | --- |
+| A. Outbox delegated and funded (`fund_outbox` only); a third party sends `release_outbox` to the rollup | Rejected. The program ran, but the validator refused the write to the owner wallet: `Account 2: <owner> was illegally used as writable`, `Magic111… failed: InvalidWritableAccount`. | Owner unchanged in the rollup and on Solana. Rollup Outbox still holds 21,231,920 lamports with amount 20,000,000. The later withdraw's base action paid `amount=20000000` once. |
+| B. Race: send `release_outbox` to the rollup right after `fund_outbox`+`withdraw` is processed | Rejected by the program: `AccountOwnedByWrongProgram` (Left: `DELeGG…`). Scheduling undelegation reassigns the Outbox to the delegation program in the rollup at once. | The base action paid 20,000,000 once. |
+| C. Outbox still delegated; the release is sent to Solana instead | Rejected: `AccountOwnedByWrongProgram`, because Solana sees the Outbox owned by the delegation program. | No effect. |
+| D. As A, but the owner wallet signs and pays the fee for the rollup release, so its account is writable as fee payer | Rejected: `Feepayer <owner> was modified without being delegated`, `InvalidAccountForFee`. | The base action paid 20,000,000 once. |
+
+In every case the owner's net balance change on Solana was +22,838,960 lamports: 20,000,000 released plus 2,838,960 of delegation rent refunded.
+
+**Can a program credit a non-delegated system account in the rollup?** No. After execution, the rollup rejects any transaction that changes an undelegated account, unless the account is only paying fees. That holds whether the account is writable (`InvalidWritableAccount`) or the fee payer (`InvalidAccountForFee`). The whole transaction rolls back, including the Outbox debit.
+
+Also seen in A: the validator sent a second commit, undelegate and action transaction for the already-undelegated Outbox. It failed at the commit step (`InvalidAccountOwner`) before reaching the action, and had no effect. The base transaction is atomic, so the action cannot run without its commit.
+
+**Guard:** none is needed for correctness, so none was implemented or verified. The validator's rule on undelegated accounts and the typed `Account<Outbox>` owner check already block both paths. A cheap defense-in-depth option, if the main program wants one: pass the Outbox's delegation record `[b"delegation", outbox]` under the delegation program to `release_outbox`, and require that it is not owned by the delegation program. On Solana, after undelegation, that account is closed, so the automatic action and the manual fallback both pass. While the Outbox is delegated the record exists, so the release fails everywhere. The cost is one extra read-only account in the action and in the fallback.
