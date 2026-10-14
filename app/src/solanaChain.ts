@@ -181,14 +181,16 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
   }
 
   /**
-   * Sends `settle_match` and returns the outcome byte from its log, or null if another caller
-   * settled the battle first. A battle that is not Seeded yet throws.
+   * Sends `settle_match` and returns the outcome byte from its log, or null when it is unknown:
+   * another caller settled the battle first, or the log could not be read. A battle that is not
+   * Seeded yet throws.
    */
   async function settleOnce(match: Match) {
     try {
       const signature = await send(er, settleMatchIx(match));
       const tx = await er.getTransaction(signature, { commitment: "confirmed", maxSupportedTransactionVersion: 0 });
-      return resolvedOutcome(tx?.meta?.logMessages ?? [], match.pubkey) ?? 0;
+      // A missing log line counts as unknown, like a settlement by someone else.
+      return resolvedOutcome(tx?.meta?.logMessages ?? [], match.pubkey);
     } catch (err) {
       // AlreadyResolved: someone else's settlement closed the battle.
       const info = await er.getAccountInfo(new PublicKey(match.pubkey));
@@ -199,6 +201,7 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
     }
   }
 
+  /** The settled match. An unknown outcome comes from the indexer, or stays 0 (pending) until it has the row. */
   async function resolved(match: Match, outcome: number | null): Promise<Match> {
     if (outcome !== null) return { ...match, status: 1, outcome };
     const indexed = await read<Match | null>(`/matches/${match.pubkey}`).catch(() => null);
@@ -374,7 +377,10 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
     async topUp(amount) {
       const owner = me();
       const player = playerPda(owner);
-      const before = (await er.getAccountInfo(player))?.lamports ?? 0;
+      // Measure the credit against the rollup's copy, so wait until the rollup has it.
+      const delegated = await until(DELEGATION_WAIT_MS, () => ownedInRollup(player));
+      if (!delegated) throw new Error("The rollup has not picked up the Player yet; register first or try again");
+      const before = delegated.lamports;
       const salt = crypto.getRandomValues(new Uint8Array(32));
       await send(base, lamportsDelegatedTransferIx(owner, player, amount, salt));
       // The rollup credits the Player about a second later.

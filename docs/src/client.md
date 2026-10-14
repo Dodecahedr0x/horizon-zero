@@ -12,7 +12,7 @@ Any other value, including unset, uses the Solana shell. It talks to two RPC end
 | `VITE_ER_RPC_URL` | the MagicBlock ephemeral rollup; its WebSocket is the next port | the local rollup, `http://127.0.0.1:7799` | none: `createSolanaChain` throws until it is set, because it must be the rollup that serves the validator pinned in Config |
 | `VITE_ORACLE_QUEUE` | the VRF queue `lock_army` asks; an ephemeral queue, whose oracle calls back into the rollup | the local test queue `Sc9MJUngNbQXSXGP3F67KvKwVnhaYn6kcioxXNVowYT` | MagicBlock's `DEFAULT_EPHEMERAL_QUEUE`, `5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc` |
 
-`pnpm dev:chain` runs the game this way against `pnpm localnet`; see [Networks and deployment](deployment.md). Wallets are Phantom and Solflare. Chain reads and writes go through `createSolanaChain`. The ledger process still listens, and the Solana page does not call it.
+The local stack does not serve these yet: `pnpm localnet` starts the rollup but does not delegate Config or the battlegrounds, create the eSPL rent PDA, or run a `vrf-oracle` for the ephemeral test queue, and `pnpm dev:chain` still sets `VITE_ORACLE_QUEUE` to the base test queue. Until the local-stack task changes that, the rollup flows below do not complete locally. `pnpm dev:chain` runs the game this way against `pnpm localnet`; see [Networks and deployment](deployment.md). Wallets are Phantom and Solflare. Chain reads and writes go through `createSolanaChain`. The ledger process still listens, and the Solana page does not call it.
 
 ## ChainAdapter
 
@@ -170,7 +170,7 @@ Reads:
 - `battlegrounds` lists the indexer's rows and replaces each queue and `matchSeq` with the battleground account read in the rollup.
 - `armies(owner)` lists the indexer's rows, reads each army in the rollup, drops those it no longer finds there, and takes the status from the rollup, so a closed or newly queued army shows at once.
 - `match(pubkey)` reads the indexer and falls back to the battle account in the rollup.
-- `player()` reads the Player in the rollup. `free` is its lamports minus the rent-exempt minimum for 68 bytes (read once from Solana) and `budget + winnings + locked`. `outboxPending` is the Outbox's `amount` from Solana while the Outbox is undelegated there, otherwise the rollup copy's `amount` (a `fund_outbox` whose `withdraw` did not land).
+- `player()` reads the Player in the rollup. `free` is its lamports minus the rent-exempt minimum for 68 bytes (read once from Solana) and `budget + winnings + locked`. `outboxPending` is the Outbox's `amount` from Solana while the Outbox is undelegated there, otherwise the rollup copy's `amount` (a `fund_outbox` whose `withdraw` did not land). `player()` only reads: it does not send `release_outbox`. A pending amount is paid by the next `withdraw` (which releases before it delegates again) or, later, by a UI action.
 - `admin()` reads Config in the rollup.
 
 `createArmy` uses the next index above any army the indexer lists for this wallet.
@@ -179,13 +179,13 @@ Reads:
 
 `register(deposit)` sends one Solana transaction: `register_player(deposit)`, `delegate_player` and `delegate_outbox`. A retry after a partial registration sends only what is missing, and moves the deposit with a top-up when the Player already exists. It then polls the rollup until it sees the Player owned by the program, for up to 60 seconds.
 
-`topUp(lamports)` sends the SDK's `lamportsDelegatedTransferIx(wallet, player, lamports, salt)` to Solana with a random 32-byte salt, then waits until the rollup shows the Player's lamports grown. The wallet pays the amount plus 300 000 lamports and the fee (see [Money in and out](matchmaking.md#money-in-and-out)).
+`topUp(lamports)` first waits, for up to 60 seconds, until the rollup holds the delegated Player, and throws if it does not. It then sends the SDK's `lamportsDelegatedTransferIx(wallet, player, lamports, salt)` to Solana with a random 32-byte salt, then waits until the rollup shows the Player's lamports grown past what it read before. The wallet pays the amount plus 300 000 lamports and the fee (see [Money in and out](matchmaking.md#money-in-and-out)).
 
 ### Lock and settle
 
 `lock(army)` reads the battleground in the rollup for its queue and `match_seq`, and reads each queued army there. It offers, in queue order, every queued army whose status is Queued and whose owner is another wallet, each with its owner's Player once, so the program can match a funded owner and evict one whose budget no longer covers a stake. It stops adding candidates when the transaction would pass 32 accounts. It sends a compute budget of `1_400_000` and `lock_army` with the player's Player, Config, the battle `[b"match", battleground, match_seq]`, the vault and the magic program, the oracle queue, and the army's distinct behaviors.
 
-If the battle account then exists in the rollup, a match opened. The client polls it every half second until it is Seeded (status 2), for up to 60 seconds, then sends `settle_match` and reads the outcome from the transaction's `HZ_MATCH_RESOLVED` log. `lock` returns the battle decoded from the rollup with that outcome and status 1. If someone else settled first, the battle is gone; `settle_match` fails with `AlreadyResolved`, and `lock` returns the indexer's row for it, or the last decoded state. If the seed has not arrived in time, `lock` returns the battle still Awaiting, and `settle(match)` can settle it later. `settle` treats a battle that is already closed as settled and throws while it is still Awaiting (`NotSeeded`).
+If the battle account then exists in the rollup, a match opened. The client polls it every half second until it is Seeded (status 2), for up to 60 seconds, then sends `settle_match` and reads the outcome from the transaction's `HZ_MATCH_RESOLVED` log. `lock` returns the battle decoded from the rollup with that outcome and status 1. The outcome is unknown when someone else settled first (the battle is gone and `settle_match` fails with `AlreadyResolved`) or when the log line cannot be read; `lock` then returns the indexer's row for the battle, or, before the indexer has it, the last decoded state with status 1 and outcome 0 (pending). If the seed has not arrived in time, `lock` returns the battle still Awaiting, and `settle(match)` can settle it later. `settle` treats a battle that is already closed as settled and throws while it is still Awaiting (`NotSeeded`).
 
 ### Withdrawal and fee claim
 
