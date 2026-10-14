@@ -541,7 +541,9 @@ export function createArmyIx(
 /**
  * Rollup. `candidates` are queued armies offered as opponents; each is passed writable with its
  * owner's Player once. The program matches a candidate whose owner's budget covers the stake and
- * evicts one whose owner's Player shows less.
+ * evicts one whose owner's Player shows less. `opens` says a candidate's owner covers the stake, so
+ * the lock opens a battle: only then is the battle passed writable. The rollup refuses a transaction
+ * that passes writable an account it neither holds nor creates, so a lock that queues passes it read-only.
  */
 export function lockArmyIx(args: {
   player: PublicKey;
@@ -551,6 +553,7 @@ export function lockArmyIx(args: {
   queue: PublicKey;
   seq: number;
   candidates: { army: PublicKey; owner: PublicKey }[];
+  opens: boolean;
 }) {
   const battleground = battlegroundPda(args.battlegroundId);
   const keys = [
@@ -559,7 +562,7 @@ export function lockArmyIx(args: {
     readonly(configPda()),
     writable(battleground),
     writable(args.army),
-    writable(matchPda(battleground, args.seq)),
+    args.opens ? writable(matchPda(battleground, args.seq)) : readonly(matchPda(battleground, args.seq)),
     ...ephemeral(),
     writable(args.queue),
     readonly(identityPda()),

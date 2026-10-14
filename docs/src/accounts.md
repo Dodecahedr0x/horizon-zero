@@ -347,7 +347,7 @@ No instruction arguments. Account order after the `#[vrf]` macro expands `LockAr
 3. config `[b"config"]`
 4. battleground, writable
 5. army, writable
-6. battle, writable (created in this instruction when a match opens; untouched when the army only queues)
+6. battle: writable when a match opens, which creates it here; read-only when the army only queues. The rollup refuses a transaction that passes writable an account it neither holds nor creates (`InvalidWritableAccount`, before the program runs), so the client passes the battle writable only when a candidate's owner's budget covers the stake. Passed read-only to a lock that does open a match, the creation fails.
 7. vault, writable
 8. magic program
 9. oracle queue, writable, owned by the VRF program

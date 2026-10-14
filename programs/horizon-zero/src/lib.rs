@@ -1273,8 +1273,8 @@ pub struct LockArmy<'info> {
     pub battleground: Account<'info, Battleground>,
     #[account(mut)]
     pub army: Box<Account<'info, Army>>,
-    /// CHECK: created when two armies match
-    #[account(mut)]
+    /// CHECK: created when two armies match, so writable only then: the rollup refuses a
+    /// transaction that passes a writable account it neither holds nor creates
     pub battle: UncheckedAccount<'info>,
     pub ephemeral: EphAccounts<'info>,
     /// CHECK: oracle queue owned by the VRF program

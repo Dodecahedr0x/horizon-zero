@@ -153,6 +153,7 @@ test("lock_army passes the VRF accounts, then behaviors, candidates and each own
     queue,
     seq: 9,
     candidates: [{ army: key(6), owner: rival }, { army: key(7), owner: rival }],
+    opens: true,
   });
   expect(ix, "lock_army", [
     [owner, true, true],
@@ -173,6 +174,9 @@ test("lock_army passes the VRF accounts, then behaviors, candidates and each own
     [key(7), false, true],
     [playerPda(rival), false, true],
   ]);
+  // A lock that can only queue passes the battle read-only.
+  const queues = lockArmyIx({ player: owner, battlegroundId: 1, army, behaviors: [behavior], queue, seq: 9, candidates: [], opens: false });
+  assert.deepEqual(metas(queues)[5], [matchPda(ground, 9).toBase58(), false, false]);
 });
 
 test("settle_match passes the battle, both armies, both Players, Config and the ephemeral accounts", () => {

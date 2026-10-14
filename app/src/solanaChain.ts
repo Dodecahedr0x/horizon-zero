@@ -457,6 +457,14 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
       candidates.push({ army: queued[i], owner: new PublicKey(head.owner) });
       owners.add(head.owner);
     }
+    // The program matches a candidate whose owner's budget covers the stake. Only then does the
+    // lock create the battle, and only then may the battle be passed writable (see lockArmyIx).
+    const ownerKeys = [...owners].map((key) => playerPda(new PublicKey(key)));
+    const players = ownerKeys.length ? await er.getMultipleAccountsInfo(ownerKeys) : [];
+    const opens = players.some((info) => {
+      const player = info?.owner.equals(PROGRAM_ID) ? decodePlayer(info.data) : null;
+      return !!player && lamports(player.budget) >= lamports(state.stake);
+    });
     await send(er, computeBudgetIx(), lockArmyIx({
       player: owner,
       battlegroundId: state.battlegroundId,
@@ -465,6 +473,7 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
       queue: ORACLE_QUEUE,
       seq: state.matchSeq,
       candidates,
+      opens,
     }));
     return matchPda(ground, state.matchSeq);
   }
