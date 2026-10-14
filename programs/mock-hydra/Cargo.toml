@@ -1,0 +1,23 @@
+[package]
+name = "mock-hydra"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local stand-in for the MagicBlock Hydra crank program"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "mock_hydra"
+
+[features]
+# Checked by the code Anchor's #[program] macro generates.
+custom-heap = []
+custom-panic = []
+default = []
+no-entrypoint = []
+
+[dependencies]
+solana-program = "3.0.0"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

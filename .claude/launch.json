@@ -1,0 +1,65 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "asset-studio",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "tools/asset-studio/server.js"
+      ],
+      "port": 4174,
+      "autoPort": true
+    },
+    {
+      "name": "game-dev",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": [
+        "-c",
+        "VITE_DEV_MODE=true exec node scripts/dev-app.mjs"
+      ],
+      "port": 4710,
+      "autoPort": false
+    },
+    {
+      "name": "asset-server",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "app/server.js"
+      ],
+      "port": 4715,
+      "autoPort": false
+    },
+    {
+      "name": "landing",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "--prefix",
+        "landing",
+        "run",
+        "dev"
+      ],
+      "port": 4711,
+      "autoPort": false
+    },
+    {
+      "name": "game-dev-isolated",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": [
+        "-c",
+        "LOCAL_LEDGER_PORT=4723 LOCAL_LEDGER_PATH=/private/tmp/claude-501/-Users-dode-Documents-solana-horizon-zero/284ed78a-114e-4009-acd3-28014a2fde52/scratchpad/ledger.db node app/local-ledger.mjs & cd app && LOCAL_LEDGER_PORT=4723 VITE_DEV_MODE=true exec node node_modules/vite/bin/vite.js --port 4720 --strictPort"
+      ],
+      "port": 4720,
+      "autoPort": false
+    },
+    {
+      "name": "game-dev-pot",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": [
+        "-c",
+        "LOCAL_LEDGER_PORT=4733 LOCAL_LEDGER_PATH=/private/tmp/claude-501/-Users-dode-Documents-solana-horizon-zero/03071217-773f-4288-b153-7d0838893038/scratchpad/ledger.db node app/local-ledger.mjs & cd app && LOCAL_LEDGER_PORT=4733 VITE_DEV_MODE=true exec node node_modules/vite/bin/vite.js --port 4730 --strictPort"
+      ],
+      "port": 4730,
+      "autoPort": false
+    }
+  ]
+}

@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Horizon Zero</title>
+    <meta name="theme-color" content="#0d0b0a" />
+    <meta name="description" content="Horizon Zero is a grim frontier auto-battle. Lock an army of the Ashborn, the Rootborn, or the Deeplings, stake SOL, and a VRF seed fights." />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect fill='%23141210' width='16' height='16'/%3E%3Cpath fill='%23e07a3d' d='M8 1.5 14.5 8 8 14.5 1.5 8Z'/%3E%3C/svg%3E" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Alegreya+Sans:wght@400;500;700&family=Grenze+Gotisch:wght@500;700&display=swap" />
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+      <!-- Approved art carries a faint low-alpha haze around the figure; this drops it. -->
+      <filter id="alpha-cut" color-interpolation-filters="sRGB">
+        <feComponentTransfer><feFuncA type="linear" slope="1.12" intercept="-0.12" /></feComponentTransfer>
+      </filter>
+    </svg>
+    <header class="bar">
+      <a class="mark" href="#top" aria-label="Horizon Zero, top of page">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.5 14.5 8 8 14.5 1.5 8Z" /></svg>
+        Horizon Zero
+      </a>
+      <nav aria-label="Sections">
+        <a href="#match">The match</a>
+        <a href="#field">The field</a>
+        <a href="#line">The line</a>
+        <a href="#front">The front</a>
+      </nav>
+      <a class="play" data-play href="/">Play</a>
+    </header>
+
+    <section class="hero" id="top" aria-labelledby="hero-title">
+      <div class="sky" aria-hidden="true">
+        <div class="sun"></div>
+        <svg class="ridge" data-depth="0.08" viewBox="0 0 1600 400" preserveAspectRatio="none"><path data-ridge="far" /></svg>
+        <svg class="ridge" data-depth="0.18" viewBox="0 0 1600 400" preserveAspectRatio="none"><path data-ridge="mid" /></svg>
+        <div class="sentinel" data-depth="0.32"><figure class="sentinel-art" data-asset="world.png" data-alt="" data-eager></figure></div>
+        <svg class="ridge near" data-depth="0.42" viewBox="0 0 1600 400" preserveAspectRatio="none"><path data-ridge="near" /></svg>
+        <div class="fog"></div>
+        <canvas class="embers"></canvas>
+      </div>
+      <div class="hero-copy">
+        <p class="kicker">Ash, root, and tide</p>
+        <h1 id="hero-title">Horizon Zero</h1>
+        <p class="deck">Lock an army. Stake SOL.<br />A VRF seed runs the auto-battle.</p>
+        <p class="lore">Past the last road the earth is ash-grey and the light burns ember. The dead rose from the burned city as the Ashborn, the last grove walked out as the Rootborn, and the Deeplings crawled up from the drowned harbor. All three want the same ground.</p>
+        <div class="actions">
+          <a class="play large" data-play href="/">Enter the field</a>
+          <a class="ghost" href="#match">How a match runs</a>
+        </div>
+      </div>
+      <a class="scroll-cue" href="#match" aria-label="Scroll to the match"><span></span></a>
+    </section>
+
+    <section class="match" id="match" aria-labelledby="match-title">
+      <h2 id="match-title">The match</h2>
+      <p class="lead">Three moves. After the third, nobody touches the fight.</p>
+      <ol class="rite">
+        <li>
+          <span class="numeral" aria-hidden="true">I</span>
+          <h3>Lock an army</h3>
+          <p>Pick a people, then spend the battleground budget on up to ten of its soldiers. Set each one on a tile in your starting zone. The roster closes when you lock it.</p>
+        </li>
+        <li>
+          <span class="numeral" aria-hidden="true">II</span>
+          <h3>Stake SOL</h3>
+          <p>Outpost, Garrison, or Citadel. The stake sits with the army for the match.</p>
+        </li>
+        <li>
+          <span class="numeral" aria-hidden="true">III</span>
+          <h3>Auto-battle</h3>
+          <p>A VRF seed lays rubble on the open ground between the zones and resolves the fight, round by round, to the last soldier standing or round twelve.</p>
+        </li>
+      </ol>
+      <svg class="rite-path" viewBox="0 0 1000 40" preserveAspectRatio="none" aria-hidden="true"><path pathLength="1" d="M0 20 C 160 4, 340 36, 500 20 S 840 4, 1000 20" /></svg>
+    </section>
+
+    <section class="field" id="field" aria-labelledby="field-title">
+      <div class="field-copy">
+        <h2 id="field-title">The field</h2>
+        <p class="lead">Each battleground is a grid. One army starts on the top two rows, the other on the bottom two. The seed decides where the rubble falls between them. It never cuts one zone off from the other.</p>
+        <div class="grounds" role="tablist" aria-label="Battleground"></div>
+        <dl class="ground-facts" aria-live="polite">
+          <div><dt>Stake</dt><dd data-fact="stake">—</dd></div>
+          <div><dt>Budget</dt><dd data-fact="budget">—</dd></div>
+          <div><dt>Grid</dt><dd data-fact="grid">—</dd></div>
+          <div><dt>Rubble</dt><dd data-fact="rubble">—</dd></div>
+        </dl>
+        <button class="roll" type="button">Roll a new seed</button>
+        <p class="seed"><span>Seed</span> <code data-seed>················</code></p>
+        <p class="note">The rubble here comes from the same rule the program uses: candidates sorted by SHA-256 of the seed and the tile, kept only while the two zones stay connected. The armies are a sample within budget, two different peoples on every roll.</p>
+      </div>
+      <div class="board-wrap">
+        <canvas class="board" role="img" aria-label="Isometric battleground with both starting zones and seeded rubble"></canvas>
+        <div class="board-legend" aria-hidden="true">
+          <span><i class="key key-b"></i>Your zone</span>
+          <span><i class="key key-a"></i>Their zone</span>
+          <span><i class="key key-r"></i>Rubble</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="line" id="line" aria-labelledby="line-title">
+      <div class="line-head">
+        <h2 id="line-title">The line</h2>
+        <p class="lead">Three peoples, twelve soldiers. Every number below is the catalog the program fights with.</p>
+        <div class="grounds peoples" role="tablist" aria-label="People"></div>
+        <p class="people-blurb" aria-live="polite"></p>
+      </div>
+      <div class="stage">
+        <div class="stage-glow" aria-hidden="true"></div>
+        <div class="roster" role="tablist" aria-label="Soldier"></div>
+        <div class="ridge-floor" aria-hidden="true"></div>
+      </div>
+      <article class="dossier" aria-live="polite">
+        <div class="dossier-title">
+          <p class="dossier-cost"><span data-unit="cost"></span> budget</p>
+          <h3 data-unit="name"></h3>
+        </div>
+        <p class="dossier-body" data-unit="body"></p>
+        <dl class="stats">
+          <div><dt>HP</dt><dd data-unit="hp"></dd></div>
+          <div><dt>Attack</dt><dd data-unit="atk"></dd></div>
+          <div><dt>Range</dt><dd data-unit="range"></dd></div>
+          <div><dt>Speed</dt><dd data-unit="speed"></dd></div>
+        </dl>
+        <p class="cast"><strong data-unit="castName"></strong> <span data-unit="castText"></span></p>
+      </article>
+    </section>
+
+    <section class="front" id="front" aria-labelledby="front-title" data-state="loading">
+      <div class="front-head">
+        <h2 id="front-title">The front</h2>
+        <p class="front-pulse" aria-live="polite"><i aria-hidden="true"></i><span data-live>Reading the field…</span></p>
+      </div>
+      <p class="lead">Counted from the chain as it happens. Every battle here was staked, seeded, and fought to the end.</p>
+      <dl class="tally">
+        <div class="tally-main"><dt>Battles fought</dt><dd data-stat="battlesFought">—</dd></div>
+        <div><dt>In the last day</dt><dd data-stat="battlesToday">—</dd></div>
+        <div><dt>SOL staked</dt><dd data-stat="staked">—</dd></div>
+        <div><dt>Commanders</dt><dd data-stat="players">—</dd></div>
+        <div><dt>Locked, waiting</dt><dd data-stat="armiesLocked">—</dd></div>
+        <div><dt>Ended in a draw</dt><dd data-stat="drawShare">—</dd></div>
+      </dl>
+      <ol class="fronts" aria-label="Battlegrounds"></ol>
+      <p class="front-quiet">The front is quiet. Live numbers will return when the field answers.</p>
+    </section>
+
+    <footer class="close">
+      <div class="close-sky" aria-hidden="true"></div>
+      <p class="close-line">The game is the field.<br />This page is the gate.</p>
+      <a class="play large" data-play href="/">Play Horizon Zero</a>
+    </footer>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

@@ -1,0 +1,8 @@
+{
+  "name": "indexer",
+  "private": true,
+  "scripts": {
+    "start": "node ../scripts/run-indexer.mjs",
+    "test": "cargo test"
+  }
+}

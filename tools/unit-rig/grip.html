@@ -1,0 +1,30 @@
+<!doctype html><meta charset="utf-8"><title>grip</title>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}</script>
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+// For each shield unit: the matrix P that pre-transforms shield vertices (mesh local space) so that,
+// skinned 100% to the hand, the shield shows upright at the hand on the first idle frame.
+window.result = {};
+for (const n of ["guard", "warden"]) {
+  const g = await new GLTFLoader().loadAsync(`${n}-body.anim.glb`);
+  let mesh = null; g.scene.traverse((o) => { if (o.isSkinnedMesh && !mesh) mesh = o; });
+  const bones = mesh.skeleton.bones; const j = bones.findIndex((b) => b.name === "LeftHand");
+  const mixer = new THREE.AnimationMixer(g.scene);
+  mixer.clipAction(g.animations[0]).play(); mixer.setTime(0); g.scene.updateMatrixWorld(true);
+  const boneInv = mesh.skeleton.boneInverses[j];
+  const K = (handWorld) => new THREE.Matrix4().multiplyMatrices(mesh.matrixWorld, mesh.bindMatrixInverse).multiply(handWorld).multiply(boneInv).multiply(mesh.bindMatrix);
+  const Kidle = K(bones[j].matrixWorld.clone());
+  const handIdle = new THREE.Vector3().setFromMatrixPosition(bones[j].matrixWorld);
+  // Rest pose: an untouched copy of the file, bones at their stored transforms.
+  const rest = await new GLTFLoader().loadAsync(`${n}-body.anim.glb`);
+  rest.scene.updateMatrixWorld(true);
+  let restHand = null; rest.scene.traverse((o) => { if (o.isBone && o.name === "LeftHand") restHand = o; });
+  const Kbind = K(restHand.matrixWorld.clone());
+  const handBind = new THREE.Vector3().setFromMatrixPosition(restHand.matrixWorld);
+  const delta = handIdle.clone().sub(handBind);
+  const P = Kidle.clone().invert().multiply(new THREE.Matrix4().makeTranslation(delta.x, delta.y, delta.z)).multiply(Kbind);
+  window.result[n] = { P: P.elements, handBind: handBind.toArray().map((v) => +v.toFixed(3)), handIdle: handIdle.toArray().map((v) => +v.toFixed(3)), scale: new THREE.Vector3().setFromMatrixScale(P).toArray().map((v) => +v.toFixed(4)), joint: j };
+}
+window.ready = true;
+</script>

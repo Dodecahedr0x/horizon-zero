@@ -1,0 +1,183 @@
+{
+ "archer": {
+  "rig": "01a12bc6-0f28-72a3-a059-fcb24e72ea63",
+  "rigCredits": 5,
+  "anim": "01a12bc6-4d44-7494-aa90-74e8cc97a6c7",
+  "animCredits": 21,
+  "actions": [
+   0,
+   14,
+   224,
+   222,
+   150,
+   179,
+   183
+  ]
+ },
+ "guard": {
+  "rig": "01a12bc7-689f-7709-b8cf-4240e264f8de",
+  "rigCredits": 5,
+  "anim": "01a12bc7-c6b4-746f-9f4a-b52abe5b64ab",
+  "animCredits": 21,
+  "actions": [
+   89,
+   14,
+   240,
+   220,
+   138,
+   178,
+   187
+  ]
+ },
+ "skirmisher": {
+  "rig": "01a12bc7-6897-71a1-b85a-c416d07fb505",
+  "rigCredits": 5,
+  "anim": "01a12bc7-a476-74be-aed0-ef4c7e3e1587",
+  "animCredits": 21,
+  "actions": [
+   89,
+   14,
+   92,
+   91,
+   147,
+   178,
+   189
+  ]
+ },
+ "vanguard": {
+  "rig": "01a12bc7-689c-7334-b816-3609f4ecf95f",
+  "rigCredits": 5,
+  "anim": "01a12bc7-b754-70d9-b48c-3410f6646c24",
+  "animCredits": 21,
+  "actions": [
+   89,
+   14,
+   242,
+   127,
+   149,
+   178,
+   187
+  ]
+ },
+ "warden": {
+  "rig": "01a12bc7-6897-7710-b914-db6e7018d522",
+  "rigCredits": 5,
+  "anim": "01a12bc7-c457-772c-b4fc-2b35745551ba",
+  "animCredits": 21,
+  "actions": [
+   0,
+   14,
+   128,
+   255,
+   139,
+   171,
+   188
+  ]
+ },
+ "guard-body": {
+  "rig": "01a12bca-ef73-70a1-9a8e-623b7393f950",
+  "rigCredits": 5,
+  "anim": "01a12bcb-2c56-7125-9c76-6989fea25ef1",
+  "animCredits": 21,
+  "actions": [
+   89,
+   14,
+   240,
+   220,
+   138,
+   178,
+   187
+  ]
+ },
+ "warden-body": {
+  "rig": "01a12bca-ef79-710f-a188-ae5bd7846aec",
+  "rigCredits": 5,
+  "anim": "01a12bcb-411a-761a-b141-0c618120f84e",
+  "animCredits": 21,
+  "actions": [
+   0,
+   14,
+   128,
+   255,
+   139,
+   171,
+   188
+  ],
+  "extra-219": "01a12bcf-31f2-7476-a05a-cb2d81b5685a"
+ },
+ "thornling": {
+  "rig": "01a1376e-b70e-7581-ae21-2e722a9843cd",
+  "rigCredits": 5,
+  "anim": "01a1376f-138b-7148-a2da-e6c9cebe8b4d",
+  "animCredits": 21,
+  "actions": [
+   89,
+   14,
+   99,
+   238,
+   138,
+   178,
+   187
+  ]
+ },
+ "briarsling": {
+  "rig": "01a1376e-b71b-737f-b4d5-77f78c6c8600",
+  "rigCredits": 5,
+  "anim": "01a1376f-1743-75ef-85c3-52e567155e4e",
+  "animCredits": 21,
+  "actions": [
+   0,
+   14,
+   393,
+   398,
+   140,
+   179,
+   189
+  ]
+ },
+ "elderoak": {
+  "rig": "01a1376e-b708-741d-93f9-3835e72bb009",
+  "rigCredits": 5,
+  "anim": "01a1376f-6403-7440-92a6-682e01cffa3b",
+  "animCredits": 21,
+  "actions": [
+   0,
+   14,
+   128,
+   125,
+   139,
+   171,
+   188
+  ]
+ },
+ "clawling": {
+  "rig": "01a1377e-94e3-76f3-ab59-d36541dbab36",
+  "rigCredits": 5,
+  "anim": "01a1377e-efb4-7381-8caa-550a4d8b8fa7"
+ },
+ "eelsnare": {
+  "rig": "01a1377e-94c1-76f3-b2bc-fa7b0873eeb2",
+  "rigCredits": 5,
+  "anim": "01a1377e-de81-77d9-8e2c-2c281ed70e15"
+ },
+ "spineshot": {
+  "rig": "01a1377e-94d6-7519-949f-d5472492cb17",
+  "rigCredits": 5,
+  "anim": "01a1377e-e8f5-70f5-b88a-273cdcb19b99"
+ },
+ "tidecaller": {
+  "rig": "01a1377f-08b7-7383-ba08-93e3babc8d9e",
+  "rigCredits": 5,
+  "anim": "01a1377f-697a-7575-96fb-ba0c1b756253",
+  "animCredits": 21,
+  "actions": [
+   0,
+   14,
+   129,
+   125,
+   139,
+   171,
+   188
+  ]
+ }
+}

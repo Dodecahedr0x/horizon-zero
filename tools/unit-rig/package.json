@@ -1,0 +1,13 @@
+{
+  "name": "unit-rig",
+  "private": true,
+  "type": "module",
+  "description": "Optimize, rig and animate unit models with Meshy, then assemble the approved glb. See docs/src/assets.md.",
+  "dependencies": {
+    "@gltf-transform/cli": "4.5.1",
+    "@gltf-transform/core": "4.5.1",
+    "@gltf-transform/functions": "4.5.1",
+    "meshoptimizer": "1.3.0",
+    "sharp": "0.35.5"
+  }
+}

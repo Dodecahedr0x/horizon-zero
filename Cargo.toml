@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/combat",
+    "programs/horizon-zero",
+    "programs/mock-hydra",
+    "programs/mock-vrf",
+    "tests/litesvm-suite",
+]
+# The indexer links Carbon's Solana crates. It stays outside this workspace so those versions are not unified with the program.
+exclude = ["indexer"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"

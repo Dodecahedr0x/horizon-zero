@@ -1,0 +1,1 @@
+One board terrain piece only: a single square block of ground meant to tile a grid, centered, seen from a three-quarter angle above so its top face and two side faces show. Chunky and thick, flat top, straight square edges. Transparent background, PNG. No characters, no text.

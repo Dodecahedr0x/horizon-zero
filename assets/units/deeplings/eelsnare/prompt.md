@@ -1,0 +1,1 @@
+Exactly one figure. An Eelsnare: a lean, sinuous eel-like humanoid with long slick dark skin, a fin running down its spine and head, a wide jaw of needle teeth, holding a coil of barbed fishing line and a hooked gaff, a fast predatory forward lean.

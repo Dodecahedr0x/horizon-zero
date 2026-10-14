@@ -1,0 +1,54 @@
+# Networks and deployment
+
+Horizon Zero runs on three clusters. Local development and testing use a local Solana base layer with a MagicBlock ephemeral rollup, never devnet. Devnet and mainnet are deploy targets.
+
+| cluster | Solana RPC | VRF queue | how |
+| --- | --- | --- | --- |
+| local | `http://127.0.0.1:8899` | `GKE6d7iv8kCBrsxr78W3xVdjGLLLJnxsGiuzrsZCGEvb` (SDK test queue) | `pnpm localnet` |
+| devnet | `https://api.devnet.solana.com` | `Cuj97ggrhhidhbu39TijNVqE74xvKJ69gDervRUXAxGh` (SDK default) | `pnpm deploy:devnet` |
+| mainnet | your mainnet RPC (default `https://api.mainnet-beta.solana.com`) | `Cuj97ggrhhidhbu39TijNVqE74xvKJ69gDervRUXAxGh` | `pnpm deploy:mainnet --confirm-mainnet` |
+
+## Local stack
+
+`pnpm localnet` (`scripts/local-stack.mjs`) needs `solana-test-validator` from the Anza CLI and `mb-stack` and `vrf-oracle` from `npm install -g @magicblock-labs/ephemeral-validator@0.14.10`. It builds the program with default features and `programs/mock-hydra`, starts the stack with both loaded (the mock at the Hydra id, since `mb-stack` has no Hydra), starts the oracle, funds an admin keypair in `target/localnet/admin.json`, runs `app/scripts/bootstrap.mjs`, and starts the local Hydra cranker `app/scripts/hydra-cranker.mjs` with a funded `target/localnet/cranker.json`. It stays in the foreground; Ctrl-C stops every node. The ledger is reset on each start. `--no-build` reuses `target/deploy/horizon_zero.so` and `target/deploy/mock_hydra.so`. `HZ_HYDRA_SO` and `HZ_HYDRA_CRANKER` swap in a real Hydra build and MagicBlock's `hydra-cranker` binary (see [Testing](testing.md#local-stack)). `--check` plays one battle and exits (see [Testing](testing.md)).
+
+```mermaid
+flowchart LR
+  App["game (vite dev, wallet)"] -->|"RPC 8899"| Base
+  Indexer["indexer"] -->|"RPC 8899, ws 8900"| Base
+  subgraph stack ["pnpm localnet"]
+    Base["mb-test-validator: base layer<br/>horizon_zero, mock Hydra, VRF and delegation programs, VRF queues"]
+    ER["ephemeral validator: rollup 7799"]
+    QFS["query-filtering front 6699"]
+    Oracle["vrf-oracle (test queue)"]
+    Cranker["hydra-cranker"]
+    QFS --> ER
+    ER -->|"clones from, commits to"| Base
+    Oracle -->|"provide_randomness, then seed_match CPI"| Base
+    Cranker -->|"Trigger + settle_match"| Base
+  end
+```
+
+`horizon_zero` does not delegate accounts, so the game, the indexer, the oracle and the cranker all use the base layer. The rollup and its front run so that delegated flows can be tested against the same stack when the program uses them. The ports are `MB_STACK_BASE_PORT`, `MB_STACK_ER_PORT` and `MB_STACK_PUBLIC_PORT` (defaults 8899, 7799, 6699). The base validator's gossip, dynamic and faucet ports default to `18000`, `18100-18200` and `19900` (`HZ_LOCAL_GOSSIP_PORT`, `HZ_LOCAL_DYNAMIC_PORTS`, `HZ_LOCAL_FAUCET_PORT`) so they do not collide with another local validator. The script refuses to start when something already answers on the base port.
+
+`pnpm dev:chain` is `pnpm dev:all` with the stack and the indexer added and the game in its Solana shell (`VITE_DEV_MODE=false`) pointed at the local RPC and test queue; the indexer's default `SOLANA_RPC_URL` is already the local base layer. A browser wallet must be set to a custom or localnet RPC at `http://127.0.0.1:8899`. `pnpm localnet:fund <address>` airdrops 10 SOL there. `pnpm dev:all` without `--chain` keeps the no-wallet local ledger and starts no indexer, since nothing serves the local RPC then.
+
+Without `VITE_RPC_URL` and `VITE_ORACLE_QUEUE`, `vite dev` uses the local RPC and the test queue (`app/src/network.ts`); a production build without them uses devnet and the default queue.
+
+## Bootstrap
+
+`app/scripts/bootstrap.mjs --url <rpc> --keypair <file>` makes a cluster playable and is safe to repeat: `initialize` (the keypair becomes the admin), the battlegrounds in `content/catalog.json` (ids, budgets, stakes and grids), and every standard behavior in `content/catalog.json`. Each step is skipped when its account already exists. It fails when the program is not deployed on that cluster.
+
+## Devnet and mainnet
+
+`scripts/deploy.mjs <devnet|mainnet>` deploys or upgrades the program, then bootstraps:
+
+1. Mainnet requires `--confirm-mainnet`.
+2. The program keypair `target/deploy/horizon_zero-keypair.json` must be `Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c`, the `declare_id!`. Keep that file; without it the program cannot be upgraded at the same address.
+3. `cargo-build-sbf` with default features, unless `--skip-build`. `inline-mock-vrf` never reaches a real cluster.
+4. `solana program deploy` with `--keypair` (default `~/.config/solana/id.json`) as payer and upgrade authority, and `--with-compute-unit-price` when `--priority` is given.
+5. The bootstrap above, unless `--skip-bootstrap`.
+
+It ends by printing the build variables for the game (`VITE_DEV_MODE=false`, `VITE_RPC_URL`, `VITE_ORACLE_QUEUE`) and the indexer's `SOLANA_RPC_URL`. `render.yaml` lists `VITE_RPC_URL` (set it in the dashboard) and `VITE_ORACLE_QUEUE` for the game service.
+
+Devnet and mainnet settle battles through the deployed Hydra program `Hydra17i1feui9deaxu6d1TzSQMRNHeBRkDR1Awy7zea`, run by Hydra's crankers; nothing in this repository cranks there, and `app/scripts/hydra-cranker.mjs --url <rpc> --keypair <file>` can run against any cluster if a battle's crank is not picked up. The VRF callback only seeds the battle, so every battle fits; see [Settlement crank](matchmaking.md#settlement-crank).

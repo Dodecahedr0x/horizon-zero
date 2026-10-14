@@ -1,0 +1,1 @@
+Exactly one figure. A Tidecaller: a tall, eerie jellyfish-and-octopus shaman, a translucent glowing bell-shaped head with a hanging veil of fine tendrils, two long tentacle arms raised slightly outward, a rusted iron diving-bell lantern hanging at its side, robes of torn sailcloth. Unsettling and solemn.

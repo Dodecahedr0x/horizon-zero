@@ -1,0 +1,61 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  litesvm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - name: Install Solana
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/v4.2.1/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+      - name: Combat and LiteSVM
+        run: |
+          cargo test -p combat
+          cargo-build-sbf --manifest-path programs/mock-vrf/Cargo.toml
+          cargo-build-sbf --manifest-path programs/mock-hydra/Cargo.toml
+          cargo-build-sbf --manifest-path programs/horizon-zero/Cargo.toml -- --features inline-mock-vrf
+          cargo test -p horizon-litesvm-tests -- --test-threads=1
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Wasm replay matches the golden vector
+        run: |
+          rustup target add wasm32-unknown-unknown
+          curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+          wasm-pack build --target nodejs --out-dir ../../app/src/combat-node crates/combat --features wasm
+          wasm-pack build --target web --out-dir ../../app/src/combat-wasm crates/combat --features wasm
+          pnpm install
+          pnpm --filter app test
+          pnpm --filter asset-studio test
+
+  localnet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Solana
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/v4.2.1/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Local MagicBlock stack and a VRF-resolved battle
+        run: |
+          pnpm install
+          npm install -g @magicblock-labs/ephemeral-validator@0.14.10
+          pnpm localnet:check

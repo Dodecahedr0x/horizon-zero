@@ -1,0 +1,1 @@
+Exactly one figure. A Clawling: a squat, armored crab-like warrior standing on two thick legs, a heavy slate-blue carapace scarred and patched with iron plates, one oversized crushing claw and one small pincer, barnacles on its shell, eyes on short stalks.

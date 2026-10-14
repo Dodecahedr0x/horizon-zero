@@ -1,0 +1,1 @@
+An Elderoak: the largest and oldest Rootborn, a colossal broad oak with a hollow in its chest glowing ember-orange like a hearth, a canopy of ash-grey leaves, an iron lantern hanging from one branch, heavy root-feet, still and imposing.

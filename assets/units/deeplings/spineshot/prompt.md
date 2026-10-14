@@ -1,0 +1,1 @@
+Exactly one figure. A Spineshot: a rounded pufferfish-like creature on two stubby legs, its body bristling with long sharp quills, a bandolier of loose quills across the shoulder, one arm drawn back ready to hurl a spine, glowing sea-green spots along its sides. No bow.

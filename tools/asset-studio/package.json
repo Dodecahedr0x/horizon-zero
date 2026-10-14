@@ -1,0 +1,12 @@
+{
+  "name": "asset-studio",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node --env-file-if-exists=../../.env server.js",
+    "test": "node --test prompt.test.js generate.test.js entity.test.js listen.test.js queue.test.js battle.test.js balance.test.js meshy.test.js"
+  },
+  "dependencies": {
+    "three": "^0.170.0"
+  }
+}

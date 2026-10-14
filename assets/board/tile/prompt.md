@@ -1,0 +1,1 @@
+A square flagstone floor block of cracked ash-grey stone with worn bevelled edges and a faint ember-orange seam glowing in one crack. The top face is level and fills the square.

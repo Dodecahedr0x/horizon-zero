@@ -1,0 +1,1 @@
+An impassable square block of rubble: a broken flagstone base heaped with fallen ash-grey masonry, a snapped iron beam and charred timber, ember-orange embers smouldering between the stones. Clearly taller than a floor tile, about half its width in height, still a square footprint.

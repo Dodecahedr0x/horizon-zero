@@ -1,0 +1,483 @@
+/* Horizon Zero theme: tokens and components from the Horizon Zero design system (v3, bright cel-shaded fantasy).
+   Shared by the game (app/) and the asset studio (tools/asset-studio serves this file at /theme.css).
+   Fonts load from Google Fonts in each page's <head>. */
+
+:root {
+  /* Colour */
+  --ink: #0e0a08;
+  --dusk-light: #2b2724;
+  --dusk: #211e1b;
+  --dusk-shade: #181512;
+  --cream: #f1e8d8;
+  --cream-shade: #d9cbb3;
+  --cream-dim: #c4b6a3;
+  --stone-light: #4a433d;
+  --stone: #3a342f;
+  --stone-shade: #2b2622;
+  --ink-dim: #5e4a3c;
+  --parchment: #f0dcb4;
+  --parchment-shade: #c9a974;
+  --ember-light: #ffb36b;
+  --ember: #ff8a3d;
+  --ember-shade: #d9601f;
+  --gold-light: #ffe28a;
+  --gold: #ffcb45;
+  --gold-shade: #d99a1f;
+  --azure-light: #8fd3ff;
+  --azure: #43b3ff;
+  --azure-shade: #1f7fd1;
+  --blood-light: #ff7a72;
+  --blood: #e8464b;
+  --blood-shade: #a82a35;
+  --iron: #6b6259;
+  --danger: #ffb0a8;
+  --unit-guard: #e2d6c0;
+  --unit-skirmisher: #ff8a3d;
+  --unit-archer: #a8e0c8;
+  --unit-vanguard: #9fbf8f;
+  --unit-warden: #b3a08c;
+  --unit-thornling: #c98a4b;
+  --unit-briarsling: #c2384a;
+  --unit-elderoak: #8fa67a;
+  --unit-clawling: #d0703c;
+  --unit-eelsnare: #4fb3a4;
+  --unit-spineshot: #e3c77a;
+  --unit-tidecaller: #7fd6e0;
+  /* Spacing */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-12: 48px;
+  /* Radius */
+  --radius-sm: 6px;
+  --radius-md: 12px;
+  --radius-lg: 18px;
+  --radius-arch: 160px;
+  --radius-pill: 999px;
+  /* Shadow */
+  --shadow-drop: 0 4px 0 #0e0a08;
+  --shadow-drop-lg: 0 6px 0 #0e0a08;
+  --shadow-pressed: 0 1px 0 #0e0a08;
+  /* Size */
+  --outline: 3px;
+  --tap-min: 52px;
+  --content-max: 1100px;
+  /* Type */
+  --font-title: "Grenze Gotisch", "Alegreya SC", Georgia, serif;
+  --font-heading: "Alegreya SC", Georgia, serif;
+  --font-body: "Alegreya Sans", system-ui, sans-serif;
+}
+
+/* Components (hz-*). Mobile-first.
+   Cel rules: flat colour in three hard bands (light, base, shade), a 3px ink outline, a hard ink drop, one white glint.
+   No blur and no soft gradients anywhere. The diamond is the motif. */
+
+.hz-root {
+  --cel-outline: drop-shadow(3px 0 0 var(--ink)) drop-shadow(-3px 0 0 var(--ink)) drop-shadow(0 3px 0 var(--ink)) drop-shadow(0 -3px 0 var(--ink));
+  font-family: var(--font-body);
+  font-size: 17px;
+  font-weight: 500;
+  line-height: 1.45;
+  color: var(--cream);
+  background: linear-gradient(180deg, var(--dusk-light) 0 22%, var(--dusk) 22% 84%, var(--dusk-shade) 84%);
+  -webkit-font-smoothing: antialiased;
+}
+.hz-root *, .hz-root *::before, .hz-root *::after { box-sizing: border-box; }
+
+/* Outlined display text: ink stroke painted behind the fill, then a hard drop. */
+.hz-title, .hz-inked {
+  paint-order: stroke fill;
+  -webkit-text-stroke: 6px var(--ink);
+  text-shadow: 0 4px 0 var(--ink);
+}
+.hz-title { margin: 0; font-family: var(--font-title); font-weight: 900; font-size: 56px; line-height: 0.9; color: var(--gold); -webkit-text-stroke-width: 8px; text-shadow: 0 5px 0 var(--ink); }
+.hz-lore { margin: 0; font-style: italic; color: var(--cream-dim); }
+.trace { margin: 12px 0 0; padding-left: 1.2em; display: grid; gap: 4px; max-height: 180px; overflow: auto; }
+.trace li { color: var(--ink-dim); }
+.trace__done { color: var(--ink); }
+
+/* Diamond: the motif, outlined in ink. */
+.hz-diamond {
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  flex: none;
+  background: linear-gradient(135deg, var(--gold-light) 0 35%, var(--gold) 35% 70%, var(--gold-shade) 70%);
+  border: 2px solid var(--ink);
+  border-radius: 2px;
+  transform: rotate(45deg);
+}
+.hz-diamond--ember { background: linear-gradient(135deg, var(--ember-light) 0 35%, var(--ember) 35% 70%, var(--ember-shade) 70%); }
+
+/* Button */
+.hz-button {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  min-height: var(--tap-min);
+  padding: 0 22px 3px;
+  border: var(--outline) solid var(--ink);
+  border-radius: var(--radius-md);
+  background: linear-gradient(180deg, var(--stone-light) 0 34%, var(--stone) 34% 76%, var(--stone-shade) 76%);
+  color: var(--cream);
+  box-shadow: var(--shadow-drop);
+  font-family: var(--font-heading);
+  font-size: 18px;
+  font-weight: 900;
+  letter-spacing: 0.02em;
+  text-decoration: none;
+  cursor: pointer;
+  transition: transform 80ms ease-out, box-shadow 80ms ease-out;
+}
+.hz-button::after {
+  content: "";
+  position: absolute;
+  top: 5px;
+  left: 9px;
+  width: 14px;
+  height: 5px;
+  border-radius: 3px;
+  background: #ffffff;
+  opacity: 0.3;
+}
+.hz-button:active { transform: translateY(3px); box-shadow: var(--shadow-pressed); }
+.hz-button--primary {
+  background: linear-gradient(180deg, var(--ember-light) 0 36%, var(--ember) 36% 74%, var(--ember-shade) 74%);
+  box-shadow: var(--shadow-drop-lg);
+  color: var(--ink);
+  font-size: 20px;
+}
+.hz-button--primary:active { transform: translateY(5px); box-shadow: var(--shadow-pressed); }
+.hz-button--block { display: flex; width: 100%; }
+.hz-button:disabled, .hz-button[aria-disabled="true"] {
+  background: linear-gradient(180deg, #4d4640 0 36%, #3d3631 36% 74%, #2e2925 74%);
+  color: var(--cream-dim);
+  box-shadow: none;
+  transform: translateY(3px);
+  cursor: not-allowed;
+}
+.hz-button:disabled::after { opacity: 0.3; }
+.hz-button:focus-visible { outline: 3px solid var(--gold); outline-offset: 3px; }
+
+/* Frame: a bright cream panel with a cel shadow band, ink outline and hard drop. */
+.hz-frame {
+  position: relative;
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-4);
+  border: var(--outline) solid var(--ink);
+  border-radius: var(--radius-lg);
+  background: linear-gradient(180deg, var(--stone) 0 86%, var(--stone-shade) 86%);
+  color: var(--cream);
+  box-shadow: var(--shadow-drop-lg);
+}
+.hz-frame--crest::before {
+  content: "";
+  position: absolute;
+  top: -11px;
+  left: 50%;
+  width: 18px;
+  height: 18px;
+  margin-left: -9px;
+  background: linear-gradient(135deg, var(--gold-light) 0 35%, var(--gold) 35% 70%, var(--gold-shade) 70%);
+  border: 3px solid var(--ink);
+  border-radius: 3px;
+  transform: rotate(45deg);
+}
+.hz-frame__title { margin: 0; font-family: var(--font-heading); font-size: 22px; font-weight: 900; line-height: 1.05; color: var(--cream); }
+.hz-frame__body { margin: 0; color: var(--cream); }
+.hz-frame__meta { font-size: 13px; color: var(--cream-dim); overflow-wrap: anywhere; }
+.hz-frame.is-selected { box-shadow: 0 0 0 4px var(--gold), 0 0 0 7px var(--ink), 0 10px 0 var(--ink); }
+
+/* Divider: a cream bar outlined in ink, with diamonds on it. */
+.hz-divider { position: relative; display: flex; justify-content: center; align-items: center; gap: 8px; height: 22px; margin: var(--space-4) 0; }
+.hz-divider::before { content: ""; position: absolute; left: 0; right: 0; top: 50%; height: 6px; margin-top: -3px; z-index: 0; background: var(--stone-shade); border: 2px solid var(--ink); border-radius: var(--radius-pill); }
+.hz-divider > * { position: relative; }
+
+/* SectionHeading */
+.hz-section { display: flex; align-items: center; gap: 10px; margin: 0 0 var(--space-4); font-family: var(--font-heading); font-size: 24px; font-weight: 900; color: var(--cream); paint-order: stroke fill; -webkit-text-stroke: 6px var(--ink); text-shadow: 0 3px 0 var(--ink); }
+.hz-section__num {
+  display: inline-grid;
+  place-items: center;
+  min-width: 34px;
+  height: 30px;
+  padding: 0 6px 2px;
+  border: 3px solid var(--ink);
+  border-radius: var(--radius-sm);
+  background: linear-gradient(180deg, var(--gold-light) 0 35%, var(--gold) 35% 72%, var(--gold-shade) 72%);
+  box-shadow: var(--shadow-drop);
+  color: var(--ink);
+  font-size: 16px;
+  -webkit-text-stroke: 0;
+  text-shadow: none;
+}
+.hz-kicker { margin: 0 0 6px; font-style: italic; font-weight: 800; color: var(--gold); }
+
+/* TabBar: dusk-shade bar on phones; the selected tab rises on an ember plate. */
+.hz-tabbar {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  gap: 6px;
+  padding: 8px 8px 10px;
+  background: var(--dusk-shade);
+  border-top: var(--outline) solid var(--ink);
+}
+.hz-tab {
+  position: relative;
+  display: grid;
+  justify-items: center;
+  align-content: center;
+  gap: 6px;
+  min-height: 58px;
+  border: var(--outline) solid transparent;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--cream-dim);
+  font-family: var(--font-heading);
+  font-size: 15px;
+  font-weight: 900;
+  cursor: pointer;
+}
+.hz-tab::before {
+  content: "";
+  width: 12px;
+  height: 12px;
+  background: var(--iron);
+  border: 2px solid var(--ink);
+  border-radius: 2px;
+  transform: rotate(45deg);
+}
+.hz-tab[aria-selected="true"] {
+  border-color: var(--ink);
+  background: linear-gradient(180deg, var(--ember-light) 0 34%, var(--ember) 34% 76%, var(--ember-shade) 76%);
+  box-shadow: var(--shadow-drop);
+  transform: translateY(-4px);
+  color: var(--ink);
+}
+.hz-tab[aria-selected="true"]::before { background: linear-gradient(135deg, var(--gold-light) 0 35%, var(--gold) 35% 70%, var(--gold-shade) 70%); width: 14px; height: 14px; }
+.hz-tab:focus-visible { outline: 3px solid var(--gold); outline-offset: 2px; }
+@media (min-width: 800px) {
+  .hz-tabbar { display: flex; justify-content: center; background: none; border: 0; }
+  .hz-tab { min-width: 140px; }
+}
+
+/* LeagueBanner: a cloth banner with a swallowtail. The outline follows the cut via the --cel-outline filter. */
+.hz-banner-league {
+  --tail: 18px;
+  position: relative;
+  isolation: isolate;
+  min-width: 0;
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  padding: 16px 6px calc(var(--tail) + 16px);
+  border: 0;
+  background: none;
+  color: var(--cream);
+  font: inherit;
+  text-align: center;
+  cursor: pointer;
+  filter: var(--cel-outline) drop-shadow(0 4px 0 var(--ink));
+}
+.hz-banner-league::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: linear-gradient(90deg, var(--stone) 0 72%, var(--stone-shade) 72%);
+  clip-path: polygon(0 0, 100% 0, 100% 100%, 50% calc(100% - var(--tail)), 0 100%);
+}
+.hz-banner-league::after { content: ""; position: absolute; top: -6px; left: -5px; right: -5px; height: 10px; border-radius: 5px; background: linear-gradient(180deg, var(--gold-light) 0 40%, var(--gold-shade) 40%); }
+.hz-banner-league[aria-pressed="true"] { transform: translateY(-4px); color: var(--ink); }
+.hz-banner-league[aria-pressed="true"]::before { background: linear-gradient(90deg, var(--ember-light) 0 18%, var(--ember) 18% 72%, var(--ember-shade) 72%); }
+.hz-banner-league__pips { display: flex; gap: 6px; }
+.hz-banner-league__name { font-family: var(--font-heading); font-size: 17px; font-weight: 900; line-height: 1; }
+.hz-banner-league__stake {
+  padding: 2px 10px 4px;
+  border: 2.5px solid var(--ink);
+  border-radius: var(--radius-sm);
+  background: linear-gradient(180deg, var(--gold-light) 0 38%, var(--gold) 38% 74%, var(--gold-shade) 74%);
+  font-family: var(--font-heading);
+  font-size: 22px;
+  font-weight: 900;
+  line-height: 1.1;
+  color: var(--ink);
+}
+.hz-banner-league__budget { font-size: 13px; font-weight: 800; color: var(--cream-dim); }
+.hz-banner-league[aria-pressed="true"] .hz-banner-league__budget { color: var(--cream); }
+
+/* CostGem: a faceted ember diamond with a number. */
+.hz-gem { position: relative; display: inline-grid; place-items: center; width: 38px; height: 38px; flex: none; font-family: var(--font-heading); font-size: 18px; font-weight: 900; color: var(--ink); }
+.hz-gem::before {
+  content: "";
+  position: absolute;
+  inset: 6px;
+  transform: rotate(45deg);
+  background: linear-gradient(135deg, var(--ember-light) 0 38%, var(--ember) 38% 68%, var(--ember-shade) 68%);
+  border: 2.5px solid var(--ink);
+  border-radius: 4px;
+  box-shadow: 3px 3px 0 var(--ink);
+}
+.hz-gem > span { position: relative; margin-top: -1px; }
+
+/* StatGrid */
+.hz-stats { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; margin: 0; }
+.hz-stats > div {
+  display: grid;
+  justify-items: center;
+  gap: 2px;
+  padding: 7px 2px 6px;
+  border: 2.5px solid var(--ink);
+  border-radius: var(--radius-sm);
+  background: linear-gradient(180deg, var(--stone-light) 0 30%, var(--stone) 30% 78%, var(--stone-shade) 78%);
+  box-shadow: 0 3px 0 var(--ink);
+}
+.hz-stats dt { order: 2; font-size: 11px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; color: var(--cream-dim); }
+.hz-stats dd { order: 1; margin: 0; font-family: var(--font-heading); font-size: 24px; font-weight: 900; line-height: 1; color: var(--cream); }
+
+/* UnitCard: an arched portrait window with a banded sky in the unit's swatch, over a Frame plate. */
+.hz-unit { display: grid; }
+.hz-unit__portrait {
+  --sw: var(--swatch, var(--ember));
+  position: relative;
+  height: 190px;
+  margin: 0 14px;
+  border: var(--outline) solid var(--ink);
+  border-bottom: 0;
+  border-radius: var(--radius-arch) var(--radius-arch) 0 0;
+  overflow: hidden;
+  background:
+    radial-gradient(ellipse 30% 7% at 50% 90%, color-mix(in srgb, var(--ink) 35%, transparent) 98%, transparent 100%),
+    linear-gradient(180deg,
+      color-mix(in srgb, var(--sw) 45%, #ffffff) 0 38%,
+      var(--sw) 38% 74%,
+      color-mix(in srgb, var(--sw) 72%, var(--ink)) 74%);
+}
+.hz-unit__portrait img { position: absolute; inset: 14px 0 6px; width: 100%; height: calc(100% - 20px); object-fit: contain; }
+.hz-unit__portrait::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 48%;
+  width: 46px;
+  height: 46px;
+  margin: -23px 0 0 -23px;
+  border: 3px dashed var(--ink);
+  border-radius: 6px;
+  opacity: 0.45;
+  transform: rotate(45deg);
+}
+.hz-unit__portrait:has(img)::after { display: none; }
+.hz-unit__portrait .hz-gem { position: absolute; top: 10px; right: 14px; z-index: 1; }
+.hz-unit__head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--space-2); }
+.hz-unit__name { margin: 0; font-family: var(--font-heading); font-size: 28px; font-weight: 900; line-height: 1; color: var(--cream); }
+.hz-unit__role { font-style: italic; font-weight: 800; font-size: 14px; color: var(--cream-dim); }
+.hz-unit__desc { margin: 0; color: var(--cream); }
+
+/* RosterRow */
+.hz-roster {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: 60px;
+  padding: 0 8px 0 18px;
+  border: var(--outline) solid var(--ink);
+  border-radius: var(--radius-md);
+  background: linear-gradient(180deg, var(--stone) 0 80%, var(--stone-shade) 80%);
+  box-shadow: var(--shadow-drop);
+  color: var(--cream);
+}
+.hz-roster::before { content: ""; width: 16px; height: 16px; background: linear-gradient(135deg, color-mix(in srgb, var(--swatch, var(--ember)) 45%, #ffffff) 0 38%, var(--swatch, var(--ember)) 38% 70%, color-mix(in srgb, var(--swatch, var(--ember)) 72%, var(--ink)) 70%); border: 2.5px solid var(--ink); border-radius: 3px; transform: rotate(45deg); }
+.hz-roster__name { font-family: var(--font-heading); font-size: 20px; font-weight: 900; line-height: 1.05; }
+.hz-roster__behavior { display: block; font-family: var(--font-body); font-style: italic; font-size: 14px; font-weight: 800; color: var(--cream-dim); }
+
+/* HealthBar: chunky pips in a pill trough. Azure for your side, blood for the foe. */
+.hz-health { display: inline-flex; gap: 3px; padding: 4px 6px; border: var(--outline) solid var(--ink); border-radius: var(--radius-pill); background: var(--dusk-shade); box-shadow: 0 3px 0 var(--ink); }
+.hz-health > i { width: 13px; height: 12px; border: 2px solid var(--ink); border-radius: 4px; background: var(--iron); }
+.hz-health > i.on { background: linear-gradient(180deg, var(--azure-light) 0 40%, var(--azure) 40% 75%, var(--azure-shade) 75%); }
+.hz-health--foe > i.on { background: linear-gradient(180deg, var(--blood-light) 0 40%, var(--blood) 40% 75%, var(--blood-shade) 75%); }
+
+/* Scroll: parchment with rolled ends. */
+.hz-scroll {
+  position: relative;
+  margin: 12px 4px;
+  padding: 20px 18px 22px;
+  border: var(--outline) solid var(--ink);
+  border-radius: 6px;
+  background: linear-gradient(180deg, var(--parchment) 0 84%, var(--parchment-shade) 84%);
+  color: var(--ink);
+  box-shadow: var(--shadow-drop-lg);
+}
+.hz-scroll::before, .hz-scroll::after {
+  content: "";
+  position: absolute;
+  left: -10px;
+  right: -10px;
+  height: 18px;
+  border: var(--outline) solid var(--ink);
+  border-radius: 9px;
+  background: linear-gradient(180deg, var(--parchment) 0 40%, var(--parchment-shade) 40%);
+}
+.hz-scroll::before { top: -12px; }
+.hz-scroll::after { bottom: -12px; }
+.hz-scroll h3 { margin: 0 0 6px; font-family: var(--font-heading); font-size: 22px; font-weight: 900; line-height: 1.05; color: var(--ink); }
+.hz-scroll p { margin: 0; color: var(--ink); font-style: normal; }
+.hz-scroll small { display: block; margin-top: 6px; color: var(--ink-dim); font-size: 14px; font-weight: 800; }
+
+/* Field */
+.hz-field { display: grid; gap: 6px; font-size: 12px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: var(--cream-dim); }
+.hz-field select, .hz-field input {
+  min-height: var(--tap-min);
+  padding: 0 38px 2px 14px;
+  appearance: none;
+  border: var(--outline) solid var(--ink);
+  border-radius: var(--radius-md);
+  background:
+    linear-gradient(45deg, transparent 45%, var(--cream) 45%) right 20px center / 8px 8px no-repeat,
+    linear-gradient(-45deg, transparent 45%, var(--cream) 45%) right 13px center / 8px 8px no-repeat,
+    linear-gradient(180deg, var(--stone-light) 0 30%, var(--stone) 30% 80%, var(--stone-shade) 80%);
+  box-shadow: 0 3px 0 var(--ink);
+  color: var(--cream);
+  font-family: var(--font-body);
+  font-size: 17px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.hz-field input { padding-right: 14px; background: linear-gradient(180deg, var(--stone-light) 0 30%, var(--stone) 30% 80%, var(--stone-shade) 80%); }
+.hz-field select:focus-visible, .hz-field input:focus-visible { outline: 3px solid var(--gold); outline-offset: 3px; }
+
+/* Ribbon and error */
+.hz-ribbon {
+  position: relative;
+  isolation: isolate;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 40px;
+  margin: 0 6px;
+  padding: 4px 30px 6px;
+  color: var(--ink);
+  font-family: var(--font-heading);
+  font-size: 17px;
+  font-weight: 900;
+  text-align: center;
+  filter: var(--cel-outline) drop-shadow(0 4px 0 var(--ink));
+}
+.hz-ribbon::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: linear-gradient(180deg, var(--ember-light) 0 34%, var(--ember) 34% 74%, var(--ember-shade) 74%);
+  clip-path: polygon(0 0, 100% 0, calc(100% - 16px) 50%, 100% 100%, 0 100%, 16px 50%);
+}
+.hz-error { display: flex; gap: 10px; align-items: center; margin: 0; color: var(--danger); font-weight: 800; }
+.hz-error::before { content: ""; width: 11px; height: 11px; flex: none; background: var(--blood); border: 2px solid var(--ink); border-radius: 2px; transform: rotate(45deg); }

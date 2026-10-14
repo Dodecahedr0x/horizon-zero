@@ -1,0 +1,17 @@
+[book]
+title = "Horizon Zero"
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+# Diagrams are mermaid fences. mdBook 0.5 renders them as source.
+# Enable the standard preprocessor only when `mdbook-mermaid` is installed:
+#
+# [preprocessor.mermaid]
+# command = "mdbook-mermaid"
+#
+# Then run `mdbook-mermaid install docs` if that tool's docs require the
+# extra JS files, and confirm `mdbook build docs` succeeds.

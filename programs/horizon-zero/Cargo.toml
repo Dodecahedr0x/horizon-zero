@@ -1,0 +1,34 @@
+[package]
+name = "horizon-zero"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Horizon Zero army matchmaking and VRF battles"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "horizon_zero"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "ephemeral-vrf-sdk/anchor"]
+anchor-debug = ["anchor-lang/anchor-debug"]
+inline-mock-vrf = []
+# Checked by the code Anchor's #[program] macro generates.
+custom-heap = []
+custom-panic = []
+# Logs where settle_match spends compute (see crates/combat/src/profile.rs). Benchmarks only.
+cu-profile = ["combat/cu-profile"]
+
+[dependencies]
+anchor-lang = { version = "1.0.1", features = ["init-if-needed"] }
+ephemeral-vrf-sdk = { version = "0.17.3", features = ["anchor"] }
+combat = { path = "../../crates/combat" }
+solana-instructions-sysvar = "3.0.1"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

@@ -1,0 +1,60 @@
+services:
+  - type: web
+    name: horizon-zero
+    runtime: node
+    plan: starter
+    buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm --filter app build
+    startCommand: node app/server.js
+    envVars:
+      - key: INDEXER_URL
+        fromService:
+          name: horizon-zero-indexer
+          type: pserv
+          property: hostport
+      # Comma-separated browser origins allowed to read GET /assets.
+      # Set this to the landing origin, for example https://horizon-zero-landing.onrender.com
+      # /api does not send this header. Unset uses the local landing dev and preview origins.
+      - key: ASSET_CORS_ORIGINS
+        sync: false
+      # The cluster the game bundle talks to, inlined at build time. See scripts/deploy.mjs.
+      - key: VITE_RPC_URL
+        sync: false
+      - key: VITE_ORACLE_QUEUE
+        value: Cuj97ggrhhidhbu39TijNVqE74xvKJ69gDervRUXAxGh
+  - type: web
+    name: horizon-zero-landing
+    runtime: static
+    buildCommand: cd landing && npm ci && npm run build
+    staticPublishPath: landing/dist
+    # fromService host is the private-network hostname. Static sites are not on that
+    # network, so the public game URL cannot be injected. Set VITE_WEB_ORIGIN to the
+    # horizon-zero public origin, for example https://horizon-zero.onrender.com
+    # Vite inlines it at build time. Asset URLs are ${VITE_WEB_ORIGIN}/assets/...
+    envVars:
+      - key: VITE_WEB_ORIGIN
+        sync: false
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    headers:
+      - path: /*
+        name: X-Frame-Options
+        value: DENY
+  - type: pserv
+    name: horizon-zero-indexer
+    runtime: rust
+    plan: starter
+    buildCommand: cargo build --release --locked --manifest-path indexer/Cargo.toml
+    startCommand: ./indexer/target/release/horizon-indexer
+    disk:
+      name: horizon-zero-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: DATABASE_PATH
+        value: /var/data/horizon.db
+      - key: SOLANA_RPC_URL
+        sync: false
+      - key: PROGRAM_ID
+        sync: false

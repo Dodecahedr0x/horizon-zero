@@ -1,0 +1,1944 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Horizon Zero asset studio</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Alegreya+SC:wght@700;800;900&family=Alegreya+Sans:ital,wght@0,500;0,800;1,500&family=Grenze+Gotisch:wght@900&display=swap" />
+    <link rel="stylesheet" href="/theme.css" />
+    <style>
+      body { margin: 0; background: var(--dusk-shade); }
+      .studio-shell { min-height: 100vh; display: grid; grid-template-columns: 1fr; }
+      .rail .hz-tabbar {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        background: var(--dusk);
+        border: var(--outline) solid var(--ink);
+        border-radius: var(--radius-md);
+      }
+      .rail .hz-tab { min-width: 0; width: 100%; }
+      #assets-tools, #battle-tools, #assets-main, #battle-main { display: grid; gap: var(--space-4); align-content: start; min-width: 0; }
+      #assets-tools[hidden], #battle-tools[hidden], #assets-main[hidden], #battle-main[hidden] { display: none; }
+      .battle-controls, .batch-row { display: flex; flex-wrap: wrap; gap: var(--space-3); align-items: center; }
+      .battle-sides { display: grid; gap: var(--space-3); }
+      .battle select, .batch-rounds, .army-list select {
+        min-height: 44px;
+        padding: 0 12px;
+        border: var(--outline) solid var(--ink);
+        border-radius: var(--radius-md);
+        background: var(--cream);
+        color: var(--ink);
+        font: 800 15px var(--font-body);
+      }
+      .field-label select, .field-label .batch-rounds { display: block; width: 100%; margin-top: 4px; }
+      .battle-readout { display: grid; gap: var(--space-3); align-items: start; }
+      .army-card {
+        flex: 1 1 240px;
+        display: grid;
+        gap: 8px;
+        padding: 12px;
+        border: var(--outline) solid var(--ink);
+        border-radius: var(--radius-md);
+        background: var(--dusk);
+      }
+      .army-card h2, .battle-stage h2 { margin: 0; }
+      .army-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+      .army-list li { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-weight: 800; overflow-wrap: anywhere; }
+      .army-list select { flex: 1 1 7rem; min-width: 0; width: auto; }
+      #battle-board {
+        display: block;
+        width: min(100%, 720px);
+        min-height: 280px;
+        overflow: hidden;
+        border: var(--outline) solid var(--ink);
+        border-radius: var(--radius-md);
+        background: var(--dusk-shade);
+      }
+      #battle-board canvas { display: block; width: 100%; height: auto; }
+      .steps {
+        list-style: decimal;
+        margin: 0;
+        max-height: 320px;
+        overflow: auto;
+        padding: 8px 8px 8px 28px;
+        border: var(--outline) solid var(--ink);
+        border-radius: var(--radius-md);
+        background: var(--cream);
+        color: var(--ink);
+      }
+      .battle-log { display: grid; gap: var(--space-3); min-width: 0; align-content: start; }
+      .step-filters { display: flex; flex-wrap: wrap; gap: 6px; }
+      .step-filters:empty { display: none; }
+      .step-badge, .step-chip {
+        border: 2px solid var(--ink);
+        font: 800 14px/1 var(--font-body);
+        cursor: pointer;
+      }
+      .step-badge--team {
+        min-width: 32px;
+        min-height: 32px;
+        padding: 0 8px;
+        border-radius: 8px;
+      }
+      .step-badge--unit, .step-chip {
+        min-height: 32px;
+        padding: 0 10px;
+        border-radius: 999px;
+      }
+      .step-badge--a { background: var(--azure); color: var(--ink); }
+      .step-badge--b { background: var(--blood); color: var(--cream); }
+      .step-badge[aria-pressed="true"] { box-shadow: inset 0 0 0 2px var(--ink); }
+      .steps li { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 4px 6px; font-weight: 800; cursor: pointer; }
+      .step-text { flex: 1 1 12rem; }
+      .steps li[aria-current="step"] { background: var(--gold); }
+      .batch-games {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+        display: grid;
+        gap: 4px;
+        max-height: 280px;
+        overflow: auto;
+      }
+      .batch-games button {
+        display: grid;
+        grid-template-columns: 3rem 5rem minmax(0, 1fr);
+        gap: 8px;
+        align-items: center;
+        width: 100%;
+        min-height: 44px;
+        padding: 8px 12px;
+        border: var(--outline) solid var(--ink);
+        border-radius: var(--radius-md);
+        background: var(--cream);
+        color: var(--ink);
+        font: 800 14px/1.3 var(--font-body);
+        text-align: left;
+        cursor: pointer;
+      }
+      .batch-games button[aria-pressed="true"] { background: var(--gold); }
+      .batch-games .seed { font-weight: 500; overflow-wrap: anywhere; }
+      .tally { display: flex; flex-wrap: wrap; gap: 12px 20px; font-weight: 800; }
+      .rail { display: grid; gap: var(--space-3); align-content: start; padding: var(--space-4); border-bottom: var(--outline) solid var(--ink); background: var(--dusk-shade); min-width: 0; }
+      .rail .level-prompt { min-height: 96px; }
+      .rail .direction-input { width: 100%; }
+      .provider {
+        margin: 0;
+        padding: 10px 12px 12px;
+        border: var(--outline) solid var(--ink);
+        border-radius: var(--radius-md);
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px 14px;
+      }
+      .provider legend { padding: 0 4px; font: 800 15px var(--font-body); }
+      .provider label { display: flex; align-items: center; gap: 6px; font-weight: 800; }
+      .tree { display: block; overflow: auto; max-height: 220px; padding: 0; color: var(--cream); }
+      .tree ul { list-style: none; margin: 0; padding: 0; }
+      .tree .children { margin: 0; padding: 0 0 0 18px; }
+      .tree-row { display: flex; align-items: center; min-height: 32px; }
+      .tree-disclosure {
+        width: 28px;
+        height: 28px;
+        flex: 0 0 28px;
+        display: grid;
+        place-items: center;
+        border: 0;
+        border-radius: var(--radius-md);
+        background: transparent;
+        color: var(--cream);
+        cursor: pointer;
+        padding: 0;
+      }
+      .tree-disclosure:focus-visible, .tree-label:focus-visible { outline: 3px solid var(--gold); outline-offset: 2px; }
+      .tree-disclosure:disabled { opacity: 0; cursor: default; }
+      .tree-caret {
+        width: 0;
+        height: 0;
+        border-top: 5px solid transparent;
+        border-bottom: 5px solid transparent;
+        border-left: 7px solid currentColor;
+      }
+      .tree-disclosure[aria-expanded="true"] .tree-caret { transform: rotate(90deg); }
+      .tree-label {
+        flex: 1;
+        min-width: 0;
+        min-height: 32px;
+        padding: 0 8px;
+        border: 0;
+        border-radius: var(--radius-md);
+        background: transparent;
+        color: var(--cream);
+        font: 800 15px var(--font-body);
+        text-align: left;
+        cursor: pointer;
+        overflow-wrap: anywhere;
+      }
+      .tree-label.active { background: var(--ember); color: var(--ink); }
+      .tree-menu {
+        position: fixed;
+        z-index: 30;
+        display: grid;
+        min-width: 16rem;
+        padding: 6px;
+        border: var(--outline) solid var(--ink);
+        border-radius: var(--radius-md);
+        background: var(--cream);
+      }
+      .tree-menu[hidden] { display: none; }
+      .tree-menu button {
+        min-height: 36px;
+        padding: 6px 10px;
+        border: 0;
+        border-radius: var(--radius-md);
+        background: transparent;
+        color: var(--ink);
+        font: 800 15px var(--font-body);
+        text-align: left;
+        cursor: pointer;
+      }
+      .tree-menu button:hover:not(:disabled), .tree-menu button:focus-visible { background: var(--ember); }
+      .tree-menu button:disabled { opacity: 0.4; cursor: default; }
+      .work { display: grid; gap: var(--space-4); align-content: start; padding: var(--space-4); }
+      .work > .hz-section { margin: 0; overflow-wrap: anywhere; }
+      .hz-scroll pre { margin: 0; white-space: pre-wrap; font: 500 15px/1.45 var(--font-body); color: var(--ink); }
+      .views { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: var(--space-4); }
+      .views figure { margin: 0; }
+      .views figcaption { font-family: var(--font-heading); font-size: 18px; font-weight: 900; }
+      .views img, .views canvas {
+        display: block;
+        width: 100%;
+        aspect-ratio: 1;
+        object-fit: contain;
+        border: var(--outline) solid var(--ink);
+        border-radius: var(--radius-md);
+        background: repeating-conic-gradient(var(--cream) 0% 25%, var(--cream-shade) 0% 50%) 50% / 24px 24px;
+      }
+      .views canvas { background: var(--dusk-light); touch-action: none; }
+      .editor { display: grid; gap: var(--space-2); }
+      .field-label { margin: 0; font-weight: 800; }
+      .level-prompt {
+        width: 100%;
+        min-height: 140px;
+        box-sizing: border-box;
+        padding: var(--space-3);
+        border: var(--outline) solid var(--ink);
+        border-radius: var(--radius-md);
+        background: var(--cream);
+        color: var(--ink);
+        font: 500 15px/1.45 var(--font-body);
+      }
+      .hint { margin: 0; color: var(--cream-dim); font-weight: 800; }
+      .actions { display: flex; flex-wrap: wrap; gap: var(--space-3); align-items: center; }
+      .regen-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3); }
+      .direction-field { display: flex; align-items: center; gap: 8px; min-width: 0; }
+      .direction-input {
+        width: min(18rem, 70vw);
+        min-height: 44px;
+        box-sizing: border-box;
+        padding: 0 14px;
+        border: var(--outline) solid var(--ink);
+        border-radius: var(--radius-md);
+        background: var(--cream);
+        color: var(--ink);
+        font: 500 15px var(--font-body);
+      }
+      .entity { display: grid; gap: var(--space-2); }
+      .entity-name {
+        width: min(100%, 24rem);
+        min-height: 44px;
+        box-sizing: border-box;
+        padding: 0 14px;
+        border: var(--outline) solid var(--ink);
+        border-radius: var(--radius-md);
+        background: var(--cream);
+        color: var(--ink);
+        font: 800 15px var(--font-body);
+      }
+      .status { margin: 0; color: var(--cream-dim); font-weight: 800; }
+      .queue {
+        display: grid;
+        gap: var(--space-2);
+        padding: var(--space-3);
+        border: var(--outline) solid var(--ink);
+        border-radius: var(--radius-md);
+        background: var(--dusk);
+      }
+      .queue-head { display: flex; flex-wrap: wrap; gap: var(--space-3); align-items: center; justify-content: space-between; }
+      .queue .hz-section { margin: 0; }
+      .queue-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; max-height: 240px; overflow: auto; }
+      .queue-row {
+        display: grid;
+        grid-template-columns: minmax(0, 1.4fr) auto auto;
+        gap: 4px 12px;
+        align-items: baseline;
+        padding: 8px 12px;
+        border: var(--outline) solid var(--ink);
+        border-radius: var(--radius-md);
+        background: var(--dusk-light);
+        color: var(--cream);
+        font-weight: 800;
+      }
+      .queue-node { overflow-wrap: anywhere; }
+      .queue-error { grid-column: 1 / -1; color: var(--danger); font-weight: 800; }
+      .queue-direction { grid-column: 1 / -1; font-weight: 500; overflow-wrap: anywhere; }
+      .queue-row[data-status="failed"] .queue-status { color: var(--danger); }
+      .queue-row[data-status="running"] .queue-status { color: var(--ember-light); }
+      .queue-row[data-status="done"] .queue-status { color: var(--gold); }
+      /* Balance lab */
+      .hz-button[hidden] { display: none; }
+      .stat-wrap { overflow-x: auto; border: var(--outline) solid var(--ink); border-radius: var(--radius-md); box-shadow: var(--shadow-drop); background: var(--stone-shade); }
+      .stat-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+      .stat-table th, .stat-table td { padding: 6px 6px; text-align: center; border-bottom: 2px solid var(--ink); white-space: nowrap; }
+      .stat-table thead th { position: sticky; top: 0; background: var(--stone); color: var(--cream-dim); font: 800 11px var(--font-body); letter-spacing: 0.06em; text-transform: uppercase; }
+      .stat-table thead .group { color: var(--gold); }
+      .stat-table tbody th { text-align: left; font: 900 16px var(--font-heading); color: var(--cream); }
+      .stat-table tbody th::before { content: ""; display: inline-block; width: 10px; height: 10px; margin-right: 8px; background: var(--swatch); border: 2px solid var(--ink); border-radius: 2px; transform: rotate(45deg); }
+      .stat-table input[type="number"] { width: 54px; min-height: 36px; padding: 0 4px; border: 2px solid var(--ink); border-radius: var(--radius-sm); background: var(--dusk-shade); color: var(--cream); font: 800 15px var(--font-body); text-align: center; }
+      .stat-table input.changed, .stat-table select.changed { outline: 3px solid var(--gold); outline-offset: 1px; }
+      .stat-table select { min-height: 36px; border: 2px solid var(--ink); border-radius: var(--radius-sm); background: var(--dusk-shade); color: var(--cream); font: 800 14px var(--font-body); }
+      .stat-table .ap { font: 900 16px var(--font-heading); color: var(--gold); }
+      .stat-table .ap[data-zero="true"] { color: var(--blood-light); }
+      .balance-warnings { margin: 0; padding: 0; list-style: none; display: grid; gap: 6px; }
+      .balance-warnings li { display: flex; gap: 8px; align-items: baseline; color: var(--danger); font-weight: 800; }
+      .balance-warnings li::before { content: ""; flex: none; width: 9px; height: 9px; background: var(--blood); border: 2px solid var(--ink); transform: rotate(45deg); }
+      .duel-grid td { min-width: 74px; font-weight: 800; color: var(--ink); }
+      .duel-grid td.mirror { opacity: 0.55; }
+      .duel-grid td small, .army-grid td small { display: block; font-size: 12px; font-weight: 800; }
+      .delta-up { color: var(--azure-light); }
+      .delta-down { color: var(--blood-light); }
+      .duel-grid td .delta-up, .duel-grid td .delta-down { color: var(--ink); }
+      .army-grid td { color: var(--cream); font-weight: 800; }
+      .balance-save { display: grid; gap: var(--space-2); padding-top: var(--space-3); border-top: 2px dashed color-mix(in srgb, var(--cream-dim) 30%, transparent); }
+      @media (min-width: 900px) {
+        .studio-shell { grid-template-columns: minmax(320px, 400px) minmax(0, 1fr); }
+        .rail { position: sticky; top: 0; height: 100vh; overflow: auto; border-bottom: 0; border-right: var(--outline) solid var(--ink); }
+        .work { padding: var(--space-6); }
+      }
+      @media (min-width: 1100px) {
+        .battle-readout { grid-template-columns: minmax(0, 1fr) minmax(280px, 420px); }
+        .steps { max-height: calc(100vh - 180px); }
+      }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "/vendor/three/build/three.module.js",
+          "three/examples/jsm/loaders/GLTFLoader.js": "/vendor/three/examples/jsm/loaders/GLTFLoader.js",
+          "three/examples/jsm/utils/SkeletonUtils.js": "/vendor/three/examples/jsm/utils/SkeletonUtils.js"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div class="hz-root studio-shell">
+      <aside class="rail" aria-label="Studio">
+        <nav class="hz-tabbar" role="tablist" aria-label="Studio">
+          <button type="button" class="hz-tab" id="tab-assets" role="tab" aria-selected="true" aria-controls="assets-main">Assets</button>
+          <button type="button" class="hz-tab" id="tab-battle" role="tab" aria-selected="false" aria-controls="battle-main">Battle</button>
+          <button type="button" class="hz-tab" id="tab-balance" role="tab" aria-selected="false" aria-controls="balance-main">Balance</button>
+        </nav>
+        <div id="assets-tools">
+          <p class="hz-kicker">Horizon Zero</p>
+          <fieldset class="provider" id="provider">
+            <legend>Image provider</legend>
+            <label><input type="radio" name="provider" value="codex" checked /> Codex</label>
+            <label><input type="radio" name="provider" value="agent" /> Agent</label>
+          </fieldset>
+          <fieldset class="provider" id="text-provider">
+            <legend>Text provider</legend>
+            <label><input type="radio" name="textProvider" value="codex" checked /> Codex</label>
+            <label><input type="radio" name="textProvider" value="agent" /> Agent</label>
+          </fieldset>
+          <nav class="tree" id="tree" aria-label="Assets"></nav>
+          <div class="entity">
+            <label class="field-label" for="entity-name">Folder name</label>
+            <input id="entity-name" class="entity-name" autocomplete="off" spellcheck="false" disabled />
+            <div class="actions">
+              <button type="button" class="hz-button" id="create-entity" disabled>New folder</button>
+              <button type="button" class="hz-button" id="rename-entity" disabled>Rename</button>
+              <button type="button" class="hz-button" id="remove-entity" disabled>Remove</button>
+              <button type="button" class="hz-button" id="confirm-remove" hidden>Confirm remove</button>
+            </div>
+          </div>
+          <div class="editor">
+            <label class="field-label" for="level-prompt">Prompt for this folder</label>
+            <textarea id="level-prompt" class="level-prompt" disabled></textarea>
+            <div class="actions">
+              <button type="button" class="hz-button" id="save-prompt" disabled>Save prompt</button>
+              <div class="regen-row">
+                <button type="button" class="hz-button" id="regen-prompt" disabled>Regenerate prompt</button>
+                <label class="direction-field field-label" for="prompt-direction">Direction
+                  <input id="prompt-direction" class="direction-input" type="text" placeholder="what to emphasize" autocomplete="off" spellcheck="false" />
+                </label>
+              </div>
+            </div>
+          </div>
+          <div class="actions">
+            <button type="button" class="hz-button" id="regen" disabled>Regenerate image</button>
+            <button type="button" class="hz-button" id="approve-image"><span class="hz-diamond"></span>Approve image</button>
+            <button type="button" class="hz-button" id="gen3d">Generate 3D</button>
+            <button type="button" class="hz-button" id="approve-model"><span class="hz-diamond"></span>Approve model</button>
+          </div>
+          <p class="status" id="status" role="status"></p>
+        </div>
+        <div id="battle-tools" hidden>
+          <div class="battle-controls">
+            <label class="field-label" for="battle-race">Race
+              <select id="battle-race"></select>
+            </label>
+            <p class="hint" id="race-units"></p>
+            <label class="field-label" for="battle-ground">Battleground
+              <select id="battle-ground">
+                <option value="outpost">Outpost 8×6 budget 8</option>
+                <option value="garrison">Garrison 10×8 budget 16</option>
+                <option value="citadel">Citadel 12×10 budget 32</option>
+              </select>
+            </label>
+            <button type="button" class="hz-button" id="generate-army">Generate army</button>
+            <button type="button" class="hz-button" id="assign-a">Use as side A</button>
+            <button type="button" class="hz-button" id="assign-b">Use as side B</button>
+          </div>
+          <div class="battle-sides">
+            <section class="army-card">
+              <h2 class="hz-section"><span class="hz-section__num">✦</span><span>Draft</span></h2>
+              <p class="hint" id="draft-cost">Generate an army to see it.</p>
+              <ul class="army-list" id="army-draft"></ul>
+            </section>
+            <section class="army-card">
+              <h2 class="hz-section"><span class="hz-section__num">A</span><span>Side A</span></h2>
+              <p class="hint" id="side-a-cost"></p>
+              <ul class="army-list" id="army-a"></ul>
+            </section>
+            <section class="army-card">
+              <h2 class="hz-section"><span class="hz-section__num">B</span><span>Side B</span></h2>
+              <p class="hint" id="side-b-cost"></p>
+              <ul class="army-list" id="army-b"></ul>
+            </section>
+          </div>
+          <p class="hint" id="army-status" role="status"></p>
+          <div class="battle-controls">
+            <button type="button" class="hz-button" id="fight" disabled>Fight</button>
+            <label class="field-label" for="battle-speed">Speed
+              <select id="battle-speed">
+                <option value="0.5">0.5×</option>
+                <option value="1" selected>1×</option>
+                <option value="2">2×</option>
+                <option value="4">4×</option>
+              </select>
+            </label>
+            <button type="button" class="hz-button" id="battle-step-back" disabled>Step back</button>
+            <button type="button" class="hz-button" id="battle-step-forward" disabled>Step forward</button>
+            <button type="button" class="hz-button" id="battle-play" disabled>Play</button>
+          </div>
+          <section class="batch" aria-label="Many rounds">
+            <h2 class="hz-section"><span class="hz-section__num">✦</span><span>Simulate many</span></h2>
+            <p class="hint">Side A fights a new random army each round.</p>
+            <div class="batch-row">
+              <label class="field-label" for="batch-rounds">Rounds
+                <input id="batch-rounds" class="batch-rounds" type="number" min="1" max="200" value="20" />
+              </label>
+              <button type="button" class="hz-button" id="batch-start" disabled>Simulate many</button>
+              <button type="button" class="hz-button" id="batch-stop" disabled>Stop</button>
+            </div>
+            <p class="tally">
+              <span>Wins <span id="batch-wins">0</span></span>
+              <span>Losses <span id="batch-losses">0</span></span>
+              <span>Draws <span id="batch-draws">0</span></span>
+              <span>Done <span id="batch-done">0</span></span>
+            </p>
+            <p class="status" id="batch-status" role="status"></p>
+            <ol class="batch-games" id="batch-games"></ol>
+          </section>
+        </div>
+        <div id="balance-tools" hidden>
+          <p class="hz-kicker">Tune unit characteristics</p>
+          <h2 class="hz-section"><span class="hz-section__num">✦</span><span>Balance</span></h2>
+          <p class="hint">Edit the stats in the table, then run. Every run plays the same seeds twice, once with your stats and once with the catalog, so the deltas show the effect of the change.</p>
+          <label class="field-label" for="balance-race">Race
+            <select id="balance-race"></select>
+          </label>
+          <label class="field-label" for="balance-ground">Battleground
+            <select id="balance-ground">
+              <option value="outpost">Outpost · 8×6 · budget 8</option>
+              <option value="garrison" selected>Garrison · 10×8 · budget 16</option>
+              <option value="citadel">Citadel · 12×10 · budget 32</option>
+            </select>
+          </label>
+          <fieldset class="provider" id="balance-mode">
+            <legend>Test</legend>
+            <label><input type="radio" name="balanceMode" value="duels" checked /> Duels: every unit one on one</label>
+            <label><input type="radio" name="balanceMode" value="armies" /> Armies: random legal hosts</label>
+          </fieldset>
+          <label class="field-label" for="balance-games">Games per pairing
+            <input id="balance-games" class="batch-rounds" type="number" min="1" max="500" value="40" />
+          </label>
+          <div class="batch-row">
+            <button type="button" class="hz-button hz-button--primary" id="balance-run">Run</button>
+            <button type="button" class="hz-button" id="balance-reset">Reset to catalog</button>
+          </div>
+          <p class="status" id="balance-status" role="status"></p>
+          <section class="balance-save" aria-label="Save">
+            <h2 class="hz-section"><span class="hz-section__num">✦</span><span>Keep the changes</span></h2>
+            <p class="hint">Save writes content/catalog.json and the matching Rust table in crates/combat/src/catalog.rs. The game reads the catalog at once in dev; on-chain battles need the program rebuilt.</p>
+            <div class="batch-row">
+              <button type="button" class="hz-button" id="balance-save" disabled>Save to catalog</button>
+              <button type="button" class="hz-button hz-button--primary" id="balance-save-confirm" hidden>Confirm save</button>
+            </div>
+          </section>
+        </div>
+      </aside>
+      <main class="work">
+        <div id="assets-main" role="tabpanel" aria-labelledby="tab-assets">
+          <h2 class="hz-section"><span class="hz-section__num">✦</span><span id="title">Pick an asset</span></h2>
+          <div class="views">
+            <figure class="hz-frame"><figcaption>Candidate</figcaption><img id="candidate" alt="Candidate image" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" /></figure>
+            <figure class="hz-frame"><figcaption>Approved</figcaption><img id="approved" alt="Approved image" src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" /></figure>
+            <figure class="hz-frame"><figcaption>Model</figcaption><canvas id="model" width="280" height="280"></canvas></figure>
+          </div>
+          <p class="field-label">Inherited prompt</p>
+          <p class="hint">Image generation uses the inherited prompt.</p>
+          <div class="hz-scroll"><pre id="inherited">Choose a folder on the left to see its prompt.</pre></div>
+          <section class="queue" id="queue" aria-label="Task queue">
+            <div class="queue-head">
+              <h2 class="hz-section" id="queue-heading"><span class="hz-section__num">✦</span><span>Queue</span></h2>
+              <button type="button" class="hz-button" id="clear-finished">Clear finished</button>
+            </div>
+            <p class="hint" id="queue-empty">No jobs yet.</p>
+            <ul class="queue-list" id="queue-list" aria-live="polite"></ul>
+          </section>
+        </div>
+        <div id="balance-main" role="tabpanel" aria-labelledby="tab-balance" hidden>
+          <h2 class="hz-section"><span class="hz-section__num">✦</span><span>Unit characteristics</span></h2>
+          <p class="hint">Actions are action points per turn: each attack or cast spends one, and one left over defends. Changed values are outlined; hover one to see the catalog value.</p>
+          <div class="stat-wrap"><table class="stat-table" id="balance-table"></table></div>
+          <ul class="balance-warnings" id="balance-warnings"></ul>
+          <h2 class="hz-section"><span class="hz-section__num">✦</span><span>Results</span></h2>
+          <p class="hint" id="balance-summary">Run a test to see results.</p>
+          <div id="balance-results"></div>
+        </div>
+        <div id="battle-main" role="tabpanel" aria-labelledby="tab-battle" hidden>
+          <h2 class="hz-section"><span class="hz-section__num">✦</span><span>Board</span></h2>
+          <p class="hint" id="battle-outcome">No fight yet.</p>
+          <p class="hint" id="battle-seed"></p>
+          <p class="hint" id="battle-step" data-cursor="0"></p>
+          <div class="battle-readout">
+            <div class="board" id="battle-board" aria-label="Battle board"></div>
+            <div class="battle-log">
+              <div class="step-filters" id="battle-filters" aria-label="Active event filters"></div>
+              <ol class="steps" id="battle-steps"></ol>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+    <div id="tree-menu" class="tree-menu" role="menu" hidden>
+      <button type="button" role="menuitem" data-action="image">Regenerate image</button>
+      <button type="button" role="menuitem" data-action="model">Regenerate model</button>
+      <button type="button" role="menuitem" data-action="images">Regenerate images in children</button>
+      <button type="button" role="menuitem" data-action="models">Regenerate models in children</button>
+    </div>
+    <script type="module">
+      import * as THREE from "three";
+      import { OrbitControls } from "/vendor/three/examples/jsm/controls/OrbitControls.js";
+      import { GLTFLoader } from "/vendor/three/examples/jsm/loaders/GLTFLoader.js";
+      import { createBoardView } from "/board-view.js";
+      import { eventShown, stepActor } from "/event-list.js";
+
+      const tree = document.querySelector("#tree");
+      const title = document.querySelector("#title");
+      const levelPrompt = document.querySelector("#level-prompt");
+      const inherited = document.querySelector("#inherited");
+      const savePrompt = document.querySelector("#save-prompt");
+      const regenPrompt = document.querySelector("#regen-prompt");
+      const entityName = document.querySelector("#entity-name");
+      const createEntity = document.querySelector("#create-entity");
+      const renameEntity = document.querySelector("#rename-entity");
+      const removeEntity = document.querySelector("#remove-entity");
+      const confirmRemove = document.querySelector("#confirm-remove");
+      const candidate = document.querySelector("#candidate");
+      const approved = document.querySelector("#approved");
+      const status = document.querySelector("#status");
+      const regen = document.querySelector("#regen");
+      const approveImage = document.querySelector("#approve-image");
+      const gen3d = document.querySelector("#gen3d");
+      const approveModel = document.querySelector("#approve-model");
+      const placeholder = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+      let current = null;
+      let showToken = 0;
+      let renderer;
+      let scene;
+      let camera;
+      let controls;
+      let modelRoot;
+
+      document.querySelector("#model").addEventListener("wheel", (event) => {
+        event.preventDefault();
+      }, { passive: false });
+
+      function bust(url) {
+        return url + "?t=" + Date.now();
+      }
+
+      function selectedProvider() {
+        const checked = document.querySelector('input[name="provider"]:checked');
+        return checked ? checked.value : "codex";
+      }
+
+      function selectedTextProvider() {
+        const checked = document.querySelector('input[name="textProvider"]:checked');
+        return checked ? checked.value : "codex";
+      }
+
+      async function show(rel) {
+        const token = ++showToken;
+        const data = await (await fetch("/api/element?path=" + encodeURIComponent(rel))).json();
+        if (token !== showToken) return;
+        if (data.error) throw new Error(data.error);
+        current = data;
+        title.textContent = data.path === "." ? "world" : data.path;
+        levelPrompt.disabled = false;
+        savePrompt.disabled = false;
+        regenPrompt.disabled = false;
+        entityName.disabled = false;
+        entityName.value = data.path === "." ? "" : data.name;
+        createEntity.disabled = false;
+        renameEntity.disabled = data.path === ".";
+        removeEntity.disabled = data.path === ".";
+        confirmRemove.hidden = true;
+        levelPrompt.value = data.ownPrompt || "";
+        inherited.textContent = data.prompt || "";
+        const fileName = data.name;
+        const imagePath = data.path === "." ? fileName : data.path + "/" + fileName;
+        candidate.src = data.candidatePng ? bust("/files/" + imagePath + ".png") : placeholder;
+        approved.src = data.approvedPng ? bust("/files/" + imagePath + ".approved.png") : placeholder;
+        regen.disabled = false;
+        approveImage.disabled = false;
+        approveModel.disabled = !data.element;
+        gen3d.disabled = !data.element || !data.approvedPng;
+        status.textContent = data.task ? "Meshy " + data.task.status : "";
+        status.className = "status";
+        try {
+          await preview(modelPath(data));
+        } catch (error) {
+          if (token !== showToken) return;
+          status.textContent = error.message;
+          status.className = "hz-error";
+        }
+      }
+
+      function modelPath(data) {
+        if (typeof data.model === "string") return data.model;
+        const prefix = data.path && data.path !== "." ? data.path + "/" : "";
+        if (data.approvedGlb) return prefix + data.name + ".approved.glb";
+        if (data.candidateGlb) return prefix + data.name + ".glb";
+        return "";
+      }
+
+      function frameModel(object) {
+        const box = new THREE.Box3().setFromObject(object);
+        const size = box.getSize(new THREE.Vector3());
+        const center = box.getCenter(new THREE.Vector3());
+        const scale = 1.6 / (size.length() || 1);
+        object.scale.multiplyScalar(scale);
+        object.position.copy(center).multiplyScalar(-scale);
+        camera.near = 0.01;
+        camera.far = 100;
+        camera.position.set(1.6, 1.2, 2.2);
+        camera.lookAt(0, 0, 0);
+        camera.updateProjectionMatrix();
+        controls.target.set(0, 0, 0);
+        controls.update();
+      }
+
+      async function preview(rel) {
+        const canvas = document.querySelector("#model");
+        if (!renderer) {
+          renderer = new THREE.WebGLRenderer({ canvas, alpha: true });
+          scene = new THREE.Scene();
+          camera = new THREE.PerspectiveCamera(35, 1, 0.01, 100);
+          camera.position.set(1.6, 1.2, 2.2);
+          camera.lookAt(0, 0, 0);
+          controls = new OrbitControls(camera, canvas);
+          controls.mouseButtons.LEFT = THREE.MOUSE.ROTATE;
+          controls.mouseButtons.MIDDLE = THREE.MOUSE.PAN;
+          controls.mouseButtons.RIGHT = THREE.MOUSE.PAN;
+          controls.minDistance = 0.95;
+          controls.maxDistance = 12;
+          controls.target.set(0, 0, 0);
+          controls.addEventListener("change", () => renderer.render(scene, camera));
+          scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+          const light = new THREE.DirectionalLight(0xffffff, 1.2);
+          light.position.set(2, 3, 4);
+          scene.add(light);
+        }
+        const view = canvas.clientWidth || 280;
+        renderer.setSize(view, view, false);
+        if (modelRoot) scene.remove(modelRoot);
+        modelRoot = null;
+        if (!rel) {
+          renderer.render(scene, camera);
+          return;
+        }
+        const gltf = await new GLTFLoader().loadAsync(bust("/files/" + rel));
+        modelRoot = gltf.scene;
+        frameModel(modelRoot);
+        scene.add(modelRoot);
+        renderer.render(scene, camera);
+      }
+
+      const taskState = new Map();
+
+      function renderTask(task) {
+        const row = document.createElement("li");
+        row.className = "queue-row";
+        row.dataset.node = task.node;
+        row.dataset.kind = task.kind;
+        row.dataset.status = task.status;
+        const node = document.createElement("span");
+        node.className = "queue-node";
+        node.textContent = task.node === "." ? "world" : task.node;
+        const kind = document.createElement("span");
+        kind.className = "queue-kind";
+        kind.textContent = task.kind === "3d" ? "3D" : task.kind;
+        const state = document.createElement("span");
+        state.className = "queue-status";
+        state.textContent = task.status;
+        row.append(node, kind, state);
+        if (task.direction) {
+          const direction = document.createElement("span");
+          direction.className = "queue-direction";
+          direction.textContent = task.direction;
+          row.append(direction);
+        }
+        if (task.status === "failed" && task.error) {
+          const error = document.createElement("span");
+          error.className = "queue-error";
+          error.textContent = task.error;
+          row.append(error);
+        }
+        return row;
+      }
+
+      async function paintQueue() {
+        const response = await fetch("/api/tasks", { cache: "no-store" });
+        const body = await response.json();
+        const tasks = body.tasks || [];
+        const list = document.querySelector("#queue-list");
+        const empty = document.querySelector("#queue-empty");
+        empty.hidden = tasks.length > 0;
+        list.replaceChildren();
+        let refresh = false;
+        for (const task of tasks) {
+          const previous = taskState.get(task.id);
+          if (current && task.node === current.path && (task.status === "done" || task.status === "failed") && previous !== task.status) {
+            refresh = true;
+          }
+          taskState.set(task.id, task.status);
+          list.append(renderTask(task));
+        }
+        for (const id of [...taskState.keys()]) {
+          if (!tasks.some((task) => task.id === id)) taskState.delete(id);
+        }
+        if (refresh && current) {
+          show(current.path).catch((error) => {
+            status.textContent = error.message;
+            status.className = "hz-error";
+          });
+        }
+      }
+
+      async function enqueueJob(url) {
+        if (!current) return;
+        const payload = { path: current.path };
+        if (url === "/api/generate") payload.provider = selectedProvider();
+        if (url === "/api/regenerate-prompt") {
+          payload.textProvider = selectedTextProvider();
+          payload.direction = document.querySelector("#prompt-direction").value;
+        }
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const body = await response.json();
+        if (!response.ok) {
+          status.textContent = body.error || "failed";
+          status.className = "hz-error";
+          return;
+        }
+        status.textContent = "Queued " + (body.kind || "job");
+        status.className = "status";
+        await paintQueue();
+      }
+
+      async function act(url) {
+        if (!current) return;
+        status.textContent = "working…";
+        status.className = "status";
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: current.path }),
+        });
+        const body = await response.json();
+        if (!response.ok) {
+          status.textContent = body.error || "failed";
+          status.className = "hz-error";
+        } else await show(current.path);
+      }
+
+      regen.onclick = () => enqueueJob("/api/generate").catch((error) => {
+        status.textContent = error.message;
+        status.className = "hz-error";
+      });
+      approveImage.onclick = () => act("/api/approve-image");
+      gen3d.onclick = () => enqueueJob("/api/generate-3d").catch((error) => {
+        status.textContent = error.message;
+        status.className = "hz-error";
+      });
+      approveModel.onclick = () => act("/api/approve-model");
+      savePrompt.onclick = async () => {
+        if (!current) return;
+        status.textContent = "saving…";
+        status.className = "status";
+        const response = await fetch("/api/prompt", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ path: current.path, prompt: levelPrompt.value }),
+        });
+        const body = await response.json();
+        if (!response.ok) {
+          status.textContent = body.error || "failed";
+          status.className = "hz-error";
+          return;
+        }
+        await show(current.path);
+        status.textContent = "Prompt saved";
+        status.className = "status";
+      };
+      document.querySelector("#provider").addEventListener("change", async () => {
+        const provider = selectedProvider();
+        const response = await fetch("/api/provider", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ provider }),
+        });
+        const body = await response.json();
+        if (!response.ok) {
+          status.textContent = body.error || "failed";
+          status.className = "hz-error";
+        }
+      });
+      document.querySelector("#text-provider").addEventListener("change", async () => {
+        const textProvider = selectedTextProvider();
+        const response = await fetch("/api/provider", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ textProvider }),
+        });
+        const body = await response.json();
+        if (!response.ok) {
+          status.textContent = body.error || "failed";
+          status.className = "hz-error";
+        }
+      });
+      regenPrompt.onclick = () => enqueueJob("/api/regenerate-prompt").catch((error) => {
+        status.textContent = error.message;
+        status.className = "hz-error";
+      });
+      document.querySelector("#clear-finished").onclick = async () => {
+        const response = await fetch("/api/tasks/clear", { method: "POST" });
+        const body = await response.json();
+        if (!response.ok) {
+          status.textContent = body.error || "failed";
+          status.className = "hz-error";
+          return;
+        }
+        await paintQueue();
+      };
+      async function refresh(rel) {
+        await loadTree();
+        markSelected(rel);
+        await show(rel);
+      }
+      async function runEntity(url, payload) {
+        if (!current) return;
+        status.textContent = "updating folder…";
+        status.className = "status";
+        confirmRemove.hidden = true;
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const body = await response.json();
+        if (!response.ok) {
+          status.textContent = body.error || "failed";
+          status.className = "hz-error";
+          return;
+        }
+        await refresh(body.path);
+        status.textContent = "Folder updated";
+        status.className = "status";
+      }
+      createEntity.onclick = () => {
+        if (current) expandPath(current.path);
+        runEntity("/api/create", { path: current.path, name: entityName.value }).catch((error) => {
+          status.textContent = error.message;
+          status.className = "hz-error";
+        });
+      };
+      renameEntity.onclick = () => runEntity("/api/rename", { path: current.path, name: entityName.value }).catch((error) => {
+        status.textContent = error.message;
+        status.className = "hz-error";
+      });
+      removeEntity.onclick = () => {
+        if (!current || current.path === ".") return;
+        confirmRemove.hidden = false;
+        status.textContent = "Click Confirm remove to delete this folder";
+        status.className = "status";
+      };
+      confirmRemove.onclick = () => runEntity("/api/remove", { path: current.path }).catch((error) => {
+        status.textContent = error.message;
+        status.className = "hz-error";
+      });
+
+      let catalog = null;
+      const collapsed = new Set();
+
+      function expandPath(rel) {
+        collapsed.delete(".");
+        if (!rel || rel === ".") return;
+        let cursor = "";
+        for (const part of rel.split("/")) {
+          cursor = cursor ? cursor + "/" + part : part;
+          collapsed.delete(cursor);
+        }
+      }
+
+      function markSelected(rel) {
+        for (const entry of tree.querySelectorAll(".tree-label")) {
+          entry.classList.toggle("active", entry.dataset.path === rel);
+        }
+      }
+
+      function renderNode(node) {
+        const item = document.createElement("li");
+        const row = document.createElement("div");
+        row.className = "tree-row";
+        row.dataset.path = node.path;
+        const children = [...(node.children || [])].sort((a, b) => a.name.localeCompare(b.name));
+        const disclosure = document.createElement("button");
+        disclosure.type = "button";
+        disclosure.className = "tree-disclosure";
+        if (children.length) {
+          const open = !collapsed.has(node.path);
+          disclosure.setAttribute("aria-expanded", open ? "true" : "false");
+          disclosure.setAttribute("aria-label", (open ? "Collapse " : "Expand ") + node.name);
+          const caret = document.createElement("span");
+          caret.className = "tree-caret";
+          caret.setAttribute("aria-hidden", "true");
+          disclosure.append(caret);
+          disclosure.onclick = () => {
+            if (open) collapsed.add(node.path);
+            else collapsed.delete(node.path);
+            paintTree();
+          };
+        } else {
+          disclosure.disabled = true;
+          disclosure.tabIndex = -1;
+          disclosure.setAttribute("aria-hidden", "true");
+        }
+        const label = document.createElement("button");
+        label.type = "button";
+        label.className = "tree-label";
+        label.dataset.path = node.path;
+        label.textContent = node.name;
+        label.onclick = () => {
+          markSelected(node.path);
+          show(node.path).catch((error) => {
+            status.textContent = error.message;
+            status.className = "hz-error";
+          });
+        };
+        row.append(disclosure, label);
+        item.append(row);
+        if (children.length && !collapsed.has(node.path)) {
+          const list = document.createElement("ul");
+          list.className = "children";
+          for (const child of children) list.append(renderNode(child));
+          item.append(list);
+        }
+        return item;
+      }
+
+      function paintTree() {
+        if (!catalog) return;
+        tree.replaceChildren();
+        const list = document.createElement("ul");
+        list.append(renderNode(catalog));
+        tree.append(list);
+        if (current) markSelected(current.path);
+      }
+
+      async function loadTree() {
+        catalog = await fetch("/api/tree").then((response) => response.json());
+        paintTree();
+      }
+
+      const treeMenu = document.querySelector("#tree-menu");
+
+      function findCatalogNode(rel, node = catalog) {
+        if (!node) return null;
+        if (node.path === rel) return node;
+        for (const child of node.children || []) {
+          const found = findCatalogNode(rel, child);
+          if (found) return found;
+        }
+        return null;
+      }
+
+      function closeTreeMenu() {
+        treeMenu.hidden = true;
+      }
+
+      function openTreeMenu(x, y, rel) {
+        const node = findCatalogNode(rel);
+        const childless = !node || (node.children || []).length === 0;
+        treeMenu.dataset.path = rel;
+        treeMenu.querySelector('[data-action="images"]').disabled = childless;
+        treeMenu.querySelector('[data-action="models"]').disabled = childless;
+        treeMenu.hidden = false;
+        treeMenu.style.left = "0px";
+        treeMenu.style.top = "0px";
+        const rect = treeMenu.getBoundingClientRect();
+        const left = Math.max(8, Math.min(x, window.innerWidth - rect.width - 8));
+        const top = Math.max(8, Math.min(y, window.innerHeight - rect.height - 8));
+        treeMenu.style.left = `${left}px`;
+        treeMenu.style.top = `${top}px`;
+      }
+
+      async function postJob(url, payload) {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const body = await response.json();
+        if (!response.ok) {
+          status.textContent = body.error || "failed";
+          status.className = "hz-error";
+          await paintQueue();
+          return;
+        }
+        const tasks = Array.isArray(body.tasks) ? body.tasks : [body];
+        const failed = tasks.filter((task) => task && task.status === "failed");
+        if (tasks.length > 0 && failed.length === tasks.length && failed[0].error) {
+          status.textContent = failed[0].error;
+          status.className = "hz-error";
+        } else if (tasks.length === 0) {
+          status.textContent = "No descendant folders";
+          status.className = "status";
+        } else {
+          const kind = tasks[0].kind === "3d" ? "3D" : tasks[0].kind;
+          status.textContent = tasks.length === 1 ? "Queued " + kind : "Queued " + tasks.length + " " + kind + " jobs";
+          status.className = "status";
+        }
+        await paintQueue();
+      }
+
+      tree.addEventListener("contextmenu", (event) => {
+        const row = event.target.closest(".tree-row");
+        if (!row || !row.dataset.path) return;
+        event.preventDefault();
+        openTreeMenu(event.clientX, event.clientY, row.dataset.path);
+      });
+      treeMenu.addEventListener("contextmenu", (event) => event.preventDefault());
+      treeMenu.addEventListener("click", (event) => {
+        const button = event.target.closest("button");
+        if (!button || button.disabled) return;
+        const rel = treeMenu.dataset.path;
+        const action = button.dataset.action;
+        closeTreeMenu();
+        const payload = { path: rel };
+        let url = "/api/regenerate-models";
+        if (action === "image" || action === "images") payload.provider = selectedProvider();
+        if (action === "image") url = "/api/generate";
+        else if (action === "model") url = "/api/regenerate-model";
+        else if (action === "images") url = "/api/generate-descendants";
+        postJob(url, payload).catch((error) => {
+          status.textContent = error.message;
+          status.className = "hz-error";
+        });
+      });
+      document.addEventListener("pointerdown", (event) => {
+        if (event.button !== 0 || treeMenu.hidden || treeMenu.contains(event.target)) return;
+        closeTreeMenu();
+      });
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") closeTreeMenu();
+      });
+
+      let races = [];
+      let behaviors = [];
+      let draftArmy = null;
+      let sideA = null;
+      let sideB = null;
+      let fightState = null;
+      let boardView = null;
+      let batchId = null;
+      let batchTimer = null;
+      let replayKey = null;
+      let paintedBatch = null;
+      let paintedGames = -1;
+      let fightSerial = 0;
+      let eventFilters = [];
+
+      const STUDIO_TABS = ["assets", "battle", "balance"];
+
+      function studioTab() {
+        try {
+          const saved = sessionStorage.getItem("hz-studio-tab");
+          return STUDIO_TABS.includes(saved) ? saved : "assets";
+        } catch {
+          return "assets";
+        }
+      }
+
+      function showTab(name) {
+        for (const tab of STUDIO_TABS) {
+          const on = tab === name;
+          document.querySelector(`#${tab}-tools`).hidden = !on;
+          document.querySelector(`#${tab}-main`).hidden = !on;
+          document.querySelector(`#tab-${tab}`).setAttribute("aria-selected", on ? "true" : "false");
+        }
+        try {
+          sessionStorage.setItem("hz-studio-tab", name);
+        } catch {
+          // The tab still switches when storage is blocked.
+        }
+      }
+
+      for (const tab of STUDIO_TABS) document.querySelector(`#tab-${tab}`).onclick = () => showTab(tab);
+      showTab(studioTab());
+
+      function kindName(unit) {
+        return unit && unit.name ? unit.name : "Unit";
+      }
+
+      function selectedRace() {
+        return races.find((race) => String(race.id) === document.querySelector("#battle-race").value) || races[0] || null;
+      }
+
+      function paintRace() {
+        const race = selectedRace();
+        const line = document.querySelector("#race-units");
+        line.textContent = race ? race.units.map((unit) => `${unit.name} ${unit.cost}`).join(" · ") : "";
+      }
+
+      function raceOf(army) {
+        if (!army) return selectedRace();
+        return races.find((race) => race.id === army.race) || selectedRace();
+      }
+
+      function copyArmy(army) {
+        return {
+          ...army,
+          units: army.units.map((unit) => ({
+            ...unit,
+            body: Array.isArray(unit.body) ? unit.body.slice() : unit.body,
+            cast: unit.cast ? { ...unit.cast } : unit.cast,
+          })),
+        };
+      }
+
+      function changeKind(army, index, kindId) {
+        const race = raceOf(army);
+        const kind = race && race.units.find((item) => item.id === kindId);
+        if (!kind) return "Unknown kind.";
+        if (army.units.length > 10) return "An army can have at most 10 units.";
+        const cost = army.units.reduce((sum, unit, unitIndex) => {
+          const id = unitIndex === index ? kind.id : unit.kind;
+          const item = race.units.find((entry) => entry.id === id);
+          return sum + (item ? item.cost : 0);
+        }, 0);
+        if (cost > army.budget) return "That kind exceeds the battleground budget.";
+        const unit = army.units[index];
+        unit.kind = kind.id;
+        unit.name = kind.name;
+        unit.cost = kind.cost;
+        unit.hp = kind.hp;
+        unit.atk = kind.atk;
+        unit.range = kind.range;
+        unit.speed = kind.speed;
+        unit.cast = { ...kind.cast };
+        army.cost = cost;
+        return "";
+      }
+
+      function changeBehavior(army, index, name) {
+        const behavior = behaviors.find((item) => item.name === name);
+        if (!behavior) return "Unknown behavior.";
+        const unit = army.units[index];
+        unit.behavior = behavior.name;
+        unit.body = behavior.body.slice();
+        return "";
+      }
+
+      function renderArmy(list, army) {
+        list.replaceChildren();
+        if (!army) return;
+        const race = raceOf(army);
+        army.units.forEach((unit, index) => {
+          const item = document.createElement("li");
+          item.dataset.behavior = unit.behavior;
+          item.dataset.body = Array.isArray(unit.body) ? unit.body.join(",") : "";
+          item.dataset.hp = String(unit.hp);
+          item.dataset.kindName = unit.name || kindName(unit);
+          const kind = document.createElement("select");
+          kind.setAttribute("aria-label", `Kind for unit ${index + 1}`);
+          for (const optionKind of race ? race.units : []) {
+            const option = document.createElement("option");
+            option.value = String(optionKind.id);
+            option.textContent = optionKind.name;
+            kind.append(option);
+          }
+          kind.value = String(unit.kind);
+          kind.onchange = () => {
+            const error = changeKind(army, index, Number(kind.value));
+            document.querySelector("#army-status").textContent = error;
+            refreshArmies();
+            if (!error && (army === sideA || army === sideB)) invalidateLiveFight();
+          };
+          const behavior = document.createElement("select");
+          behavior.setAttribute("aria-label", `Behavior for unit ${index + 1}`);
+          for (const optionBehavior of behaviors) {
+            const option = document.createElement("option");
+            option.value = optionBehavior.name;
+            option.textContent = optionBehavior.name;
+            behavior.append(option);
+          }
+          behavior.value = unit.behavior;
+          behavior.onchange = () => {
+            const error = changeBehavior(army, index, behavior.value);
+            document.querySelector("#army-status").textContent = error;
+            refreshArmies();
+            if (!error && (army === sideA || army === sideB)) invalidateLiveFight();
+          };
+          const tile = document.createElement("span");
+          tile.textContent = `(${unit.col}, ${unit.row})`;
+          item.append(kind, behavior, tile);
+          list.append(item);
+        });
+      }
+
+      function refreshArmies() {
+        renderArmy(document.querySelector("#army-draft"), draftArmy);
+        renderArmy(document.querySelector("#army-a"), sideA);
+        renderArmy(document.querySelector("#army-b"), sideB);
+        const cost = document.querySelector("#draft-cost");
+        cost.textContent = draftArmy ? `${draftArmy.raceName} · ${draftArmy.name} · cost ${draftArmy.cost} / ${draftArmy.budget}` : "Generate an army to see it.";
+        document.querySelector("#side-a-cost").textContent = sideA ? `cost ${sideA.cost} / ${sideA.budget}` : "";
+        document.querySelector("#side-b-cost").textContent = sideB ? `cost ${sideB.cost} / ${sideB.budget}` : "";
+        document.querySelector("#fight").disabled = !sideA || !sideB;
+        document.querySelector("#batch-start").disabled = !sideA;
+      }
+
+      function clearBoard() {
+        if (boardView) {
+          boardView.dispose();
+          boardView = null;
+        }
+      }
+
+      function paintReadout() {
+        const step = document.querySelector("#battle-step");
+        if (!fightState) {
+          step.dataset.cursor = "0";
+          step.textContent = "";
+          document.querySelector("#battle-steps").replaceChildren();
+          syncTransport();
+          return;
+        }
+        const cursor = fightState.cursor;
+        step.dataset.cursor = String(cursor);
+        step.textContent = cursor === 0 ? "Deployment" : (fightState.sentences[cursor - 1] || "");
+        paintSteps();
+        syncTransport();
+      }
+
+      function mountBoard() {
+        clearBoard();
+        if (!fightState) return;
+        boardView = createBoardView(document.querySelector("#battle-board"), {
+          cols: fightState.cols,
+          rows: fightState.rows,
+          unitsA: fightState.a.units,
+          unitsB: fightState.b.units,
+          mySide: 0,
+          blocked: fightState.blocked,
+          lines: fightState.lines,
+          playing: false,
+          stepMs: playDelay(),
+          onProgress(cursor) {
+            if (!fightState) return;
+            fightState.cursor = cursor;
+            if (fightState.playing && cursor >= fightState.lines.length) {
+              fightState.playing = false;
+              boardView?.setPlaying(false);
+            }
+            paintReadout();
+          },
+        });
+      }
+
+      function syncTransport() {
+        const play = document.querySelector("#battle-play");
+        const back = document.querySelector("#battle-step-back");
+        const forward = document.querySelector("#battle-step-forward");
+        if (!fightState || fightState.lines.length === 0) {
+          play.disabled = true;
+          play.textContent = "Play";
+          back.disabled = true;
+          forward.disabled = true;
+          return;
+        }
+        const done = fightState.cursor >= fightState.lines.length;
+        play.disabled = false;
+        play.textContent = fightState.playing && !done ? "Pause" : "Play";
+        back.disabled = fightState.cursor <= 0;
+        forward.disabled = done;
+      }
+
+      function playDelay() {
+        const speed = Number(document.querySelector("#battle-speed").value);
+        return 180 / (speed > 0 ? speed : 1);
+      }
+
+      function invalidateLiveFight() {
+        if (!fightState || replayKey) return;
+        stopPlayback();
+        fightState = null;
+        eventFilters = [];
+        clearBoard();
+        document.querySelector("#battle-outcome").textContent = "Roster changed. Fight again.";
+        document.querySelector("#battle-seed").textContent = "";
+        paintReadout();
+      }
+
+      function filterKey(filter) {
+        return filter.type === "unit" ? `unit:${filter.team}:${filter.index}` : `team:${filter.team}`;
+      }
+
+      function toggleEventFilter(filter) {
+        const key = filterKey(filter);
+        if (eventFilters.some((item) => filterKey(item) === key)) {
+          eventFilters = eventFilters.filter((item) => filterKey(item) !== key);
+        } else {
+          eventFilters = [...eventFilters, filter];
+        }
+        paintSteps();
+      }
+
+      function paintFilters() {
+        const host = document.querySelector("#battle-filters");
+        host.replaceChildren();
+        if (!fightState) return;
+        for (const filter of eventFilters) {
+          const chip = document.createElement("button");
+          chip.type = "button";
+          const name = filter.type === "team" ? filter.team : `${filter.team} ${filter.label}`;
+          chip.className = `step-chip step-badge--${filter.team === "B" ? "b" : "a"}`;
+          chip.textContent = `${name} ×`;
+          chip.setAttribute("aria-label", `Remove ${name} filter`);
+          chip.onclick = () => toggleEventFilter(filter);
+          host.append(chip);
+        }
+      }
+
+      function stepBadge(type, actor) {
+        const button = document.createElement("button");
+        button.type = "button";
+        const side = actor.team === "B" ? "b" : "a";
+        button.className = `step-badge step-badge--${type} step-badge--${side}`;
+        button.textContent = type === "team" ? actor.team : actor.label;
+        const filter = type === "team"
+          ? { type: "team", team: actor.team }
+          : { type: "unit", team: actor.team, index: actor.index, label: actor.label };
+        const pressed = eventFilters.some((item) => filterKey(item) === filterKey(filter));
+        button.setAttribute("aria-pressed", pressed ? "true" : "false");
+        const name = type === "team" ? `side ${actor.team}` : `side ${actor.team} ${actor.label}`;
+        button.setAttribute("aria-label", pressed ? `Remove ${name} filter` : `Filter ${name}`);
+        button.addEventListener("click", (event) => {
+          event.stopPropagation();
+          toggleEventFilter(filter);
+        });
+        return button;
+      }
+
+      function paintSteps() {
+        const list = document.querySelector("#battle-steps");
+        paintFilters();
+        if (!fightState) {
+          list.replaceChildren();
+          list.dataset.serial = "";
+          return;
+        }
+        const cursor = fightState.cursor;
+        const stamp = `${fightState.serial}|${eventFilters.map(filterKey).join("&")}`;
+        if (list.dataset.serial !== stamp) {
+          list.dataset.serial = stamp;
+          list.replaceChildren();
+          const unitsA = fightState.a.units || [];
+          const unitsB = fightState.b.units || [];
+          fightState.lines.forEach((line, index) => {
+            const actor = stepActor(line, unitsA, unitsB);
+            if (!eventShown(actor, eventFilters)) return;
+            const item = document.createElement("li");
+            item.value = index + 1;
+            item.dataset.trace = String(index);
+            if (actor) item.append(stepBadge("team", actor), stepBadge("unit", actor));
+            const text = document.createElement("span");
+            text.className = "step-text";
+            text.textContent = fightState.sentences[index] || "";
+            item.append(text);
+            item.addEventListener("click", (event) => {
+              if (event.target.closest(".step-badge")) return;
+              goToTrace(index);
+            });
+            list.append(item);
+          });
+        }
+        for (const item of list.children) {
+          const index = Number(item.dataset.trace);
+          if (cursor > 0 && index === cursor - 1) item.setAttribute("aria-current", "step");
+          else item.removeAttribute("aria-current");
+        }
+        const current = list.querySelector("[aria-current='step']");
+        if (current) current.scrollIntoView({ block: "nearest" });
+      }
+
+      function showFight({ cols, rows, a, b, lines, sentences, blocked, outcome, seed }) {
+        clearBoard();
+        fightSerial += 1;
+        fightState = {
+          serial: fightSerial,
+          cols,
+          rows,
+          a,
+          b,
+          lines,
+          sentences,
+          blocked: blocked || [],
+          cursor: 0,
+          playing: false,
+        };
+        document.querySelector("#battle-outcome").textContent = `Outcome ${outcome}`;
+        document.querySelector("#battle-seed").textContent = seed;
+        mountBoard();
+        playFight();
+      }
+
+      function stopPlayback() {
+        if (fightState) fightState.playing = false;
+        boardView?.setPlaying(false);
+      }
+
+      function playFight() {
+        if (!fightState || !boardView) return;
+        if (fightState.cursor >= fightState.lines.length) boardView.seek(0);
+        fightState.playing = true;
+        boardView.setStepMs(playDelay());
+        boardView.setPlaying(true);
+        paintReadout();
+      }
+
+      function stepFight(delta) {
+        if (!fightState || !boardView) return;
+        stopPlayback();
+        const next = fightState.cursor + delta;
+        if (next < 0 || next > fightState.lines.length) {
+          paintReadout();
+          return;
+        }
+        boardView.seek(next);
+      }
+
+      function goToTrace(index) {
+        if (!fightState || !boardView) return;
+        if (!Number.isInteger(index) || index < 0 || index >= fightState.lines.length) return;
+        stopPlayback();
+        boardView.seek(index + 1);
+      }
+
+      async function battlePost(url, payload) {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const body = await response.json();
+        if (!response.ok) throw new Error(body.error || "failed");
+        return body;
+      }
+
+      document.querySelector("#battle-ground").onchange = () => {
+        draftArmy = null;
+        sideA = null;
+        sideB = null;
+        stopPlayback();
+        fightState = null;
+        eventFilters = [];
+        clearBoard();
+        document.querySelector("#battle-outcome").textContent = "No fight yet.";
+        document.querySelector("#battle-seed").textContent = "";
+        paintReadout();
+        refreshArmies();
+      };
+      document.querySelector("#battle-race").onchange = () => {
+        paintRace();
+        draftArmy = null;
+        refreshArmies();
+      };
+      document.querySelector("#generate-army").onclick = () => {
+        const ground = document.querySelector("#battle-ground").value;
+        const race = selectedRace();
+        battlePost("/api/battle/army", { ground, race: race ? race.id : 0 }).then((army) => {
+          draftArmy = army;
+          refreshArmies();
+        }).catch((error) => {
+          document.querySelector("#battle-outcome").textContent = error.message;
+        });
+      };
+      document.querySelector("#assign-a").onclick = () => {
+        if (!draftArmy) return;
+        sideA = copyArmy(draftArmy);
+        document.querySelector("#army-status").textContent = "";
+        refreshArmies();
+        invalidateLiveFight();
+      };
+      document.querySelector("#assign-b").onclick = () => {
+        if (!draftArmy) return;
+        sideB = copyArmy(draftArmy);
+        document.querySelector("#army-status").textContent = "";
+        refreshArmies();
+        invalidateLiveFight();
+      };
+      document.querySelector("#fight").onclick = () => {
+        if (!sideA || !sideB) return;
+        stopPlayback();
+        battlePost("/api/battle/fight", { ground: sideA.ground, a: sideA.units, b: sideB.units }).then((result) => {
+          replayKey = null;
+          eventFilters = [];
+          document.querySelectorAll("#batch-games button").forEach((button) => button.setAttribute("aria-pressed", "false"));
+          showFight({
+            cols: sideA.cols,
+            rows: sideA.rows,
+            a: sideA,
+            b: sideB,
+            lines: result.lines,
+            sentences: result.sentences,
+            blocked: result.blocked || [],
+            outcome: result.outcome,
+            seed: result.seed,
+          });
+        }).catch((error) => {
+          document.querySelector("#battle-outcome").textContent = error.message;
+        });
+      };
+      document.querySelector("#battle-play").onclick = () => {
+        if (!fightState) return;
+        if (fightState.playing) {
+          stopPlayback();
+          paintReadout();
+          return;
+        }
+        playFight();
+      };
+      document.querySelector("#battle-speed").onchange = () => {
+        boardView?.setStepMs(playDelay());
+      };
+      document.querySelector("#battle-step-back").onclick = () => stepFight(-1);
+      document.querySelector("#battle-step-forward").onclick = () => stepFight(1);
+
+      function renderGames(batch) {
+        const list = document.querySelector("#batch-games");
+        list.replaceChildren();
+        for (const game of batch.games || []) {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.dataset.index = String(game.index);
+          button.setAttribute("aria-pressed", replayKey === `${batch.id}:${game.index}` ? "true" : "false");
+          const index = document.createElement("span");
+          index.textContent = String(game.index);
+          const result = document.createElement("span");
+          result.textContent = game.result;
+          const seed = document.createElement("span");
+          seed.className = "seed";
+          seed.textContent = game.seed;
+          button.append(index, result, seed);
+          button.onclick = () => replayGame(batch.id, game);
+          list.append(button);
+        }
+      }
+
+      function replayGame(id, game) {
+        const nextKey = `${id}:${game.index}`;
+        if (nextKey !== replayKey) eventFilters = [];
+        replayKey = nextKey;
+        document.querySelectorAll("#batch-games button").forEach((button) => {
+          button.setAttribute("aria-pressed", button.dataset.index === String(game.index) ? "true" : "false");
+        });
+        showFight({
+          cols: game.cols,
+          rows: game.rows,
+          a: { units: game.a },
+          b: { units: game.b },
+          lines: game.lines,
+          sentences: game.sentences,
+          blocked: game.blocked,
+          outcome: game.result,
+          seed: game.seed,
+        });
+      }
+
+      function paintBatch(batch) {
+        document.querySelector("#batch-wins").textContent = String(batch.wins);
+        document.querySelector("#batch-losses").textContent = String(batch.losses);
+        document.querySelector("#batch-draws").textContent = String(batch.draws);
+        document.querySelector("#batch-done").textContent = String(batch.done);
+        document.querySelector("#batch-stop").disabled = !batch.running;
+        document.querySelector("#batch-status").textContent = batch.error || (batch.running ? "Running" : "Finished");
+        const count = (batch.games || []).length;
+        if (paintedBatch !== batch.id || paintedGames !== count) {
+          paintedBatch = batch.id;
+          paintedGames = count;
+          renderGames(batch);
+        }
+      }
+
+      function watchBatch(id) {
+        if (batchTimer) clearInterval(batchTimer);
+        batchTimer = setInterval(() => {
+          fetch("/api/battle/batch?id=" + encodeURIComponent(id), { cache: "no-store" })
+            .then((response) => response.json())
+            .then((batch) => {
+              paintBatch(batch);
+              if (!batch.running && batchTimer) {
+                clearInterval(batchTimer);
+                batchTimer = null;
+              }
+            })
+            .catch((error) => {
+              document.querySelector("#batch-status").textContent = error.message;
+            });
+        }, 150);
+      }
+
+      document.querySelector("#batch-start").onclick = () => {
+        if (!sideA) return;
+        const rounds = Number(document.querySelector("#batch-rounds").value);
+        battlePost("/api/battle/batch", { ground: sideA.ground, army: sideA.units, rounds }).then((batch) => {
+          batchId = batch.id;
+          replayKey = null;
+          paintedBatch = null;
+          paintedGames = -1;
+          paintBatch(batch);
+          watchBatch(batch.id);
+        }).catch((error) => {
+          document.querySelector("#batch-status").textContent = error.message;
+        });
+      };
+      document.querySelector("#batch-stop").onclick = () => {
+        if (!batchId) return;
+        battlePost("/api/battle/batch/stop", { id: batchId }).then((batch) => {
+          paintBatch(batch);
+        }).catch((error) => {
+          document.querySelector("#batch-status").textContent = error.message;
+        });
+      };
+
+      const raceList = await fetch("/api/battle/races").then((response) => response.json());
+      races = Array.isArray(raceList.races) ? raceList.races : [];
+      behaviors = Array.isArray(raceList.behaviors) ? raceList.behaviors : [];
+      const raceSelect = document.querySelector("#battle-race");
+      for (const race of races) {
+        const option = document.createElement("option");
+        option.value = String(race.id);
+        option.textContent = race.name;
+        raceSelect.append(option);
+      }
+      if (races[0]) raceSelect.value = String(races[0].id);
+      paintRace();
+
+      const settings = await fetch("/api/provider").then((response) => response.json());
+      const selected = document.querySelector(`input[name="provider"][value="${settings.provider}"]`);
+      if (selected) selected.checked = true;
+      const selectedText = document.querySelector(`input[name="textProvider"][value="${settings.textProvider}"]`);
+      if (selectedText) selectedText.checked = true;
+      await loadTree();
+      await paintQueue();
+      setInterval(() => {
+        paintQueue().catch((error) => {
+          status.textContent = error.message;
+          status.className = "hz-error";
+        });
+      }, 400);
+    </script>
+    <script type="module">
+      // Balance lab: edit unit stats, run seeded simulations, compare with the catalog, save.
+      const table = document.querySelector("#balance-table");
+      const warningsList = document.querySelector("#balance-warnings");
+      const results = document.querySelector("#balance-results");
+      const summary = document.querySelector("#balance-summary");
+      const status = document.querySelector("#balance-status");
+      const runButton = document.querySelector("#balance-run");
+      const saveButton = document.querySelector("#balance-save");
+      const confirmButton = document.querySelector("#balance-save-confirm");
+      const gamesInput = document.querySelector("#balance-games");
+      const FIELDS = [
+        ["cost", "Cost"], ["hp", "HP"], ["atk", "Atk"], ["range", "Range"], ["speed", "Speed"], ["actions", "Actions"],
+        ["cast.effect", "Effect"], ["cast.aim", "Aim"], ["cast.power", "Power"], ["cast.rounds", "Rounds"], ["cast.cooldown", "Cooldown"],
+        ["cast.damage", "Dmg"], ["cast.range", "Range"], ["cast.aoe", "Area"],
+      ];
+      const LIMIT_KEY = {
+        cost: "cost", hp: "hp", atk: "atk", range: "range", speed: "speed", actions: "actions",
+        "cast.effect": "castEffect", "cast.aim": "castAim", "cast.power": "castPower", "cast.rounds": "castRounds", "cast.cooldown": "castCooldown",
+        "cast.damage": "castDamage", "cast.range": "castRange", "cast.aoe": "castAoe",
+      };
+      // Named choices instead of numbers; the engine ids are the list positions.
+      const PICKS = { "cast.effect": () => meta.effects, "cast.aim": () => meta.aims };
+      const LASTING = ["sprint", "reach", "taunt"];
+      let catalog = [];
+      let tuned = [];
+      let meta = null;
+
+      const get = (unit, key) => key.split(".").reduce((value, part) => value[part], unit);
+      const set = (unit, key, value) => {
+        const [head, tail] = key.split(".");
+        if (tail) unit[head] = { ...unit[head], [tail]: value };
+        else unit[head] = value;
+      };
+      const clone = (units) => units.map((unit) => ({ ...unit, cast: { ...unit.cast } }));
+      const swatch = (name) => `--swatch: var(--unit-${name.toLowerCase()})`;
+      const changedCount = () => tuned.reduce((sum, unit, index) => sum + FIELDS.filter(([key]) => get(unit, key) !== get(catalog[index], key)).length, 0);
+
+      function unitWarnings(unit) {
+        const out = [];
+        if (unit.actions === 0) out.push(`${unit.name}: 0 action points, so it never attacks, casts or defends.`);
+        if (unit.speed === 0) out.push(`${unit.name}: speed 0, it never moves.`);
+        if (unit.atk === 0 && unit.cast.damage === 0) out.push(`${unit.name}: no attack or cast damage.`);
+        const effect = meta.effects[unit.cast.effect];
+        if (unit.cast.damage === 0 && (effect === "none" || (effect !== "taunt" && unit.cast.power === 0))) out.push(`${unit.name}: the cast changes nothing, so it never fires.`);
+        if (LASTING.includes(effect) && unit.cast.rounds === 0) out.push(`${unit.name}: a ${effect} that lasts 0 rounds never lands.`);
+        return out;
+      }
+
+      function paintTable() {
+        const head = `<thead><tr><th scope="col" rowspan="2">Unit</th>${FIELDS.slice(0, 6).map(([, label]) => `<th scope="col" rowspan="2">${label}</th>`).join("")}<th scope="colgroup" colspan="${FIELDS.length - 6}" class="group">Cast</th><th scope="col" rowspan="2">Trial behavior</th></tr><tr>${FIELDS.slice(6).map(([, label]) => `<th scope="col">${label}</th>`).join("")}</tr></thead>`;
+        const rows = tuned.map((unit, index) => {
+          const cells = FIELDS.map(([key, label]) => {
+            const [min, max] = meta.limits[LIMIT_KEY[key]];
+            const value = get(unit, key);
+            const was = get(catalog[index], key);
+            const changed = value !== was;
+            const mark = `data-unit="${index}" data-key="${key}" aria-label="${unit.name} ${key.replace("cast.", "cast ")}"`;
+            const names = PICKS[key]?.();
+            const input = names
+              ? `<select ${mark}${changed ? ` class="changed" title="Catalog: ${names[was]}"` : ""}>${names.map((name, id) => `<option value="${id}"${id === value ? " selected" : ""}>${name}</option>`).join("")}</select>`
+              : `<input type="number" min="${min}" max="${max}" value="${value}" ${mark}${changed ? ` class="changed" title="Catalog: ${was}"` : ""} />`;
+            return `<td>${input}</td>`;
+          }).join("");
+          const options = meta.behaviors.map((name) => `<option${name === unit.behavior ? " selected" : ""}>${name}</option>`).join("");
+          return `<tr><th scope="row" style="${swatch(unit.name)}">${unit.name}</th>${cells}<td><select data-unit="${index}" aria-label="${unit.name} trial behavior">${options}</select></td></tr>`;
+        }).join("");
+        table.innerHTML = head + `<tbody>${rows}</tbody>`;
+        warningsList.innerHTML = tuned.flatMap(unitWarnings).map((text) => `<li>${text}</li>`).join("");
+        const count = changedCount();
+        saveButton.disabled = count === 0;
+        confirmButton.hidden = true;
+        status.textContent = count ? `${count} ${count === 1 ? "value differs" : "values differ"} from the catalog.` : "Matches the catalog.";
+        status.className = "status";
+      }
+
+      table.addEventListener("change", (event) => {
+        const target = event.target;
+        const index = Number(target.dataset.unit);
+        if (!Number.isInteger(index)) return;
+        if (target.tagName === "SELECT" && !target.dataset.key) tuned[index].behavior = target.value;
+        else {
+          const value = Number(target.value);
+          const [min, max] = meta.limits[LIMIT_KEY[target.dataset.key]];
+          if (!Number.isInteger(value) || value < min || value > max) {
+            status.textContent = `${tuned[index].name}: ${target.dataset.key} must be ${min} to ${max}.`;
+            status.className = "hz-error";
+            target.value = get(tuned[index], target.dataset.key);
+            return;
+          }
+          set(tuned[index], target.dataset.key, value);
+        }
+        paintTable();
+      });
+
+      function pct(part, whole) {
+        return whole ? Math.round((100 * part) / whole) : 0;
+      }
+
+      function delta(now, was, unit = "") {
+        const diff = Math.round((now - was) * 10) / 10;
+        if (!diff) return `<small>±0${unit}</small>`;
+        return `<small class="${diff > 0 ? "delta-up" : "delta-down"}">${diff > 0 ? "+" : ""}${diff}${unit}</small>`;
+      }
+
+      function paintDuels(run) {
+        const games = run.tuned.games;
+        const names = run.tuned.units;
+        const head = `<thead><tr><th scope="col">Row beats column</th>${names.map((name) => `<th scope="col">${name}</th>`).join("")}<th scope="col">Overall</th></tr></thead>`;
+        const rows = names.map((name, row) => {
+          const cells = names.map((_, col) => {
+            const now = pct(run.tuned.table[row][col].wins, games);
+            const was = pct(run.catalog.table[row][col].wins, games);
+            const draws = pct(run.tuned.table[row][col].draws, games);
+            const shade = `background: color-mix(in srgb, var(--azure) ${now}%, var(--blood))`;
+            return `<td class="${row === col ? "mirror" : ""}" style="${shade}" title="${draws}% draws">${now}%${delta(now, was, "%")}</td>`;
+          }).join("");
+          const overall = (table) => {
+            let wins = 0;
+            let total = 0;
+            table[row].forEach((cell, col) => {
+              if (col === row) return;
+              wins += cell.wins;
+              total += games;
+            });
+            return pct(wins, total);
+          };
+          const now = overall(run.tuned.table);
+          return `<tr><th scope="row" style="${swatch(name)}">${name}</th>${cells}<td style="background: color-mix(in srgb, var(--azure) ${now}%, var(--blood))">${now}%${delta(now, overall(run.catalog.table), "%")}</td></tr>`;
+        }).join("");
+        results.innerHTML = `<div class="stat-wrap"><table class="stat-table duel-grid">${head}<tbody>${rows}</tbody></table></div>`;
+        const draws = run.tuned.table.flat().reduce((sum, cell) => sum + cell.draws, 0);
+        summary.textContent = `${games} games per pairing on ${run.ground}, sides alternated. Each cell is how often the row unit beats the column unit, with the change from the catalog. ${pct(draws, games * names.length * names.length)}% of duels were draws. Seed ${run.seed.slice(0, 8)}…`;
+      }
+
+      function paintArmies(run) {
+        const { games, totals } = run.tuned;
+        const was = run.catalog;
+        const rows = run.tuned.units.map((unit, index) => {
+          const before = was.units[index];
+          const per = (value, count) => (count ? Math.round((value / count) * 10) / 10 : 0);
+          const fields = [
+            [per(unit.fielded, games), per(before.fielded, games), ""],
+            [pct(unit.winsIn, unit.gamesIn), pct(before.winsIn, before.gamesIn), "%"],
+            [per(unit.dealt, unit.fielded), per(before.dealt, before.fielded), ""],
+            [per(unit.taken, unit.fielded), per(before.taken, before.fielded), ""],
+            [per(unit.healed, unit.fielded), per(before.healed, before.fielded), ""],
+            [pct(unit.survived, unit.fielded), pct(before.survived, before.fielded), "%"],
+            [per(unit.dealt, unit.fielded * unit.cost), per(before.dealt, before.fielded * before.cost), ""],
+          ];
+          return `<tr><th scope="row" style="${swatch(unit.name)}">${unit.name}</th>${fields.map(([now, then, suffix]) => `<td>${now}${suffix}${delta(now, then, suffix)}</td>`).join("")}</tr>`;
+        }).join("");
+        const head = `<thead><tr><th scope="col">Unit</th><th scope="col">Fielded / game</th><th scope="col">Win rate when fielded</th><th scope="col">Damage dealt</th><th scope="col">Damage taken</th><th scope="col">Healed</th><th scope="col">Survives</th><th scope="col">Damage per cost</th></tr></thead>`;
+        results.innerHTML = `<div class="stat-wrap"><table class="stat-table army-grid">${head}<tbody>${rows}</tbody></table></div>`;
+        const drawNow = pct(totals.draws, games);
+        const drawWas = pct(was.totals.draws, games);
+        summary.innerHTML = `${games} games of random budget-legal hosts on ${run.ground}. Damage is per unit fielded. Draws: ${drawNow}% (catalog ${drawWas}%). Rounds per game: ${Math.round((totals.rounds / games) * 10) / 10} (catalog ${Math.round((was.totals.rounds / games) * 10) / 10}). Seed ${run.seed.slice(0, 8)}…`;
+      }
+
+      runButton.onclick = async () => {
+        const mode = document.querySelector('input[name="balanceMode"]:checked').value;
+        const games = Number(gamesInput.value);
+        runButton.disabled = true;
+        status.textContent = "Running…";
+        status.className = "status";
+        try {
+          const response = await fetch("/api/balance/run", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ units: tuned, mode, ground: document.querySelector("#balance-ground").value, games, race: balanceRace }),
+          });
+          const run = await response.json();
+          if (!response.ok) throw new Error(run.error || "run failed");
+          if (mode === "duels") paintDuels(run);
+          else paintArmies(run);
+          status.textContent = "Done.";
+        } catch (error) {
+          status.textContent = error.message;
+          status.className = "hz-error";
+        } finally {
+          runButton.disabled = false;
+        }
+      };
+
+      document.querySelectorAll('input[name="balanceMode"]').forEach((input) => {
+        input.onchange = () => {
+          const armies = input.value === "armies" && input.checked;
+          gamesInput.max = String(armies ? meta.maxGames.armies : meta.maxGames.duels);
+          gamesInput.value = armies ? "300" : "40";
+          document.querySelector('label[for="balance-games"]').firstChild.textContent = armies ? "Games " : "Games per pairing ";
+        };
+      });
+
+      document.querySelector("#balance-reset").onclick = () => {
+        tuned = clone(catalog);
+        paintTable();
+      };
+
+      saveButton.onclick = () => {
+        confirmButton.hidden = false;
+        status.textContent = `Save ${changedCount()} changed values to content/catalog.json and crates/combat/src/catalog.rs?`;
+        status.className = "status";
+      };
+
+      confirmButton.onclick = async () => {
+        confirmButton.hidden = true;
+        try {
+          const response = await fetch("/api/balance/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ units: tuned, race: balanceRace }) });
+          const saved = await response.json();
+          if (!response.ok) throw new Error(saved.error || "save failed");
+          catalog = saved.units.map((unit, index) => ({ ...unit, behavior: tuned[index].behavior }));
+          tuned = clone(catalog);
+          paintTable();
+          status.textContent = "Saved. Rebuild the program before on-chain battles use the new stats.";
+        } catch (error) {
+          status.textContent = error.message;
+          status.className = "hz-error";
+        }
+      };
+
+      // The race whose table is shown; switching race reloads its catalog stats and drops unsaved edits.
+      let balanceRace = 0;
+      const raceSelect = document.querySelector("#balance-race");
+      async function loadBalance() {
+        try {
+          const response = await fetch(`/api/balance?race=${balanceRace}`);
+          if (!response.ok) throw new Error(response.status === 404 ? "This studio server is older than the page and has no Balance data. Restart the studio (pnpm --filter asset-studio start)." : `Could not load unit stats (${response.status}).`);
+          meta = await response.json();
+          if (!raceSelect.options.length) {
+            for (const race of meta.races || [{ id: 0, name: "Ashborn" }]) raceSelect.add(new Option(race.name, String(race.id)));
+          }
+          raceSelect.value = String(balanceRace);
+          catalog = clone(meta.units);
+          tuned = clone(catalog);
+          gamesInput.max = String(meta.maxGames.duels);
+          runButton.disabled = false;
+          paintTable();
+        } catch (error) {
+          table.innerHTML = "";
+          summary.textContent = error.message;
+          summary.className = "hz-error";
+          status.textContent = error.message;
+          status.className = "hz-error";
+          runButton.disabled = true;
+        }
+      }
+      raceSelect.onchange = () => {
+        balanceRace = Number(raceSelect.value);
+        loadBalance();
+      };
+      loadBalance();
+    </script>
+  </body>
+</html>

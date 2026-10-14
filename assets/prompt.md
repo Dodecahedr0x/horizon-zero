@@ -1,0 +1,1 @@
+Horizon Zero, an Art Nouveau frontier wargame aesthetic. Ash-grey earth, ember-orange illumination, weathered iron, and bone-pale cloth. Painted forms with bold, readable silhouettes, restrained detail, and a scorched, battle-worn atmosphere. Isolated composition only: no text, letters, typography, border, frame, background scene, ground plane, or cast shadow.

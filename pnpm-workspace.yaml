@@ -1,0 +1,4 @@
+packages:
+  - app
+  - indexer
+  - tools/asset-studio

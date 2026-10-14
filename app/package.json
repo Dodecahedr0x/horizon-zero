@@ -1,0 +1,32 @@
+{
+  "name": "app",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node ../scripts/dev-app.mjs",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "start": "node --env-file-if-exists=../.env server.js",
+    "test": "node --test src/golden.test.mjs local-ledger.test.mjs ../content/trace.test.mjs ../content/interpret.test.mjs"
+  },
+  "dependencies": {
+    "@noble/hashes": "^1.8.0",
+    "buffer": "^6.0.3",
+    "@solana/wallet-adapter-base": "^0.9.27",
+    "@solana/wallet-adapter-react": "^0.15.39",
+    "@solana/wallet-adapter-react-ui": "^0.9.39",
+    "@solana/wallet-adapter-wallets": "^0.19.37",
+    "@solana/web3.js": "^1.98.4",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "three": "^0.170.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@types/three": "^0.170.0",
+    "@vitejs/plugin-react": "^4.4.1",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5"
+  }
+}

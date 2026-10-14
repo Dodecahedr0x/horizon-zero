@@ -1,0 +1,142 @@
+{
+  "battlegrounds": [
+    { "id": 0, "slug": "outpost", "name": "Outpost", "budget": 8, "stake": 50000000, "cols": 8, "rows": 6 },
+    { "id": 1, "slug": "garrison", "name": "Garrison", "budget": 16, "stake": 200000000, "cols": 10, "rows": 8 },
+    { "id": 2, "slug": "citadel", "name": "Citadel", "budget": 32, "stake": 1000000000, "cols": 12, "rows": 10 }
+  ],
+  "races": [
+    {
+      "id": 0,
+      "name": "Ashborn",
+      "slug": "ashborn",
+      "units": [
+        { "id": 0, "name": "Guard", "color": "#e2d6c0", "cost": 2, "hp": 14, "atk": 8, "range": 1, "speed": 3, "actions": 1, "cast": { "damage": 9, "range": 2, "aoe": 0, "effect": "push", "aim": "foe", "power": 1, "rounds": 0, "cooldown": 0 } },
+        { "id": 1, "name": "Skirmisher", "color": "#ff8a3d", "cost": 2, "hp": 10, "atk": 12, "range": 1, "speed": 5, "actions": 1, "cast": { "damage": 0, "range": 0, "aoe": 0, "effect": "sprint", "aim": "self", "power": 1, "rounds": 3, "cooldown": 4 } },
+        { "id": 2, "name": "Archer", "color": "#a8e0c8", "cost": 3, "hp": 5, "atk": 13, "range": 3, "speed": 3, "actions": 1, "cast": { "damage": 0, "range": 0, "aoe": 0, "effect": "reach", "aim": "self", "power": 2, "rounds": 3, "cooldown": 4 } },
+        { "id": 3, "name": "Vanguard", "color": "#9fbf8f", "cost": 4, "hp": 22, "atk": 12, "range": 1, "speed": 4, "actions": 1, "cast": { "damage": 0, "range": 2, "aoe": 1, "effect": "taunt", "aim": "foe", "power": 0, "rounds": 3, "cooldown": 4 } },
+        { "id": 4, "name": "Warden", "color": "#b3a08c", "cost": 5, "hp": 17, "atk": 12, "range": 1, "speed": 4, "actions": 1, "cast": { "damage": 0, "range": 3, "aoe": 0, "effect": "heal", "aim": "ally", "power": 5, "rounds": 0, "cooldown": 0 } }
+      ]
+    },
+    {
+      "id": 1,
+      "name": "Rootborn",
+      "slug": "rootborn",
+      "units": [
+        { "id": 0, "name": "Thornling", "color": "#c98a4b", "cost": 4, "hp": 24, "atk": 17, "range": 1, "speed": 4, "actions": 1, "cast": { "damage": 6, "range": 1, "aoe": 1, "effect": "none", "aim": "foe", "power": 0, "rounds": 0, "cooldown": 3 } },
+        { "id": 1, "name": "Briarsling", "color": "#c2384a", "cost": 7, "hp": 23, "atk": 14, "range": 3, "speed": 3, "actions": 1, "cast": { "damage": 12, "range": 4, "aoe": 0, "effect": "push", "aim": "foe", "power": 1, "rounds": 0, "cooldown": 4 } },
+        { "id": 2, "name": "Elderoak", "color": "#8fa67a", "cost": 10, "hp": 58, "atk": 19, "range": 1, "speed": 2, "actions": 1, "cast": { "damage": 0, "range": 3, "aoe": 1, "effect": "heal", "aim": "ally", "power": 5, "rounds": 0, "cooldown": 3 } }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Deeplings",
+      "slug": "deeplings",
+      "units": [
+        { "id": 0, "name": "Clawling", "color": "#d0703c", "cost": 3, "hp": 24, "atk": 12, "range": 1, "speed": 3, "actions": 1, "cast": { "damage": 15, "range": 1, "aoe": 0, "effect": "none", "aim": "foe", "power": 0, "rounds": 0, "cooldown": 2 } },
+        { "id": 1, "name": "Eelsnare", "color": "#4fb3a4", "cost": 4, "hp": 19, "atk": 12, "range": 1, "speed": 5, "actions": 1, "cast": { "damage": 0, "range": 3, "aoe": 0, "effect": "taunt", "aim": "foe", "power": 0, "rounds": 2, "cooldown": 3 } },
+        { "id": 2, "name": "Spineshot", "color": "#e3c77a", "cost": 4, "hp": 17, "atk": 12, "range": 3, "speed": 3, "actions": 1, "cast": { "damage": 3, "range": 3, "aoe": 1, "effect": "none", "aim": "foe", "power": 0, "rounds": 0, "cooldown": 2 } },
+        { "id": 3, "name": "Tidecaller", "color": "#7fd6e0", "cost": 6, "hp": 20, "atk": 9, "range": 1, "speed": 3, "actions": 1, "cast": { "damage": 9, "range": 3, "aoe": 1, "effect": "push", "aim": "foe", "power": 2, "rounds": 0, "cooldown": 2 } }
+      ]
+    }
+  ],
+  "behaviors": [
+    {
+      "name": "March",
+      "elements": [
+        {
+          "movement": { "kind": "approach", "extremum": "lowest", "stat": "distance", "side": "enemy", "stop": true },
+          "actions": [{ "type": "attack", "extremum": "lowest", "stat": "distance", "side": "enemy" }]
+        }
+      ]
+    },
+    {
+      "name": "Charge",
+      "elements": [
+        {
+          "movement": { "kind": "approach", "extremum": "lowest", "stat": "distance", "side": "enemy", "stop": false },
+          "actions": [{ "type": "attack", "extremum": "lowest", "stat": "distance", "side": "enemy" }]
+        }
+      ]
+    },
+    {
+      "name": "Kite",
+      "elements": [
+        {
+          "movement": { "kind": "approach", "extremum": "lowest", "stat": "distance", "side": "enemy", "stop": true },
+          "actions": [{ "type": "attack", "extremum": "lowest", "stat": "distance", "side": "enemy" }]
+        },
+        {
+          "movement": { "kind": "flee", "extremum": "lowest", "stat": "distance", "side": "enemy", "stop": false },
+          "actions": []
+        }
+      ]
+    },
+    {
+      "name": "Flank left",
+      "elements": [
+        {
+          "movement": { "kind": "flank-left", "extremum": "lowest", "stat": "distance", "side": "enemy", "stop": false },
+          "actions": [{ "type": "attack", "extremum": "highest", "stat": "atk", "side": "enemy" }]
+        }
+      ]
+    },
+    {
+      "name": "Flank right",
+      "elements": [
+        {
+          "movement": { "kind": "flank-right", "extremum": "lowest", "stat": "distance", "side": "enemy", "stop": false },
+          "actions": [{ "type": "attack", "extremum": "highest", "stat": "atk", "side": "enemy" }]
+        }
+      ]
+    },
+    {
+      "name": "March cast",
+      "elements": [
+        {
+          "movement": { "kind": "approach", "extremum": "lowest", "stat": "distance", "side": "enemy", "stop": true },
+          "actions": [{ "type": "cast", "extremum": "lowest", "stat": "distance", "side": "enemy" }, { "type": "attack", "extremum": "lowest", "stat": "distance", "side": "enemy" }]
+        }
+      ]
+    },
+    {
+      "name": "Charge cast",
+      "elements": [
+        {
+          "movement": { "kind": "approach", "extremum": "lowest", "stat": "distance", "side": "enemy", "stop": false },
+          "actions": [{ "type": "cast", "extremum": "lowest", "stat": "distance", "side": "enemy" }, { "type": "attack", "extremum": "lowest", "stat": "distance", "side": "enemy" }]
+        }
+      ]
+    },
+    {
+      "name": "Kite cast",
+      "elements": [
+        {
+          "movement": { "kind": "approach", "extremum": "lowest", "stat": "distance", "side": "enemy", "stop": true },
+          "actions": [{ "type": "cast", "extremum": "lowest", "stat": "distance", "side": "enemy" }, { "type": "attack", "extremum": "lowest", "stat": "distance", "side": "enemy" }]
+        },
+        {
+          "movement": { "kind": "flee", "extremum": "lowest", "stat": "distance", "side": "enemy", "stop": false },
+          "actions": []
+        }
+      ]
+    },
+    {
+      "name": "Flank left cast",
+      "elements": [
+        {
+          "movement": { "kind": "flank-left", "extremum": "lowest", "stat": "distance", "side": "enemy", "stop": false },
+          "actions": [{ "type": "cast", "extremum": "highest", "stat": "atk", "side": "enemy" }, { "type": "attack", "extremum": "highest", "stat": "atk", "side": "enemy" }]
+        }
+      ]
+    },
+    {
+      "name": "Flank right cast",
+      "elements": [
+        {
+          "movement": { "kind": "flank-right", "extremum": "lowest", "stat": "distance", "side": "enemy", "stop": false },
+          "actions": [{ "type": "cast", "extremum": "highest", "stat": "atk", "side": "enemy" }, { "type": "attack", "extremum": "highest", "stat": "atk", "side": "enemy" }]
+        }
+      ]
+    }
+  ]
+}

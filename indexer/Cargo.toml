@@ -1,0 +1,30 @@
+[package]
+name = "horizon-indexer"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96.1"
+publish = false
+license = "MIT"
+
+# Own workspace so the repo-root Anchor workspace does not claim this crate.
+[workspace]
+
+[dependencies]
+axum = "0.8"
+async-trait = "0.1"
+carbon-core = "2.0.0"
+carbon-log-metrics = "2.0.0"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+env_logger = "0.11"
+futures-util = "0.3"
+log = "0.4"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+solana-account = "4.3.2"
+solana-client = "=4.2.2"
+solana-commitment-config = "3.1.1"
+solana-pubkey = "4.2.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
+tokio-util = "0.7"
