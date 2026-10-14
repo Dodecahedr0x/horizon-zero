@@ -1,9 +1,29 @@
 // Checks the client's instruction builders and decoders against docs/src/accounts.md.
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
+import fs from "node:fs";
 import test from "node:test";
 import { PublicKey, SystemProgram } from "@solana/web3.js";
 import {
+  ARMY_LEN,
+  BATTLEGROUND_LEN,
+  PROGRAM_ERRORS,
+  STANDARDS,
+  armyPda,
+  behaviorHash,
+  behaviorPda,
+  closeArmyIx,
+  createArmyIx,
+  createBehaviorIx,
+  customErrorCode,
+  decodeArmyHead,
+  decodeBattleground,
+  delegateOutboxIx,
+  encodeBehavior,
+  fundBudgetIx,
+  programError,
+  setSegregationIx,
+  unlockArmyIx,
   DELEGATION_PROGRAM_ID,
   EPHEMERAL_VAULT_ID,
   MAGIC_CONTEXT_ID,
@@ -241,4 +261,96 @@ test("decoders read the documented offsets", () => {
   const battleKey = key(30).toBase58();
   assert.equal(resolvedOutcome(["Program log: Instruction: SettleMatch", `Program log: HZ_MATCH_RESOLVED ${battleKey} 2 1000 ${"ab".repeat(32)} ${key(24).toBase58()}`], battleKey), 2);
   assert.equal(resolvedOutcome(["Program log: HZ_PLAYER x"], battleKey), null);
+});
+
+test("delegate_outbox, fund_budget, set_segregation, unlock_army and close_army follow the program", () => {
+  const outbox = outboxPda(owner);
+  expect(delegateOutboxIx(owner), "delegate_outbox", [
+    [owner, true, true],
+    [configPda(), false, false],
+    [pda([Buffer.from("buffer"), outbox.toBuffer()], PROGRAM_ID), false, true],
+    [pda([Buffer.from("delegation"), outbox.toBuffer()], DELEGATION_PROGRAM_ID), false, true],
+    [pda([Buffer.from("delegation-metadata"), outbox.toBuffer()], DELEGATION_PROGRAM_ID), false, true],
+    [outbox, false, true],
+    [PROGRAM_ID, false, false],
+    [DELEGATION_PROGRAM_ID, false, false],
+    [SystemProgram.programId, false, false],
+  ]);
+  expect(fundBudgetIx(owner, 9n), "fund_budget", [[owner, true, false], [playerPda(owner), false, true]], u64(9));
+  expect(setSegregationIx(owner, true), "set_segregation", [[owner, true, false], [playerPda(owner), false, true]], Buffer.from([1]));
+  expect(unlockArmyIx(owner, 2, key(2)), "unlock_army", [[owner, true, true], [battlegroundPda(2), false, true], [key(2), false, true]]);
+  expect(closeArmyIx(owner, key(2)), "close_army", [
+    [owner, true, false],
+    [playerPda(owner), false, true],
+    [key(2), false, true],
+    [EPHEMERAL_VAULT_ID, false, true],
+    [MAGIC_PROGRAM_ID, false, false],
+  ]);
+});
+
+test("create_behavior and create_army lay out their data and accounts", () => {
+  const elements = STANDARDS[0].elements;
+  const body = encodeBehavior(elements);
+  const length = Buffer.alloc(4);
+  length.writeUInt32LE(body.length);
+  expect(createBehaviorIx(owner, elements), "create_behavior", [
+    [owner, true, false],
+    [playerPda(owner), false, true],
+    [behaviorPda(body), false, true],
+    [EPHEMERAL_VAULT_ID, false, true],
+    [MAGIC_PROGRAM_ID, false, false],
+    [SystemProgram.programId, false, false],
+  ], Buffer.concat([Buffer.from(behaviorHash(body)), length, Buffer.from(body)]));
+
+  const behavior = key(3);
+  const rest = Buffer.concat([
+    Buffer.from([4, 0, 0, 0]), // index
+    Buffer.from([1]), // race
+    Buffer.from([1, 0, 0, 0]), // unit count
+    Buffer.from([2]), behavior.toBuffer(), Buffer.from([5, 1]), // kind, behavior, col, row
+  ]);
+  expect(createArmyIx(owner, 0, 4, 1, [{ kind: 2, behavior, col: 5, row: 1 }]), "create_army", [
+    [owner, true, false],
+    [playerPda(owner), false, true],
+    [battlegroundPda(0), false, false],
+    [armyPda(owner, 4), false, true],
+    [EPHEMERAL_VAULT_ID, false, true],
+    [MAGIC_PROGRAM_ID, false, false],
+    [SystemProgram.programId, false, false],
+    [behavior, false, false],
+  ], rest);
+});
+
+test("battleground and army decoders read the documented offsets, and every decoder checks the length", () => {
+  const ground = Buffer.alloc(BATTLEGROUND_LEN);
+  ground[40] = 2;
+  ground.writeBigUInt64LE(10_000_000n, 43);
+  ground[54] = 2;
+  key(40).toBuffer().copy(ground, 55);
+  key(41).toBuffer().copy(ground, 87);
+  ground.writeBigUInt64LE(17n, 567);
+  assert.deepEqual(decodeBattleground(ground), { battlegroundId: 2, stake: "10000000", queue: [key(40).toBase58(), key(41).toBase58()], matchSeq: 17 });
+
+  const army = Buffer.alloc(ARMY_LEN);
+  owner.toBuffer().copy(army, 8);
+  key(42).toBuffer().copy(army, 40);
+  army[1358] = 1;
+  assert.deepEqual(decodeArmyHead(army), { owner: owner.toBase58(), battleground: key(42).toBase58(), status: 1 });
+
+  for (const decode of [decodePlayer, decodeConfig, decodeOutbox, decodeBattleground, decodeArmyHead]) assert.equal(decode(Buffer.alloc(10)), null);
+  assert.equal(decodeBattle(key(1), Buffer.alloc(2146)), null);
+});
+
+test("the error map follows HorizonError in error.rs", () => {
+  const source = fs.readFileSync(new URL("../../programs/horizon-zero/src/error.rs", import.meta.url), "utf8");
+  const variants = [...source.matchAll(/#\[msg\("([^"]*)"\)\]\s*(\w+),/g)].map((match) => [match[2], match[1]]);
+  assert.ok(variants.length > 0);
+  assert.deepEqual(PROGRAM_ERRORS.map((entry) => [...entry]), variants);
+  const outboxBusy = 6000 + variants.findIndex(([name]) => name === "OutboxBusy");
+  assert.equal(programError(outboxBusy).name, "OutboxBusy");
+  assert.equal(programError(5999), null);
+  assert.equal(customErrorCode({ err: { InstructionError: [1, { Custom: outboxBusy }] } }), outboxBusy);
+  assert.equal(customErrorCode({ logs: [`Program log: AnchorError occurred. Error Code: OutboxBusy. Error Number: ${outboxBusy}. Error Message: x.`] }), outboxBusy);
+  assert.equal(customErrorCode({ message: `failed: custom program error: 0x${outboxBusy.toString(16)}` }), outboxBusy);
+  assert.equal(customErrorCode({ message: "insufficient funds" }), null);
 });
