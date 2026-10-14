@@ -222,3 +222,90 @@ In every case the owner's net balance change on Solana was +22,838,960 lamports:
 Also seen in A: the validator sent a second commit, undelegate and action transaction for the already-undelegated Outbox. It failed at the commit step (`InvalidAccountOwner`) before reaching the action, and had no effect. The base transaction is atomic, so the action cannot run without its commit.
 
 **Guard:** none is needed for correctness, so none was implemented or verified. The validator's rule on undelegated accounts and the typed `Account<Outbox>` owner check already block both paths. A cheap defense-in-depth option, if the main program wants one: pass the Outbox's delegation record `[b"delegation", outbox]` under the delegation program to `release_outbox`, and require that it is not owned by the delegation program. On Solana, after undelegation, that account is closed, so the automatic action and the manual fallback both pass. While the Outbox is delegated the record exists, so the release fails everywhere. The cost is one extra read-only account in the action and in the fallback.
+
+## Local stack end-to-end
+
+Date: 2026-10-15. Branch `feat/ephemeral-rollup-fees`, the real program (default features) on `pnpm localnet:check` (`scripts/local-stack.mjs --check`, `app/scripts/localnet-assert.mjs`), ephemeral-validator 0.14.10. Final run: exit 0, `[check] passed: outcome 2, fee 1000000, battle BPWPqeaniJo5y71xGgL1zEc6hPU2ezBkinU9TUQkK7WA`. Every probe below is printed by that script (`PROBE` and `FEE` lines).
+
+### 1. `isBlockhashValid` on the rollup: **correct.**
+
+```
+PROBE isBlockhashValid on the base for a fresh blockhash: true, 10 s later true (height 41, last valid 173)
+PROBE isBlockhashValid on the rollup for a fresh blockhash: true, 10 s later true (height 616, last valid 1616)
+PROBE blockhash validity while a signature was still unknown: {"base":{"valid":6,"invalid":0},"er":{"valid":0,"invalid":0}}
+```
+
+A rollup blockhash lives 1 000 blocks. Every rollup transaction was already found by the first status poll. The client's confirm() needs no change.
+
+### 2. `getSignatureStatuses` with history and `getTransaction` logs on the rollup: **both work.**
+
+```
+PROBE getSignatureStatuses(searchTransactionHistory) 5s later on the rollup: {"slot":713,"confirmations":null,"status":{"Ok":null},"err":null,"confirmationStatus":"finalized"}
+PROBE getTransaction on the rollup: logMessages 12, slot 713
+```
+
+`resolvedOutcome` read `HZ_MATCH_RESOLVED` from those logs, and a failed rollup transaction's logs came back the same way.
+
+### 3. The indexer's RPC calls on the rollup: **all served; the indexer had three bugs, now fixed.**
+
+```
+PROBE getProgramAccounts on the rollup: 13 accounts by size {"0":1,"49":3,"68":2,"83":1,"119":2,"576":3,"1360":1}
+PROBE getMultipleAccounts on the rollup: Hm19Jf…/1360, Hm19Jf…/68, Hm19Jf…/576, null
+PROBE logsSubscribe notifications 13, programSubscribe notifications 43
+PROBE getBlockTime(713) on the rollup: first error failed to get block time for slot 713: Slot 713 was skipped, or is not yet available; 1792016934 after 101 ms
+PROBE indexer /matches/BPWPqeaniJo5y71xGgL1zEc6hPU2ezBkinU9TUQkK7WA: … "status":1, … "outcome":2,"openAt":1792016933,"resolvedAt":1792016934, … "fee":"1000000","feeBps":500}
+```
+
+`getProgramAccounts` returns ephemeral accounts (Behavior 119, Army 1360) next to delegated ones (Player 68, Outbox 49, Config 83, Battleground 576). Ephemeral accounts hold 0 lamports. The indexer bugs:
+
+- `programSubscribe` was opened without an encoding. The RPC then sends base58 and refuses it for accounts over 128 bytes: `Error decoding account event` for every Battleground, Army and Battle.
+- Carbon's `AccountUpdate::into_update` turns an account with 0 lamports into a deletion, so every ephemeral account was dropped: the database had no behavior, army or battle row, only the resolution.
+- The rollup answers `getBlockTime` for a slot only about 100 ms after it, exactly when a live update arrives, so every live row had null times. The indexer now asks up to five times, 200 ms apart.
+
+### 4. Ephemeral accounts with the Player PDA as sponsor: **work, after one program fix.**
+
+```
+PROBE behavior 8k1kKB8GR68AtsChdLg5K4EJsQm24WGUyaZxp614ow9r owner=Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c lamports=0 len=119
+PROBE battle BPWPqeaniJo5y71xGgL1zEc6hPU2ezBkinU9TUQkK7WA owner=Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c lamports=0 len=2147
+PROBE lock_army took 70624 lamports of battle rent from the locker's Player
+PROBE close_army refunded 45440 lamports to the Player; army now missing
+```
+
+- `create_behavior`, `create_army` and `lock_army`'s battle (Player PDA signing by seeds) create ephemeral accounts. `close_army` and `settle_match`'s battle close (`CloseEphemeralAccount`, Player PDA signing by seeds) work, and the rent comes back to the Player: `(1360 + 60) × 32 = 45 440`, `(2147 + 60) × 32 = 70 624`.
+- The Rent sysvar is available in the rollup: `fund_budget`, `fund_outbox` and `fund_treasury_outbox` all call `Rent::get` (`free_lamports`, the kept rent).
+- `lock_army`'s full sequence (create the battle, write the opponent's Player and army, the VRF CPI) succeeds, and the oracle on the rollup seeds the battle in about a second.
+- **Bug found:** a `lock_army` that only queues failed before the program ran: `Transaction loads a writable account that cannot be written`. Simulation names it: `Account 4: BPWPqeaniJo5y71xGgL1zEc6hPU2ezBkinU9TUQkK7WA was illegally used as writable`, `Magic111… failed: InvalidWritableAccount`. The rollup refuses a writable account that it neither holds delegated nor creates as ephemeral in that transaction, and a queueing lock does not create the battle. Fix: `LockArmy.battle` is no longer `mut`; the client passes it writable only when a candidate's owner's budget covers the stake, which is exactly when the program opens a match.
+
+### 5. Post-undelegate `release_outbox` for the real program: **runs, for both `withdraw` and `claim_fees`.**
+
+```
+PROBE withdraw: release_outbox ran in 2ZsN32FQ…, fee payer mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev, same tx as ProcessUndelegation: true
+    Program log: Instruction: ProcessUndelegation
+    Program log: Instruction: ReleaseOutbox
+    Program log: HZ_RELEASE DoyV2oFv… 10000000
+PROBE claim: release_outbox ran in 3L1i7Ykz…, fee payer mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev, same tx as ProcessUndelegation: true
+    Program log: HZ_RELEASE 7qP5pGCu… 1000000
+```
+
+Both Outboxes were back on Solana and paid within seconds; the client fallback was never needed. `delegate_outbox` and `delegate_treasury_outbox` afterwards delegated them again, and the rollup held both.
+
+### 6. What MagicBlock charged
+
+| step | wallet change | breakdown |
+| --- | --- | --- |
+| register (`register_player` + `delegate_player` + `delegate_outbox`, one Solana tx) | −8 879 000 | Player and Outbox rent, two delegation records and metadata, 5 000 tx fee |
+| top-up 0.05 SOL (`lamportsDelegatedTransferIx`) | −50 305 000 | amount + **300 000** eSPL charge + 5 000 tx fee |
+| any rollup transaction | 0 | `fee 0` on every rollup transaction, signer undelegated |
+| withdraw 0.01 SOL | +12 838 960 | amount + 2 838 960 delegation rent refunded; nothing charged |
+| claim 0.001 SOL | +3 838 960 | fees + 2 838 960 refunded |
+| `delegate_outbox` again | −3 143 960 | 3 138 960 record and metadata rent + 5 000 tx fee |
+
+So a withdrawal session nets 300 000 lamports plus two Solana tx fees (delegate 3 143 960 out, 2 838 960 back), and a top-up costs 300 000 plus the tx fee: about 0.0003 SOL each, as documented. The validator identity pays the commit and action transaction on Solana.
+
+### Local-stack bug outside the program
+
+`mb-stack --reset` resets only the base ledger. The rollup keeps accounts in `magicblock-test-storage/` under its working directory (the repo root before), so ephemeral armies and behaviors from earlier runs survived a reset: `getProgramAccounts` returned 5 armies after a run that made 2, and `create_behavior` found March already there. `local-stack.mjs` now runs `mb-stack` in `target/localnet` and removes that directory first. The rollup identity stays `mAGic…` with fresh storage.
+
+### Bootstrap and stack
+
+`app/scripts/bootstrap.mjs --espl-rent` created and funded the eSPL rent PDA `4RvdEGaUyChj3AketeBZoY1EotNtPveMFUXL8DVetrAp`, then `initialize(500, mAGic…)`, the three battlegrounds, the treasury Outbox, and the four delegations; the rollup returned Config and every battleground within seconds. Only the rollup oracle runs: nothing requests randomness on the base layer any more.
