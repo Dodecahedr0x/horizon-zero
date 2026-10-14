@@ -27,6 +27,7 @@ import {
   fundTreasuryOutboxIx,
   horizonErrorCode,
   lockArmyIx,
+  lockOpens,
   matchPda,
   nameBehavior,
   outboxPda,
@@ -123,6 +124,19 @@ function programFailure(logs: readonly string[] | undefined, signature?: string)
   const code = horizonErrorCode(logs ?? []);
   const known = code === null ? null : programError(code);
   return known ? new ProgramError(known.code, known.name, known.message, signature) : null;
+}
+
+/**
+ * A lock that passed the battle with the wrong access for what the program did: writable when it
+ * only queued (the rollup refuses the write, `InvalidWritableAccount`), or read-only when it opened
+ * a match (creating the battle escalates its privilege).
+ */
+function queueRace(err: unknown) {
+  const source = err as { message?: string; logs?: string[]; transactionLogs?: string[] };
+  const text = [source?.message ?? "", ...(source?.logs ?? source?.transactionLogs ?? [])].join("\n");
+  // The local rollup's preflight words them "Transaction loads a writable account that cannot be
+  // written" and "Cross-program invocation with unauthorized signer or writable account".
+  return /InvalidWritableAccount|writable account that cannot be written|PrivilegeEscalation|unauthorized signer or writable account/i.test(text);
 }
 
 /**
@@ -461,10 +475,7 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
     // lock create the battle, and only then may the battle be passed writable (see lockArmyIx).
     const ownerKeys = [...owners].map((key) => playerPda(new PublicKey(key)));
     const players = ownerKeys.length ? await er.getMultipleAccountsInfo(ownerKeys) : [];
-    const opens = players.some((info) => {
-      const player = info?.owner.equals(PROGRAM_ID) ? decodePlayer(info.data) : null;
-      return !!player && lamports(player.budget) >= lamports(state.stake);
-    });
+    const opens = lockOpens(players, lamports(state.stake));
     await send(er, computeBudgetIx(), lockArmyIx({
       player: owner,
       battlegroundId: state.battlegroundId,
@@ -546,9 +557,16 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
       try {
         battle = await sendLock(owner, army);
       } catch (err) {
-        // Another lock opened a match between our read of match_seq and ours: read it again once.
-        if (!(err instanceof ProgramError && err.errorName === "BadMatch")) throw err;
-        battle = await sendLock(owner, army);
+        // The queue changed between our read and the lock: another lock opened a match first
+        // (BadMatch), or a candidate's budget changed so the lock matched or queued against what we
+        // passed the battle as. Read the queue again and send once more.
+        if (!(err instanceof ProgramError && err.errorName === "BadMatch") && !queueRace(err)) throw err;
+        try {
+          battle = await sendLock(owner, army);
+        } catch (again) {
+          if (queueRace(again)) throw new Error("The queue changed while you locked; try again");
+          throw again;
+        }
       }
       if (!(await ownedInRollup(battle))) return null;
       return settleWhenSeeded(battle);

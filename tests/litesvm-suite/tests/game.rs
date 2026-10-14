@@ -1335,9 +1335,10 @@ fn queue(env: &mut Env, player: &Keypair, army: Address, behavior: Address) {
     let stored: [u8; 32] = env.svm.get_account(&army).unwrap().data[40..72].try_into().unwrap();
     let ground = Address::from(stored);
     cover_stake(env, player, &ground);
-    let mut lock = lock_ix(env, player, ground, army, Address::new_unique(), &[behavior], vec![]);
+    let battle = Address::new_unique();
+    let mut lock = lock_ix(env, player, ground, army, battle, &[behavior], vec![]);
     // A lock that only queues passes the battle read-only, as the rollup requires.
-    lock.accounts[5].is_writable = false;
+    lock.accounts.iter_mut().filter(|meta| meta.pubkey == battle).for_each(|meta| meta.is_writable = false);
     send(&mut env.svm, player, &[cu_limit(), lock]);
 }
 

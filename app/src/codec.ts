@@ -281,15 +281,23 @@ export function decodeBattle(pubkey: PublicKey, data: Uint8Array) {
   };
 }
 
-/** The outcome byte of `HZ_MATCH_RESOLVED <battle> <outcome> <fee> <seed> <player_b>`, if a log line has it. */
-export function resolvedOutcome(logs: readonly string[], battle: string) {
+/**
+ * `HZ_MATCH_RESOLVED <battle> <outcome> <fee> <seed> <player_b>` for `battle`, if a log line has it:
+ * the outcome byte (1 A, 2 B, 3 draw), the fee in lamports, the seed in hex and side B's wallet.
+ */
+export function resolvedMatch(logs: readonly string[], battle: string) {
   for (const line of logs) {
     const at = line.indexOf("HZ_MATCH_RESOLVED ");
     if (at < 0) continue;
-    const [name, pubkey, outcome] = line.slice(at).split(" ");
-    if (name === "HZ_MATCH_RESOLVED" && pubkey === battle) return Number(outcome);
+    const [name, pubkey, outcome, fee, seed, playerB] = line.slice(at).split(" ");
+    if (name === "HZ_MATCH_RESOLVED" && pubkey === battle) return { outcome: Number(outcome), fee: BigInt(fee), seed, playerB };
   }
   return null;
+}
+
+/** The outcome byte of `resolvedMatch`, or null. */
+export function resolvedOutcome(logs: readonly string[], battle: string) {
+  return resolvedMatch(logs, battle)?.outcome ?? null;
 }
 
 // HorizonError in programs/horizon-zero/src/error.rs, in order: Anchor numbers them from 6000.
@@ -619,6 +627,19 @@ export function lockArmyIx(args: {
     keys.push(writable(playerPda(new PublicKey(owner))));
   }
   return ix("lock_army", keys);
+}
+
+/**
+ * Whether a `lock_army` offering these candidates opens a match, and so must pass the battle
+ * writable (see `lockArmyIx`): the program matches a candidate whose owner's Player, owned by this
+ * program, has a budget that covers the stake. `players` are the candidates' owners' Player
+ * accounts as the rollup returned them, null when missing.
+ */
+export function lockOpens(players: readonly ({ owner: PublicKey; data: Uint8Array } | null)[], stake: bigint) {
+  return players.some((info) => {
+    const player = info && info.owner.equals(PROGRAM_ID) ? decodePlayer(info.data) : null;
+    return player !== null && BigInt(player.budget) >= stake;
+  });
 }
 
 export function unlockArmyIx(player: PublicKey, battlegroundId: number, army: PublicKey) {

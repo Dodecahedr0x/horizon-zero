@@ -49,11 +49,13 @@ import {
   fundTreasuryOutboxIx,
   identityPda,
   lockArmyIx,
+  lockOpens,
   matchPda,
   outboxPda,
   playerPda,
   registerPlayerIx,
   releaseOutboxIx,
+  resolvedMatch,
   resolvedOutcome,
   setFeeIx,
   settleMatchIx,
@@ -229,6 +231,20 @@ test("lock_army passes the VRF accounts, then behaviors, candidates and each own
   assert.deepEqual(metas(queues)[5], [matchPda(ground, 9).toBase58(), false, false]);
 });
 
+test("a lock opens a match only when a candidate owner's Player covers the stake", () => {
+  const player = (budget) => {
+    const data = Buffer.alloc(68);
+    owner.toBuffer().copy(data, 8);
+    data.writeBigUInt64LE(BigInt(budget), 40);
+    return { owner: PROGRAM_ID, data };
+  };
+  assert.equal(lockOpens([], 10n), false, "no candidate: the lock queues");
+  assert.equal(lockOpens([null, player(9)], 10n), false, "a missing Player or a short budget does not match");
+  assert.equal(lockOpens([player(9), player(10)], 10n), true, "one owner whose budget covers the stake is enough");
+  assert.equal(lockOpens([{ ...player(10), owner: SystemProgram.programId }], 10n), false, "a Player the program does not own is ignored");
+  assert.equal(lockOpens([{ owner: PROGRAM_ID, data: Buffer.alloc(49) }], 10n), false, "an account that is not a Player is ignored");
+});
+
 test("settle_match passes the battle, both armies, both Players, Config and the ephemeral accounts", () => {
   const match = { pubkey: key(8).toBase58(), armyA: key(9).toBase58(), armyB: key(10).toBase58(), playerA: key(11).toBase58(), playerB: key(12).toBase58() };
   expect(settleMatchIx(match), "settle_match", [
@@ -315,6 +331,13 @@ test("decoders read the documented offsets", () => {
   const battleKey = key(30).toBase58();
   assert.equal(resolvedOutcome(["Program log: Instruction: SettleMatch", `Program log: HZ_MATCH_RESOLVED ${battleKey} 2 1000 ${"ab".repeat(32)} ${key(24).toBase58()}`], battleKey), 2);
   assert.equal(resolvedOutcome(["Program log: HZ_PLAYER x"], battleKey), null);
+  assert.deepEqual(resolvedMatch([`Program log: HZ_MATCH_RESOLVED ${battleKey} 1 1000000 ${"cd".repeat(32)} ${key(24).toBase58()}`], battleKey), {
+    outcome: 1,
+    fee: 1_000_000n,
+    seed: "cd".repeat(32),
+    playerB: key(24).toBase58(),
+  });
+  assert.equal(resolvedMatch([`Program log: HZ_MATCH_RESOLVED ${key(25).toBase58()} 1 0 00 x`], battleKey), null, "another battle's line");
 });
 
 test("delegate_outbox, fund_budget, set_segregation, unlock_army and close_army follow the program", () => {
