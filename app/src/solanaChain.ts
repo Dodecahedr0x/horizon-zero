@@ -64,6 +64,7 @@ const LOCK_FIXED_ACCOUNTS = 15;
 
 /** A program error, named from `HorizonError`. */
 export class ProgramError extends Error {
+  override readonly name = "ProgramError";
   readonly code: number;
   readonly errorName: string;
   readonly signature?: string;
@@ -80,6 +81,7 @@ export class ProgramError extends Error {
  * start the new one: withdraw again if that was meant.
  */
 export class RecoveredError extends Error {
+  override readonly name = "RecoveredError";
   readonly amount: bigint;
   constructor(amount: bigint) {
     super(`An earlier withdrawal of ${amount} lamports was waiting and has been paid out; nothing more was withdrawn. Withdraw again if you meant to.`);
@@ -92,6 +94,7 @@ export class RecoveredError extends Error {
  * or withdrawal still on its way. It may still land; check the balance before trying again.
  */
 export class PendingError extends Error {
+  override readonly name = "PendingError";
   readonly signature?: string;
   constructor(message: string, signature?: string) {
     super(message);

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { Board, type Piece } from "./board";
 import { BATTLEGROUNDS, RACES, STANDARDS, ZONE_DEPTH, behaviorLabel, encodeBehavior, raceById, unitSpec, type ElementSpec } from "./codec";
-import type { Army, Behavior, ChainAdapter, DraftUnit, Match, Pot } from "./devChain";
+import type { Army, Behavior, ChainAdapter, DraftUnit, Match, PlayerBalance, ProtocolConfig } from "./devChain";
 import { randomSeed, replay, simulateTrial } from "./replay";
 import { chronicle, cueFor, healthAt, HealthBar } from "./battleParts";
 import { BehaviorEditor, BehaviorGlyphs, BehaviorList } from "./BehaviorEditor";
@@ -9,6 +9,7 @@ import { armyCost, isFull, matchUnit, MAX_UNITS, randomArmy } from "./armyRules"
 import { Gem, GroundPicker, Select, UnitArt, swatch } from "./ui";
 import { play, setSoundEnabled, soundEnabled } from "./sfx";
 import { tourSteps, Walkthrough, walkthroughSeen } from "./Walkthrough";
+import { AdminPanel, CreatePlayer, explain, WalletPanel } from "./Wallet";
 
 const devMode = import.meta.env.VITE_DEV_MODE === "true";
 const SCREENS = ["battle", "army", "behaviors"] as const;
@@ -51,57 +52,6 @@ function Section({ title, aside, children, tour }: { title: string; aside?: Reac
       </header>
       {children}
     </section>
-  );
-}
-
-function sol(lamports: string | bigint) {
-  return Number(lamports) / 1e9;
-}
-
-/** "0.25" SOL as lamports, or null when it is not a positive amount with at most 9 decimals. */
-function parseSol(text: string) {
-  const match = text.trim().match(/^(\d*)(?:\.(\d{0,9}))?$/);
-  if (!match || (!match[1] && !match[2])) return null;
-  const lamports = BigInt(match[1] || "0") * 1_000_000_000n + BigInt((match[2] || "").padEnd(9, "0"));
-  return lamports > 0n ? lamports : null;
-}
-
-/** The player's battle budget on one battleground: every army they lock there stakes from it. */
-function PotPanel({ pot, stake, busy, onFund, onWithdraw, onSegregate }: {
-  pot: Pot | null;
-  stake: number;
-  busy: boolean;
-  onFund: (lamports: bigint) => void;
-  onWithdraw: (lamports: bigint) => void;
-  onSegregate: (segregate: boolean) => void;
-}) {
-  const [amount, setAmount] = useState("");
-  const lamports = parseSol(amount);
-  const budget = BigInt(pot?.budget ?? "0");
-  const winnings = BigInt(pot?.winnings ?? "0");
-  const stakes = stake > 0 ? budget / BigInt(stake) : 0n;
-  return (
-    <div className="pot">
-      <div className="pot__figures">
-        <p><span className="select__label">Battle budget</span><strong>{sol(budget)} SOL</strong><small>{stakes === 0n ? "Under one stake: no army can lock" : `Covers ${stakes} ${stakes === 1n ? "stake" : "stakes"}`}</small></p>
-        {(pot?.segregate || winnings > 0n) && <p><span className="select__label">Winnings set aside</span><strong>{sol(winnings)} SOL</strong><small>Never staked again</small></p>}
-      </div>
-      <div className="pot__controls">
-        <label className="pot__amount">
-          <span className="select__label">Amount in SOL</span>
-          <input inputMode="decimal" placeholder={String(sol(String(stake)))} value={amount} onChange={(event) => setAmount(event.target.value)} />
-        </label>
-        <button type="button" className="hz-button hz-button--primary" disabled={busy || !lamports} onClick={() => lamports && onFund(lamports)}>Fund</button>
-        <button type="button" className="hz-button" disabled={busy || !lamports || lamports > budget + winnings} title="Takes from the winnings first" onClick={() => lamports && onWithdraw(lamports)}>Withdraw</button>
-      </div>
-      {pot && (
-        <label className="toggle">
-          <input type="checkbox" role="switch" checked={pot.segregate} disabled={busy} onChange={(event) => onSegregate(event.target.checked)} />
-          <span className="toggle__track" aria-hidden="true" />
-          <span>Set winnings aside instead of staking them again</span>
-        </label>
-      )}
-    </div>
   );
 }
 
@@ -158,7 +108,9 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
   const [touring, setTouring] = useState(false);
   const [doomed, setDoomed] = useState("");
   const [busy, setBusy] = useState(false);
-  const [pot, setPot] = useState<Pot | null>(null);
+  // undefined until the first read; null when the wallet has no Player yet.
+  const [player, setPlayer] = useState<PlayerBalance | null | undefined>(undefined);
+  const [config, setConfig] = useState<ProtocolConfig | null>(null);
   const boardControls = useRef<{ seek: (cursor: number) => void } | null>(null);
   const traceRef = useRef<HTMLOListElement>(null);
   const ground = BATTLEGROUNDS[battlegroundId];
@@ -186,11 +138,13 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
     const [mine, fought] = await Promise.all([chain.armies(me), chain.matches(me).catch(() => [] as Match[])]);
     setArmies(mine);
     setMatches(fought);
-    await Promise.all([refreshLocked(), refreshPot()]);
+    await Promise.all([refreshLocked(), refreshPlayer()]);
   }
 
-  async function refreshPot(id = battlegroundId) {
-    setPot(await chain.pot(id));
+  async function refreshPlayer() {
+    const [mine, protocol] = await Promise.all([chain.player(), chain.admin().catch(() => null)]);
+    setPlayer(mine);
+    setConfig(protocol);
   }
 
   // Armies locked and waiting in each battleground's queue, from every player.
@@ -226,6 +180,14 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
     setTouring(true);
   }
 
+  // A pending or recovered result is not a failure: it reads as a notice, and the page still refreshes.
+  function report(err: unknown) {
+    const outcome = explain(err);
+    if (outcome.tone === "error") setError(outcome.text);
+    else setNotice(outcome.text);
+    return outcome;
+  }
+
   async function run(action: () => Promise<void>) {
     setError("");
     setNotice("");
@@ -235,11 +197,19 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
       await refresh();
       return true;
     } catch (err) {
-      setError(err instanceof Error ? err.message : "failed");
+      if (report(err).tone !== "error") await refresh().catch(() => {});
       return false;
     } finally {
       setBusy(false);
     }
+  }
+
+  async function release(which: "player" | "treasury") {
+    const what = which === "player" ? "withdrawal" : "fee claim";
+    await run(async () => {
+      const result = await chain.releasePending(which);
+      setNotice(result === "paid" ? `The pending ${what} has been paid to your wallet.` : result === "inFlight" ? `The ${what} is still on its way. Release it again in a moment.` : `No ${what} was waiting to be paid.`);
+    });
   }
 
   function selectUnit(index: number | null) {
@@ -343,8 +313,6 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
 
   function pickBattleground(id: number) {
     setBattlegroundId(id);
-    setPot(null);
-    refreshPot(id).catch((err) => setError(err.message));
     setSelected(null);
     setDoomed("");
   }
@@ -405,11 +373,18 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
 
   async function lock(army: Army) {
     await run(async () => {
+      // On chain a lock that finds a foe waits for the VRF seed and settles before it returns.
+      if (!devMode) setNotice("Locking. If a foe is waiting, the battle waits for its seed and settles; this can take up to a minute.");
       const opened = await chain.lock(army);
       if (!opened) {
         setNotice(`Your host waits at the gate of the ${BATTLEGROUNDS[army.battlegroundId]?.name}. The battle opens when a foe locks there.`);
         return;
       }
+      if (opened.status !== 1 || !opened.outcome) {
+        setNotice("The battle is open and still waiting for its seed or its settlement. It is in the battle log; settle or watch it from there once the seed lands.");
+        return;
+      }
+      setNotice("");
       play("defend");
       openArena({ match: opened, mySide: opened.armyA === army.pubkey ? 0 : 1, lines: await replay(opened), simulated: false });
     });
@@ -485,6 +460,8 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
   }
 
   const selectedUnit = selected !== null ? draft[selected] : null;
+  const canStake = !!player && BigInt(player.budget) >= BigInt(ground.stake);
+  const needsPlayer = player === null ? "Create your player on the Battle tab first" : undefined;
 
   return (
     <div className="hz-root shell">
@@ -584,7 +561,9 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
                         <span className="log__vs">vs</span>
                         <span className="log__side">{theirs.map((unit, index) => <UnitArt key={index} race={unit.race || 0} kind={unit.kind} />)}</span>
                       </span>
-                      <button type="button" className="hz-button mini quiet" disabled={outcome === "pending"} onClick={() => watch(item)}>Watch</button>
+                      {outcome === "pending" && !devMode
+                        ? <button type="button" className="hz-button mini" disabled={busy} title="Settles the battle once its seed has landed" onClick={() => run(() => chain.settle(item))}>Settle</button>
+                        : <button type="button" className="hz-button mini quiet" disabled={outcome === "pending"} onClick={() => watch(item)}>Watch</button>}
                     </li>
                   );
                 })}
@@ -592,21 +571,34 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
               </ol>
             </Section>
 
+            {player === null && (
+              <Section title="Create your player">
+                <CreatePlayer busy={busy} fees={!devMode} onRegister={(lamports) => run(async () => { await chain.register(lamports); setNotice("Your player is ready. Fund your budget to lock an army."); })} />
+              </Section>
+            )}
+            {player && (
+              <Section title="Wallet">
+                <WalletPanel
+                  player={player}
+                  stake={Number(ground.stake)}
+                  groundName={ground.name}
+                  busy={busy}
+                  fees={!devMode}
+                  onTopUp={(lamports) => run(() => chain.topUp(lamports))}
+                  onFund={(lamports) => run(() => chain.fundBudget(lamports))}
+                  onWithdraw={(lamports) => run(async () => { await chain.withdraw(lamports); setNotice("The withdrawal has been paid to your wallet."); })}
+                  onRelease={() => release("player")}
+                  onSegregate={(segregate) => run(() => chain.setSegregation(segregate))}
+                />
+              </Section>
+            )}
+
             <Section
               title="Your armies"
               tour="armies"
               aside={<button type="button" className="hz-button hz-button--primary" data-tour="create" onClick={() => { setScreen("army"); setSelected(null); }}>Create an army</button>}
             >
               <GroundPicker value={battlegroundId} onChange={pickBattleground} counts={readyCounts} locked={locked} />
-              <PotPanel
-                key={battlegroundId}
-                pot={pot}
-                stake={Number(ground.stake)}
-                busy={busy}
-                onFund={(lamports) => run(() => chain.fundPot(battlegroundId, lamports))}
-                onWithdraw={(lamports) => run(() => chain.withdrawPot(battlegroundId, lamports))}
-                onSegregate={(segregate) => run(() => chain.setSegregation(battlegroundId, segregate))}
-              />
               <div className="armies">
                 {ready.map((army) => (
                   <ArmyCard
@@ -618,7 +610,7 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
                       <>
                         {army.status === 1
                           ? <button type="button" className="hz-button" disabled={busy} onClick={() => run(() => chain.unlock(army))}>Unlock</button>
-                          : <button type="button" className="hz-button hz-button--primary" disabled={busy || army.status !== 0 || BigInt(pot?.budget ?? "0") < BigInt(ground.stake)} title={BigInt(pot?.budget ?? "0") < BigInt(ground.stake) ? "Fund your battle budget to cover one stake" : undefined} onClick={() => lock(army)}><span className="hz-diamond hz-diamond--ember" />Lock · {ground.stake / 1e9} SOL</button>}
+                          : <button type="button" className="hz-button hz-button--primary" disabled={busy || army.status !== 0 || !canStake} title={!player ? "Create your player first" : !canStake ? "Your budget must cover one stake" : undefined} onClick={() => lock(army)}><span className="hz-diamond hz-diamond--ember" />Lock · {ground.stake / 1e9} SOL</button>}
                         {deleteControls(army)}
                       </>
                     )}
@@ -628,6 +620,19 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
               </div>
               {unfinished > 0 && <p className="panel__note">{unfinished} unfinished {unfinished === 1 ? "army waits" : "armies wait"} in the Army tab.</p>}
             </Section>
+
+            {config && owner && config.admin === owner && (
+              <Section title="Protocol fees">
+                <AdminPanel
+                  config={config}
+                  busy={busy}
+                  treasury={!devMode}
+                  onSetFee={(bps) => run(async () => { await chain.setFee(bps); setNotice(`The fee is now ${bps} bps for battles opened from here on.`); })}
+                  onClaim={() => run(async () => { await chain.claimFees(); setNotice("The fees have been paid to the admin wallet."); })}
+                  onRelease={() => release("treasury")}
+                />
+              </Section>
+            )}
           </>
         )}
 
@@ -728,7 +733,7 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
               </p>
               <div className="muster-actions">
                 <button type="button" className="hz-button" data-tour="simulate" disabled={!draft.length || busy} onClick={() => simulate()}><span className="hz-diamond hz-diamond--ember" />Simulate against a random army</button>
-                <button type="button" className="hz-button hz-button--primary" disabled={!full || busy} onClick={() => run(async () => { await chain.createArmy(battlegroundId, draft, raceId); setDraft([]); setSelected(null); setNotice(`The host is mustered for the ${ground.name}. Lock it from the Battle tab.`); })}>Save army</button>
+                <button type="button" className="hz-button hz-button--primary" disabled={!full || busy || !!needsPlayer} title={needsPlayer} onClick={() => run(async () => { await chain.createArmy(battlegroundId, draft, raceId); setDraft([]); setSelected(null); setNotice(`The host is mustered for the ${ground.name}. Lock it from the Battle tab.`); })}>Save army</button>
               </div>
             </Section>
 
@@ -764,6 +769,7 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
           <Section title="New behavior" aside={<button type="button" className="hz-button mini quiet" onClick={() => setForging(false)}>All behaviors</button>}>
             <BehaviorEditor
               elements={draftElements}
+              disabledReason={needsPlayer}
               onChange={setDraftElements}
               onCreate={() => run(() => chain.createBehavior(draftElements)).then((ok) => {
                 if (!ok) return;
