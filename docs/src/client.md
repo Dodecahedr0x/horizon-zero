@@ -45,7 +45,7 @@ The local stack does not serve these yet: `pnpm localnet` starts the rollup but 
 
 `lock` returns the opened match, or `null` when the army only queued. On Solana the match it returns is already settled when the VRF seed arrived in time (see [Solana chain](#solana-chain)).
 
-The local ledger below still keeps one pot per player and battleground, and `createLocalChain` still implements the pot methods this surface replaced, so dev mode does not type-check until it moves to Players.
+`createLocalChain` implements the same surface against the local ledger (see [Player and fees in dev mode](#player-and-fees-in-dev-mode)). There is no Outbox there: `withdraw` and `claimFees` pay at once, `releasePending` always returns `"none"`, and `settle` does nothing, because the ledger settles a battle inside `lock`.
 
 ## Walkthrough
 
@@ -121,7 +121,7 @@ Every movement spends the whole movement pool. There is no walk mode. March, Kit
 
 `createBehavior` rejects a duplicate hash, including a second create of one of those standards. `createArmy` rejects an empty roster, more than 10 units, a position outside the owner's zone, a repeated tile, an unknown behavior, and a cost above the battleground budget. Dev mode does not open a Solana socket.
 
-The ledger keeps one pot per local player and battleground, as the program does. `lock` fails with "Pot budget does not cover the battleground stake" while the player's pot holds less than one stake. Opponents are queued armies of other players whose pot still covers a stake. `lock` on an empty opponent list sets Queued and moves nothing. Otherwise it picks `crypto.getRandomValues` modulo the opponent count, draws a fresh 32-byte seed, and resolves through `simulate_json` in `app/src/combat-node`. The match row stores the seed, the outcome, the unit snapshots, and the trace. Both pots lose one stake and take the payout at once, into the budget or, with segregation on, the winnings. Both armies return to Idle, the opponent leaves the queue, and the match is stored already Resolved. This path does not read a slot hash and does not call the VRF program. The page replays that seed with `app/src/combat-wasm`.
+`lock` fails with `BudgetTooLow` while the local user has no Player or its budget is under one stake. It then walks the queue as `lock_army` does (see [Matchmaking](matchmaking.md#stakes)): another owner's queued army is a candidate while that owner's budget covers a stake, and is evicted, Idle and out of the queue, once it does not. The ledger knows every Player, so every such army is evicted, not only those a locker passes. `lock` with no candidate sets Queued and moves nothing. Otherwise it picks `crypto.getRandomValues` modulo the candidate count, draws a fresh 32-byte seed, and resolves through `simulate_json` in `app/src/combat-node`. The match row stores the seed, the outcome, the unit snapshots, and the trace. Both Players move one stake from `budget` to `locked`, and the battle settles in the same call with the rules of `settle_match` (see [Player and fees in dev mode](#player-and-fees-in-dev-mode)). Both armies return to Idle, the opponent leaves the queue, and the match is stored already Resolved. This path does not read a slot hash, does not call the VRF program, and charges no battle rent. The page replays that seed with `app/src/combat-wasm`.
 
 `unlock` on a Queued army returns it to Idle. An Idle army is not queued, so unlock is rejected. An army still marked Fighting is rejected with "A matched army cannot unlock".
 
@@ -129,9 +129,21 @@ The ledger keeps one pot per local player and battleground, as the program does.
 
 `GET /matches?player=` returns the 20 latest matches where that id is player A or B, newest first. A match key is `match-<battleground id>-<seq>`, because `seq` counts per battleground.
 
-`POST /practice` queues a Guard with March at zone-local `(0, 0)`, owned by the practice id, and tops the practice pot up to one stake, so the local user has someone to match. The page no longer calls it; the ledger test does. The adapters have no practice method.
+`POST /practice` queues a Guard with March at zone-local `(0, 0)`, owned by the practice id, and tops the practice Player's budget up to one stake, adding the lamports to back it, so the local user has someone to match. The page no longer calls it; the ledger test does. The adapters have no practice method.
 
-The ledger and the Vite proxy both use the `/api/local` prefix. A failed call returns JSON `{ error }` and status 400.
+### Player and fees in dev mode
+
+The ledger mirrors the program's [Player](accounts.md#player--68-bytes) and Config in two tables. `players` has one row per owner: `balance` (the Player's lamports, as a decimal string; dev mode charges no rent, so there is no rent floor), `budget`, `winnings`, `locked`, `segregate` and `fighting`. `free` is `balance - budget - winnings - locked`. `config` has one row: `admin`, `fee_bps` (500 on first open) and `fees`. The local user is the dev admin; it is the only identity that signs in dev mode, and the first open writes its id into `config.admin`. Older ledger files had a `pots` table, one pot per player and battleground; each open drops it, so pot balances from before are gone.
+
+- `register` creates the row with the deposit free, and fails with `AlreadyExists` when the row exists. `topUp` adds to `balance`. Both, `fundBudget`, `withdraw` and `setSegregation` fail with `MissingAccount` before `register`.
+- `fundBudget` moves free lamports into the budget, or fails with `BalanceShort`.
+- `withdraw` takes free lamports first, then winnings, then budget, never `locked`, and pays at once: there is no Outbox, so `player()` always reports `outboxPending` `"0"` and `outboxInFlight` false. It fails with `NothingToWithdraw` for 0 and `BalanceShort` beyond what those three hold.
+- Settlement uses `winPayout`, a port of `fees::win_payout`: on a win the loser's `balance` drops by the stake, the winner's grows by `stake - fee`, and the winner's budget, or winnings with segregation on, grows by `2 * stake - fee`, where `fee = 2 * stake * fee_bps / 10_000` rounded down; `config.fees` grows by `fee`. A draw returns each stake to its budget and takes no fee. Both Players then drop `locked` by the stake and `fighting` by one.
+- `setFee` and `claimFees` fail with `NotAdmin` for anyone but `config.admin`. `setFee` fails with `FeeTooHigh` above 1000. `claimFees` sets `fees` to 0, or fails with `NothingToWithdraw` when it is already 0.
+
+### Ledger routes
+
+The ledger and the Vite proxy both use the `/api/local` prefix. A failed call returns JSON `{ error }` and status 400. A rule the program also enforces fails with the program's `HorizonError` message, and the body adds its name, `{ error, name }`; `createLocalChain` throws an `Error` that carries `errorName` and the Anchor `code`, like `ProgramError` on Solana.
 
 | method | path | result |
 | --- | --- | --- |
@@ -144,10 +156,15 @@ The ledger and the Vite proxy both use the `/api/local` prefix. A failed call re
 | `POST` | `/api/local/armies/:pubkey/lock` | the opened match, or `null` when the army only queued |
 | `POST` | `/api/local/armies/:pubkey/unlock` | empty object |
 | `POST` | `/api/local/practice` | body `{ battlegroundId }` |
-| `GET` | `/api/local/pots/:battlegroundId` | the local user's pot, or `null` |
-| `POST` | `/api/local/pots/:battlegroundId/fund` | body `{ lamports }` (decimal string); the pot |
-| `POST` | `/api/local/pots/:battlegroundId/withdraw` | body `{ lamports }`; the pot |
-| `POST` | `/api/local/pots/:battlegroundId/segregation` | body `{ segregate }`; the pot |
+| `GET` | `/api/local/player` | the local user's `PlayerBalance`, or `null` before `register` |
+| `POST` | `/api/local/player/register` | body `{ lamports }` (decimal string); the Player |
+| `POST` | `/api/local/player/top-up` | body `{ lamports }`; the Player |
+| `POST` | `/api/local/player/budget` | body `{ lamports }`, free into budget; the Player |
+| `POST` | `/api/local/player/withdraw` | body `{ lamports }`; the Player |
+| `POST` | `/api/local/player/segregation` | body `{ segregate }`; the Player |
+| `GET` | `/api/local/config` | `{ admin, feeBps, fees }` |
+| `POST` | `/api/local/config/fee` | body `{ bps }`, admin only; the config |
+| `POST` | `/api/local/config/claim` | admin only; the config with `fees` 0 |
 | `DELETE` | `/api/local/armies/:pubkey` | empty object |
 | `GET` | `/api/local/matches?player=` | that player's latest 20 battles |
 | `GET` | `/api/local/matches/:pubkey` | one battle, or `null` |

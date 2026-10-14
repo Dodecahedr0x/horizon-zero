@@ -108,10 +108,21 @@ test("local ledger keeps one user, catalog rows, and army rules across a reopen"
     const stake = BigInt(BATTLEGROUNDS[0].stake);
     const broke = await call(first.port, "POST", `/api/local/armies/${mine.data[0].pubkey}/lock`);
     assert.equal(broke.status, 400);
-    assert.equal(broke.data.error, "Pot budget does not cover the battleground stake");
-    const funded = await call(first.port, "POST", "/api/local/pots/0/fund", { lamports: String(stake) });
-    assert.deepEqual(funded.data, { budget: String(stake), winnings: "0", segregate: false });
-    await call(first.port, "POST", "/api/local/pots/0/segregation", { segregate: true });
+    assert.equal(broke.data.error, "Player budget does not cover the battleground stake");
+    assert.equal(broke.data.name, "BudgetTooLow");
+    assert.equal((await call(first.port, "GET", "/api/local/player")).data, null);
+    await call(first.port, "POST", "/api/local/player/register", { lamports: String(stake) });
+    const funded = await call(first.port, "POST", "/api/local/player/budget", { lamports: String(stake) });
+    assert.deepEqual(funded.data, {
+      free: "0",
+      budget: String(stake),
+      winnings: "0",
+      locked: "0",
+      segregate: false,
+      outboxPending: "0",
+      outboxInFlight: false,
+    });
+    await call(first.port, "POST", "/api/local/player/segregation", { segregate: true });
     const queued = await call(first.port, "POST", `/api/local/armies/${mine.data[0].pubkey}/lock`);
     assert.equal(queued.status, 200);
     assert.equal(queued.data, null);
@@ -129,10 +140,17 @@ test("local ledger keeps one user, catalog rows, and army rules across a reopen"
     assert.match(opened.data.playerA, /^practice_[0-9a-f]{32}$/);
     assert.equal(opened.data.seed.length, 64);
     assert.equal(opened.data.unitsB.length, 2);
-    // Both stakes left the pots; a segregated payout lands in the winnings.
-    const won = opened.data.outcome === 2 ? 2n * stake : opened.data.outcome === 3 ? stake : 0n;
-    const pot = await call(first.port, "GET", "/api/local/pots/0");
-    assert.deepEqual(pot.data, { budget: "0", winnings: String(won), segregate: true });
+    // The battle settles at once: a segregated win lands in the winnings less the 5% fee, a draw
+    // refunds the budget, a loss leaves nothing.
+    const fee = (2n * stake * 500n) / 10_000n;
+    const outcome = opened.data.outcome;
+    const player = (await call(first.port, "GET", "/api/local/player")).data;
+    assert.equal(player.budget, outcome === 3 ? String(stake) : "0");
+    assert.equal(player.winnings, outcome === 2 ? String(2n * stake - fee) : "0");
+    assert.equal(player.locked, "0");
+    assert.equal(player.free, "0");
+    const config = (await call(first.port, "GET", "/api/local/config")).data;
+    assert.equal(config.fees, outcome === 3 ? "0" : String(fee));
     const matchedUnlock = await call(first.port, "POST", `/api/local/armies/${mine.data[0].pubkey}/unlock`);
     assert.equal(matchedUnlock.status, 400);
 
@@ -289,4 +307,210 @@ test("the ledger path stays off the indexer database", () => {
   assert.throws(() => resolveLedgerPath("/var/data/horizon.db"), /indexer database/);
   if (previous === undefined) delete process.env.DATABASE_PATH;
   else process.env.DATABASE_PATH = previous;
+});
+
+// Outpost: stake 10_000_000 lamports; at the default 5% the fee on a won pot is 1_000_000.
+const STAKE = 10_000_000n;
+const FEE = 1_000_000n;
+const DEPOSIT = 100_000_000n;
+
+/**
+ * A ledger whose battles end as `winner` says (0 side A, the queued practice army; 1 side B, the
+ * local user's lock; null a draw), so payouts are exact.
+ */
+function scripted() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hz-ledger-money-"));
+  const dbPath = path.join(dir, "ledger.db");
+  const state = { winner: null };
+  const ledger = createLedger(dbPath, { simulate: () => JSON.stringify({ winner: state.winner, lines: [] }) });
+  const api = (method, pathname, body = {}, params = new URLSearchParams()) => ledger.call(method, `/api/local${pathname}`, params, body);
+  const user = api("GET", "/owner").owner;
+  const marchKey = api("GET", "/behaviors").find((item) => item.name === "March").pubkey;
+  function army() {
+    api("POST", "/armies", { battlegroundId: 0, units: [0, 1, 2, 3].map((col) => ({ kind: 0, behavior: marchKey, col, row: 0 })) });
+    return api("GET", "/armies", {}, new URLSearchParams({ owner: user })).at(-1);
+  }
+  function practicePlayer(db) {
+    const id = db.prepare("SELECT id FROM identities WHERE role = 'practice'").get().id;
+    return db.prepare("SELECT * FROM players WHERE owner = ?").get(id);
+  }
+  function raw(fn) {
+    const db = new DatabaseSync(dbPath);
+    try {
+      return fn(db);
+    } finally {
+      db.close();
+    }
+  }
+  return {
+    state,
+    api,
+    user,
+    army,
+    raw,
+    practice: () => raw(practicePlayer),
+    close() {
+      ledger.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+function balanceOf(free, budget, winnings = 0n, locked = 0n, segregate = false) {
+  return {
+    free: String(free),
+    budget: String(budget),
+    winnings: String(winnings),
+    locked: String(locked),
+    segregate,
+    outboxPending: "0",
+    outboxInFlight: false,
+  };
+}
+
+function refused(fn, name, message) {
+  assert.throws(fn, (err) => err.errorName === name && err.message === message);
+}
+
+test("register, top up and fund the budget keep the lamports whole", () => {
+  const t = scripted();
+  try {
+    assert.equal(t.api("GET", "/player"), null);
+    refused(() => t.api("POST", "/player/budget", { lamports: "1" }), "MissingAccount", "A required account is missing");
+    assert.deepEqual(t.api("POST", "/player/register", { lamports: String(DEPOSIT) }), balanceOf(DEPOSIT, 0n));
+    refused(() => t.api("POST", "/player/register", { lamports: "1" }), "AlreadyExists", "Account already exists");
+    const funded = t.api("POST", "/player/budget", { lamports: "30000000" });
+    assert.deepEqual(funded, balanceOf(70_000_000n, 30_000_000n));
+    assert.equal(BigInt(funded.free) + BigInt(funded.budget), DEPOSIT);
+    refused(() => t.api("POST", "/player/budget", { lamports: "70000001" }), "BalanceShort", "Player holds less than the amount asked for");
+    assert.deepEqual(t.api("POST", "/player/top-up", { lamports: "5000000" }), balanceOf(75_000_000n, 30_000_000n));
+    assert.deepEqual(t.api("GET", "/player"), balanceOf(75_000_000n, 30_000_000n));
+  } finally {
+    t.close();
+  }
+});
+
+test("a won match pays the winner 2 * stake - fee and the fee to config", () => {
+  const t = scripted();
+  try {
+    t.api("POST", "/player/register", { lamports: String(DEPOSIT) });
+    t.api("POST", "/player/budget", { lamports: "30000000" });
+    t.api("POST", "/practice", { battlegroundId: 0 });
+    t.state.winner = 1;
+    const match = t.api("POST", `/armies/${t.army().pubkey}/lock`);
+    assert.equal(match.outcome, 2);
+    // Budget 30M - 10M stake + 19M credit; the Player gained the loser's stake less the fee.
+    assert.deepEqual(t.api("GET", "/player"), balanceOf(70_000_000n, 30_000_000n - STAKE + 2n * STAKE - FEE));
+    const loser = t.practice();
+    assert.deepEqual([loser.balance, loser.budget, loser.locked, loser.fighting], ["0", "0", "0", 0]);
+    assert.deepEqual(t.api("GET", "/config"), { admin: t.user, feeBps: 500, fees: String(FEE) });
+
+    // Lost: the local user's stake leaves the Player.
+    t.api("POST", "/practice", { battlegroundId: 0 });
+    t.state.winner = 0;
+    assert.equal(t.api("POST", `/armies/${t.army().pubkey}/lock`).outcome, 1);
+    assert.deepEqual(t.api("GET", "/player"), balanceOf(70_000_000n, 39_000_000n - STAKE));
+    assert.equal(t.practice().budget, String(2n * STAKE - FEE));
+    assert.equal(t.api("GET", "/config").fees, String(2n * FEE));
+  } finally {
+    t.close();
+  }
+});
+
+test("a draw restores both budgets and takes no fee", () => {
+  const t = scripted();
+  try {
+    t.api("POST", "/player/register", { lamports: String(DEPOSIT) });
+    t.api("POST", "/player/budget", { lamports: "30000000" });
+    t.api("POST", "/practice", { battlegroundId: 0 });
+    t.state.winner = null;
+    assert.equal(t.api("POST", `/armies/${t.army().pubkey}/lock`).outcome, 3);
+    assert.deepEqual(t.api("GET", "/player"), balanceOf(70_000_000n, 30_000_000n));
+    const other = t.practice();
+    assert.deepEqual([other.balance, other.budget, other.locked], [String(STAKE), String(STAKE), "0"]);
+    assert.equal(t.api("GET", "/config").fees, "0");
+  } finally {
+    t.close();
+  }
+});
+
+test("a segregated win goes to winnings, and withdraw takes free, winnings, then budget", () => {
+  const t = scripted();
+  try {
+    t.api("POST", "/player/register", { lamports: String(DEPOSIT) });
+    t.api("POST", "/player/budget", { lamports: "30000000" });
+    t.api("POST", "/player/segregation", { segregate: true });
+    t.api("POST", "/practice", { battlegroundId: 0 });
+    t.state.winner = 1;
+    t.api("POST", `/armies/${t.army().pubkey}/lock`);
+    assert.deepEqual(t.api("GET", "/player"), balanceOf(70_000_000n, 20_000_000n, 19_000_000n, 0n, true));
+
+    refused(() => t.api("POST", "/player/withdraw", { lamports: "0" }), "NothingToWithdraw", "There is nothing to withdraw");
+    assert.deepEqual(t.api("POST", "/player/withdraw", { lamports: "80000000" }), balanceOf(0n, 20_000_000n, 9_000_000n, 0n, true));
+    refused(() => t.api("POST", "/player/withdraw", { lamports: "29000001" }), "BalanceShort", "Player holds less than the amount asked for");
+    assert.deepEqual(t.api("POST", "/player/withdraw", { lamports: "15000000" }), balanceOf(0n, 14_000_000n, 0n, 0n, true));
+
+    // A stake still locked in a battle is never withdrawn.
+    t.raw((db) => db.prepare("UPDATE players SET locked = ?, balance = ?, fighting = 1 WHERE owner = ?").run(String(STAKE), String(14_000_000n + STAKE), t.user));
+    refused(() => t.api("POST", "/player/withdraw", { lamports: "14000001" }), "BalanceShort", "Player holds less than the amount asked for");
+    assert.deepEqual(t.api("POST", "/player/withdraw", { lamports: "14000000" }), balanceOf(0n, 0n, 0n, STAKE, true));
+  } finally {
+    t.close();
+  }
+});
+
+test("setFee and claimFees are admin only, setFee is capped, and a claim zeroes the fees", () => {
+  const t = scripted();
+  try {
+    refused(() => t.api("POST", "/config/claim"), "NothingToWithdraw", "There is nothing to withdraw");
+    refused(() => t.api("POST", "/config/fee", { bps: 1001 }), "FeeTooHigh", "Fee rate is above the cap");
+    assert.deepEqual(t.api("POST", "/config/fee", { bps: 1000 }), { admin: t.user, feeBps: 1000, fees: "0" });
+
+    t.api("POST", "/player/register", { lamports: String(DEPOSIT) });
+    t.api("POST", "/player/budget", { lamports: String(STAKE) });
+    t.api("POST", "/practice", { battlegroundId: 0 });
+    t.state.winner = 1;
+    t.api("POST", `/armies/${t.army().pubkey}/lock`);
+    // 10% of a 20M pot.
+    assert.equal(t.api("GET", "/config").fees, "2000000");
+    assert.equal(t.api("GET", "/player").budget, "18000000");
+
+    const admin = t.api("GET", "/config").admin;
+    t.raw((db) => db.prepare("UPDATE config SET admin = 'someone-else'").run());
+    refused(() => t.api("POST", "/config/claim"), "NotAdmin", "Battleground admin signature is required");
+    refused(() => t.api("POST", "/config/fee", { bps: 100 }), "NotAdmin", "Battleground admin signature is required");
+    t.raw((db) => db.prepare("UPDATE config SET admin = ?").run(admin));
+
+    assert.deepEqual(t.api("POST", "/config/claim"), { admin, feeBps: 1000, fees: "0" });
+    refused(() => t.api("POST", "/config/claim"), "NothingToWithdraw", "There is nothing to withdraw");
+  } finally {
+    t.close();
+  }
+});
+
+test("a lock evicts a queued army whose owner's budget no longer covers the stake", () => {
+  const t = scripted();
+  try {
+    t.api("POST", "/player/register", { lamports: String(DEPOSIT) });
+    t.api("POST", "/player/budget", { lamports: String(3n * STAKE) });
+    // Two practice armies on one practice budget of one stake.
+    t.api("POST", "/practice", { battlegroundId: 0 });
+    t.api("POST", "/practice", { battlegroundId: 0 });
+    assert.equal(t.practice().budget, String(STAKE));
+    t.state.winner = 1;
+    const first = t.api("POST", `/armies/${t.army().pubkey}/lock`);
+    assert.equal(first.outcome, 2);
+    assert.equal(t.practice().budget, "0");
+    const stranded = t.api("GET", "/battlegrounds")[0].queue;
+    assert.equal(stranded.length, 1);
+
+    const mine = t.army();
+    assert.equal(t.api("POST", `/armies/${mine.pubkey}/lock`), null);
+    assert.deepEqual(t.api("GET", "/battlegrounds")[0].queue, [mine.pubkey]);
+    const practiceId = t.raw((db) => db.prepare("SELECT id FROM identities WHERE role = 'practice'").get().id);
+    const evicted = t.api("GET", "/armies", {}, new URLSearchParams({ owner: practiceId })).find((item) => item.pubkey === stranded[0]);
+    assert.equal(evicted.status, 0);
+  } finally {
+    t.close();
+  }
 });

@@ -129,4 +129,4 @@ VRF program: `Vrf1RNUjXmQGjmQrQLvJHs9SNkvDJEsRVFPkfSQUwGz`, crate `ephemeral-vrf
 
 Ephemeral accounts: `ephemeral-rollups-sdk` 0.17.3, through the magic program `Magic11111111111111111111111111111111111111` and its rent vault `MagicVau1t999999999999999999999999999999999`.
 
-`VITE_DEV_MODE=true` renders the app without a Solana connection. Behaviors, battlegrounds, armies, and battles for that run live in the local ledger SQLite file. The asset studio is a local process and is absent from `render.yaml`. `horizon-zero-landing` is a static site in `render.yaml`. It presents the game and loads approved files from the web service. The game remains `horizon-zero`.
+`VITE_DEV_MODE=true` renders the app without a Solana connection. Behaviors, battlegrounds, armies, battles, Players, and the fee config for that run live in the local ledger SQLite file. The asset studio is a local process and is absent from `render.yaml`. `horizon-zero-landing` is a static site in `render.yaml`. It presents the game and loads approved files from the web service. The game remains `horizon-zero`.

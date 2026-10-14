@@ -1,4 +1,5 @@
-import type { Army, ChainAdapter, Match, Pot } from "./devChain";
+import { PROGRAM_ERRORS } from "./codec";
+import type { Army, ChainAdapter, Match, PlayerBalance, ProtocolConfig } from "./devChain";
 
 type Who = { owner: string; label: string };
 
@@ -18,9 +19,11 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     }
   }
   if (!response.ok) {
-    const message = data && typeof data === "object" && "error" in data && typeof (data as { error: unknown }).error === "string"
-      ? (data as { error: string }).error
-      : response.statusText;
+    const failure = (data && typeof data === "object" ? data : {}) as { error?: unknown; name?: unknown };
+    const message = typeof failure.error === "string" ? failure.error : response.statusText;
+    // A program error carries its HorizonError name, as `ProgramError` does on Solana.
+    const code = typeof failure.name === "string" ? PROGRAM_ERRORS.findIndex(([name]) => name === failure.name) : -1;
+    if (code >= 0) throw Object.assign(new Error(message), { code: 6000 + code, errorName: failure.name as string });
     throw new Error(message);
   }
   return data as T;
@@ -70,17 +73,38 @@ export function createLocalChain(): LocalChain {
     async closeArmy(army: Army) {
       await request("DELETE", `/armies/${encodeURIComponent(army.pubkey)}`);
     },
-    pot(battlegroundId: number) {
-      return request<Pot | null>("GET", `/pots/${battlegroundId}`);
+    player() {
+      return request<PlayerBalance | null>("GET", "/player");
     },
-    async fundPot(battlegroundId: number, lamports: bigint) {
-      await request("POST", `/pots/${battlegroundId}/fund`, { lamports: lamports.toString() });
+    async register(depositLamports: bigint) {
+      await request("POST", "/player/register", { lamports: depositLamports.toString() });
     },
-    async withdrawPot(battlegroundId: number, lamports: bigint) {
-      await request("POST", `/pots/${battlegroundId}/withdraw`, { lamports: lamports.toString() });
+    async topUp(lamports: bigint) {
+      await request("POST", "/player/top-up", { lamports: lamports.toString() });
     },
-    async setSegregation(battlegroundId: number, segregate: boolean) {
-      await request("POST", `/pots/${battlegroundId}/segregation`, { segregate });
+    async fundBudget(lamports: bigint) {
+      await request("POST", "/player/budget", { lamports: lamports.toString() });
+    },
+    // Dev mode has no Outbox: the ledger pays a withdrawal or a fee claim at once.
+    async withdraw(lamports: bigint) {
+      await request("POST", "/player/withdraw", { lamports: lamports.toString() });
+    },
+    async releasePending() {
+      return "none" as const;
+    },
+    async setSegregation(segregate: boolean) {
+      await request("POST", "/player/segregation", { segregate });
+    },
+    // The ledger settles a battle inside `lock`, so there is never a Seeded battle to settle.
+    async settle() {},
+    admin() {
+      return request<ProtocolConfig>("GET", "/config");
+    },
+    async claimFees() {
+      await request("POST", "/config/claim");
+    },
+    async setFee(bps: number) {
+      await request("POST", "/config/fee", { bps });
     },
     matches(owner: string) {
       return request<Match[]>("GET", `/matches?player=${encodeURIComponent(owner)}`);

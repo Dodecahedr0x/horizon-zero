@@ -8,6 +8,7 @@ import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import {
   BATTLEGROUNDS,
+  PROGRAM_ERRORS,
   STANDARDS,
   ZONE_DEPTH,
   raceById,
@@ -31,6 +32,27 @@ class LedgerError extends Error {
     super(message);
     this.status = status;
   }
+}
+
+/** The program's `HorizonError` of that name, with its message, so dev mode fails as the chain does. */
+function programFail(name) {
+  const entry = PROGRAM_ERRORS.find(([known]) => known === name);
+  if (!entry) throw new Error(`unknown program error ${name}`);
+  const err = new LedgerError(entry[1]);
+  err.errorName = name;
+  return err;
+}
+
+// The program's `fees.rs`.
+export const DEFAULT_FEE_BPS = 500;
+export const MAX_FEE_BPS = 1000;
+
+/** `fees::win_payout`: the loser pays `stake`, `fee` of it to Config and `toWinner` to the winner, who is credited `2 * stake - fee`. */
+export function winPayout(stake, feeBps) {
+  const pot = BigInt(stake) * 2n;
+  const bps = BigInt(Math.min(Number(feeBps), MAX_FEE_BPS));
+  const fee = (pot * bps) / 10_000n;
+  return { fee, toWinner: BigInt(stake) - fee, credit: pot - fee };
 }
 
 function hex(bytes) {
@@ -97,7 +119,12 @@ function send(res, status, body, extra = {}) {
   res.end(payload);
 }
 
-export function createLedger(dbPath) {
+/**
+ * `options.simulate` replaces `simulate_json` (same JSON string in and out); the tests use it to
+ * script outcomes.
+ */
+export function createLedger(dbPath, options = {}) {
+  const simulate = options.simulate || simulate_json;
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   const db = new DatabaseSync(dbPath);
   db.exec("PRAGMA journal_mode = WAL");
@@ -138,13 +165,21 @@ export function createLedger(dbPath) {
     ) STRICT;
     CREATE INDEX IF NOT EXISTS armies_owner ON armies(owner);
     DROP TABLE IF EXISTS escrow;
-    CREATE TABLE IF NOT EXISTS pots (
-      owner TEXT NOT NULL,
-      battleground_id INTEGER NOT NULL,
+    DROP TABLE IF EXISTS pots;
+    CREATE TABLE IF NOT EXISTS players (
+      owner TEXT PRIMARY KEY,
+      balance TEXT NOT NULL,
       budget TEXT NOT NULL,
       winnings TEXT NOT NULL,
+      locked TEXT NOT NULL,
       segregate INTEGER NOT NULL,
-      PRIMARY KEY (owner, battleground_id)
+      fighting INTEGER NOT NULL
+    ) STRICT;
+    CREATE TABLE IF NOT EXISTS config (
+      id INTEGER PRIMARY KEY CHECK (id = 0),
+      admin TEXT NOT NULL,
+      fee_bps INTEGER NOT NULL,
+      fees TEXT NOT NULL
     ) STRICT;
     CREATE TABLE IF NOT EXISTS matches (
       pubkey TEXT PRIMARY KEY,
@@ -201,6 +236,8 @@ export function createLedger(dbPath) {
         db.prepare("INSERT INTO identities (role, id, label) VALUES ('practice', ?, 'practice')").run(`practice_${idHex}`);
       }
       const user = identity("user");
+      // The local user is the dev admin: it is the only one who can sign in dev mode.
+      db.prepare("INSERT OR IGNORE INTO config (id, admin, fee_bps, fees) VALUES (0, ?, ?, '0')").run(user.id, DEFAULT_FEE_BPS);
       const insertGround = db.prepare(`INSERT OR IGNORE INTO battlegrounds
         (id, pubkey, name, budget, stake, cols, rows, queue, match_seq)
         VALUES (?, ?, ?, ?, ?, ?, ?, '[]', 0)`);
@@ -517,20 +554,47 @@ export function createLedger(dbPath) {
     return {};
   }
 
-  // The program's Pot: one stake budget per player and battleground that every locked army draws on.
-  function potOf(owner, battlegroundId) {
-    const row = db.prepare("SELECT budget, winnings, segregate FROM pots WHERE owner = ? AND battleground_id = ?").get(owner, battlegroundId);
-    return row ? { budget: BigInt(row.budget), winnings: BigInt(row.winnings), segregate: row.segregate === 1 } : null;
+  // The program's Player: one balance per owner. `balance` is its lamports, with no rent in dev;
+  // `free` is what `budget + winnings + locked` does not claim.
+  function playerOf(owner) {
+    const row = db.prepare("SELECT balance, budget, winnings, locked, segregate, fighting FROM players WHERE owner = ?").get(owner);
+    return row && {
+      balance: BigInt(row.balance),
+      budget: BigInt(row.budget),
+      winnings: BigInt(row.winnings),
+      locked: BigInt(row.locked),
+      segregate: row.segregate === 1,
+      fighting: Number(row.fighting),
+    };
   }
 
-  function savePot(owner, battlegroundId, pot) {
-    db.prepare(`INSERT INTO pots (owner, battleground_id, budget, winnings, segregate) VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT (owner, battleground_id) DO UPDATE SET budget = excluded.budget, winnings = excluded.winnings, segregate = excluded.segregate`)
-      .run(owner, battlegroundId, pot.budget.toString(), pot.winnings.toString(), pot.segregate ? 1 : 0);
+  function mustPlayer(owner) {
+    const player = playerOf(owner);
+    if (!player) throw programFail("MissingAccount");
+    return player;
   }
 
-  function potOut(pot) {
-    return pot && { budget: pot.budget.toString(), winnings: pot.winnings.toString(), segregate: pot.segregate };
+  function savePlayer(owner, player) {
+    db.prepare(`INSERT INTO players (owner, balance, budget, winnings, locked, segregate, fighting) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (owner) DO UPDATE SET balance = excluded.balance, budget = excluded.budget, winnings = excluded.winnings,
+        locked = excluded.locked, segregate = excluded.segregate, fighting = excluded.fighting`)
+      .run(owner, player.balance.toString(), player.budget.toString(), player.winnings.toString(), player.locked.toString(), player.segregate ? 1 : 0, player.fighting);
+  }
+
+  const freeOf = (player) => player.balance - player.budget - player.winnings - player.locked;
+
+  // `PlayerBalance` in app/src/devChain.ts. Dev mode has no Outbox: a withdrawal is paid at once.
+  function playerOut(player) {
+    if (!player) return null;
+    return {
+      free: freeOf(player).toString(),
+      budget: player.budget.toString(),
+      winnings: player.winnings.toString(),
+      locked: player.locked.toString(),
+      segregate: player.segregate,
+      outboxPending: "0",
+      outboxInFlight: false,
+    };
   }
 
   function lamports(value) {
@@ -540,43 +604,118 @@ export function createLedger(dbPath) {
     } catch {
       throw new LedgerError("amount must be a whole number of lamports");
     }
-    if (amount <= 0n) throw new LedgerError("amount must be positive");
+    if (amount < 0n || amount >= 2n ** 64n) throw new LedgerError("amount must be a whole number of lamports");
     return amount;
   }
 
-  function fundPot(owner, battlegroundId, amount) {
-    if (!groundRow(battlegroundId)) throw new LedgerError("Unknown battleground");
-    const pot = potOf(owner, battlegroundId) || { budget: 0n, winnings: 0n, segregate: false };
-    pot.budget += lamports(amount);
-    savePot(owner, battlegroundId, pot);
-    return potOut(pot);
+  // register_player: the deposit lands in free lamports.
+  function register(owner, amount) {
+    if (playerOf(owner)) throw programFail("AlreadyExists");
+    const player = { balance: lamports(amount), budget: 0n, winnings: 0n, locked: 0n, segregate: false, fighting: 0 };
+    savePlayer(owner, player);
+    return playerOut(player);
   }
 
-  // withdraw_pot: winnings first, then budget.
-  function withdrawPot(owner, battlegroundId, amount) {
-    const pot = potOf(owner, battlegroundId);
+  // A top-up is a transfer into the Player: free lamports.
+  function topUp(owner, amount) {
+    const player = mustPlayer(owner);
+    player.balance += lamports(amount);
+    savePlayer(owner, player);
+    return playerOut(player);
+  }
+
+  function fundBudget(owner, amount) {
+    const player = mustPlayer(owner);
     const want = lamports(amount);
-    if (!pot || want > pot.budget + pot.winnings) throw new LedgerError("Pot holds less than the amount asked for");
-    const fromWinnings = want < pot.winnings ? want : pot.winnings;
-    pot.winnings -= fromWinnings;
-    pot.budget -= want - fromWinnings;
-    savePot(owner, battlegroundId, pot);
-    return potOut(pot);
+    if (want > freeOf(player)) throw programFail("BalanceShort");
+    player.budget += want;
+    savePlayer(owner, player);
+    return playerOut(player);
   }
 
-  function setSegregation(owner, battlegroundId, segregate) {
-    const pot = potOf(owner, battlegroundId);
-    if (!pot) throw new LedgerError("Fund the pot first");
-    pot.segregate = !!segregate;
-    savePot(owner, battlegroundId, pot);
-    return potOut(pot);
+  // fund_outbox and release_outbox in one step: free, then winnings, then budget, never locked.
+  function withdraw(owner, amount) {
+    const player = mustPlayer(owner);
+    const want = lamports(amount);
+    if (want === 0n) throw programFail("NothingToWithdraw");
+    const free = freeOf(player);
+    const rest = want > free ? want - free : 0n;
+    const fromWinnings = rest < player.winnings ? rest : player.winnings;
+    if (rest - fromWinnings > player.budget) throw programFail("BalanceShort");
+    player.winnings -= fromWinnings;
+    player.budget -= rest - fromWinnings;
+    player.balance -= want;
+    savePlayer(owner, player);
+    return playerOut(player);
   }
 
-  function credit(owner, battlegroundId, amount) {
-    const pot = potOf(owner, battlegroundId);
-    if (pot.segregate) pot.winnings += amount;
-    else pot.budget += amount;
-    savePot(owner, battlegroundId, pot);
+  function setSegregation(owner, segregate) {
+    const player = mustPlayer(owner);
+    player.segregate = !!segregate;
+    savePlayer(owner, player);
+    return playerOut(player);
+  }
+
+  function configRow() {
+    const row = db.prepare("SELECT admin, fee_bps, fees FROM config WHERE id = 0").get();
+    return { admin: row.admin, feeBps: Number(row.fee_bps), fees: BigInt(row.fees) };
+  }
+
+  function configOut(config) {
+    return { admin: config.admin, feeBps: config.feeBps, fees: config.fees.toString() };
+  }
+
+  function saveConfig(config) {
+    db.prepare("UPDATE config SET admin = ?, fee_bps = ?, fees = ? WHERE id = 0").run(config.admin, config.feeBps, config.fees.toString());
+  }
+
+  function setFee(signer, bps) {
+    const config = configRow();
+    if (config.admin !== signer) throw programFail("NotAdmin");
+    const value = Number(bps);
+    if (!Number.isInteger(value) || value < 0) throw new LedgerError("fee must be a whole number of basis points");
+    if (value > MAX_FEE_BPS) throw programFail("FeeTooHigh");
+    config.feeBps = value;
+    saveConfig(config);
+    return configOut(config);
+  }
+
+  // fund_treasury_outbox and release_outbox in one step: every fee goes to the admin.
+  function claimFees(signer) {
+    const config = configRow();
+    if (config.admin !== signer) throw programFail("NotAdmin");
+    if (config.fees === 0n) throw programFail("NothingToWithdraw");
+    config.fees = 0n;
+    saveConfig(config);
+    return configOut(config);
+  }
+
+  // settle_match's payout. outcome 1: A won, 2: B won, 3: draw.
+  function settle(ownerA, ownerB, stake, feeBps, outcome) {
+    const a = playerOf(ownerA);
+    const b = playerOf(ownerB);
+    let fee = 0n;
+    if (outcome === 3) {
+      a.budget += stake;
+      b.budget += stake;
+    } else {
+      const [winner, loser] = outcome === 1 ? [a, b] : [b, a];
+      const payout = winPayout(stake, feeBps);
+      loser.balance -= stake;
+      winner.balance += payout.toWinner;
+      if (winner.segregate) winner.winnings += payout.credit;
+      else winner.budget += payout.credit;
+      fee = payout.fee;
+    }
+    for (const player of [a, b]) {
+      player.locked -= stake;
+      player.fighting -= 1;
+    }
+    savePlayer(ownerA, a);
+    savePlayer(ownerB, b);
+    const config = configRow();
+    config.fees += fee;
+    saveConfig(config);
   }
 
   function lock(pubkey) {
@@ -585,14 +724,25 @@ export function createLedger(dbPath) {
     if (!live || live.status !== 0 || !ground) throw new LedgerError("Army is not idle");
     const army = armyOut(live);
     const stake = BigInt(ground.stake);
-    const covers = (owner) => (potOf(owner, ground.id)?.budget ?? 0n) >= stake;
-    if (!covers(live.owner)) throw new LedgerError("Pot budget does not cover the battleground stake");
+    if ((playerOf(live.owner)?.budget ?? 0n) < stake) throw programFail("BudgetTooLow");
     const queue = JSON.parse(ground.queue);
-    // An opponent whose pot no longer covers the stake stays queued but cannot be met.
-    const opponents = queue
-      .map((key) => armyRow(key))
-      .filter((item) => item && item.owner !== live.owner && item.status === 1 && covers(item.owner))
-      .map(armyOut);
+    // As lock_army: another owner's queued army is a candidate while its owner's budget covers a
+    // stake, and is evicted (Idle, out of the queue) once it does not. The ledger knows every Player.
+    const opponents = [];
+    const evicted = [];
+    for (const key of queue) {
+      const item = armyRow(key);
+      if (!item || item.owner === live.owner || item.status !== 1) continue;
+      const owner = playerOf(item.owner);
+      if (!owner) continue;
+      if (owner.budget >= stake) opponents.push(armyOut(item));
+      else evicted.push(item.pubkey);
+    }
+    for (const key of evicted) {
+      queue.splice(queue.indexOf(key), 1);
+      db.prepare("UPDATE armies SET status = 0 WHERE pubkey = ?").run(key);
+    }
+    if (evicted.length) db.prepare("UPDATE battlegrounds SET queue = ? WHERE id = ?").run(JSON.stringify(queue), ground.id);
     if (opponents.length === 0) {
       queue.push(live.pubkey);
       db.prepare("UPDATE battlegrounds SET queue = ? WHERE id = ?").run(JSON.stringify(queue), ground.id);
@@ -618,7 +768,7 @@ export function createLedger(dbPath) {
       seed: Buffer.from(seedBytes).toString("hex"),
       outcome: 0,
     };
-    const raw = simulate_json(JSON.stringify({
+    const raw = simulate(JSON.stringify({
       cols: opened.cols,
       rows: opened.rows,
       a: opened.unitsA,
@@ -631,14 +781,15 @@ export function createLedger(dbPath) {
     opened.outcome = result.winner === 0 ? 1 : result.winner === 1 ? 2 : 3;
     const nextQueue = queue.filter((key) => key !== opponent.pubkey);
     db.prepare("UPDATE battlegrounds SET queue = ?, match_seq = ? WHERE id = ?").run(JSON.stringify(nextQueue), ground.match_seq + 1, ground.id);
-    // Both stakes leave the pots, and the battle settles at once: the payout goes back to them.
+    // lock_army locks both stakes; the battle then settles at once, as settle_match would.
     for (const owner of [opponent.owner, live.owner]) {
-      const pot = potOf(owner, ground.id);
-      pot.budget -= stake;
-      savePot(owner, ground.id, pot);
+      const player = playerOf(owner);
+      player.budget -= stake;
+      player.locked += stake;
+      player.fighting += 1;
+      savePlayer(owner, player);
     }
-    const paid = opened.outcome === 1 ? [2n * stake, 0n] : opened.outcome === 2 ? [0n, 2n * stake] : [stake, stake];
-    for (const [owner, amount] of [[opponent.owner, paid[0]], [live.owner, paid[1]]]) credit(owner, ground.id, amount);
+    settle(opponent.owner, live.owner, stake, configRow().feeBps, opened.outcome);
     db.prepare("UPDATE armies SET status = 0 WHERE pubkey = ?").run(opponent.pubkey);
     db.prepare("UPDATE armies SET status = 0 WHERE pubkey = ?").run(live.pubkey);
     db.prepare(`INSERT INTO matches (
@@ -736,9 +887,14 @@ export function createLedger(dbPath) {
     const queue = JSON.parse(ground.queue);
     queue.push(pubkey);
     db.prepare("UPDATE battlegrounds SET queue = ? WHERE id = ?").run(JSON.stringify(queue), ground.id);
-    // The practice foe's pot covers each army it queues.
-    const pot = potOf(opponent.id, ground.id);
-    if (!pot || pot.budget < BigInt(ground.stake)) fundPot(opponent.id, ground.id, BigInt(ground.stake) - (pot?.budget ?? 0n));
+    // The practice foe's budget is topped up to one stake, with the lamports to back it.
+    const stake = BigInt(ground.stake);
+    const foe = playerOf(opponent.id) || { balance: 0n, budget: 0n, winnings: 0n, locked: 0n, segregate: false, fighting: 0 };
+    if (foe.budget < stake) {
+      foe.balance += stake - foe.budget;
+      foe.budget = stake;
+    }
+    savePlayer(opponent.id, foe);
     return {};
   }
 
@@ -748,7 +904,6 @@ export function createLedger(dbPath) {
     const unlockMatch = pathName.match(/^\/api\/local\/armies\/([^/]+)\/unlock$/);
     const battleMatch = pathName.match(/^\/api\/local\/matches\/([^/]+)$/);
     const armyMatch = pathName.match(/^\/api\/local\/armies\/([^/]+)$/);
-    const potMatch = pathName.match(/^\/api\/local\/pots\/(\d+)(?:\/(fund|withdraw|segregation))?$/);
     if (pathName === `${PREFIX}/owner` && method === "GET") {
       const user = identity("user");
       return { owner: user.id, label: user.label };
@@ -778,15 +933,20 @@ export function createLedger(dbPath) {
     if (pathName === `${PREFIX}/practice` && method === "POST") {
       return transaction(() => practice(Number(body.battlegroundId)));
     }
-    if (potMatch) {
+    if (pathName === `${PREFIX}/player` && method === "GET") return playerOut(playerOf(identity("user").id));
+    const playerMatch = pathName.match(/^\/api\/local\/player\/(register|top-up|budget|withdraw|segregation)$/);
+    if (playerMatch && method === "POST") {
       const owner = identity("user").id;
-      const id = Number(potMatch[1]);
-      if (!potMatch[2] && method === "GET") return potOut(potOf(owner, id));
-      if (potMatch[2] === "fund" && method === "POST") return transaction(() => fundPot(owner, id, body.lamports));
-      if (potMatch[2] === "withdraw" && method === "POST") return transaction(() => withdrawPot(owner, id, body.lamports));
-      if (potMatch[2] === "segregation" && method === "POST") return transaction(() => setSegregation(owner, id, body.segregate));
-      throw new LedgerError("method not allowed", 405);
+      const action = playerMatch[1];
+      if (action === "register") return transaction(() => register(owner, body.lamports));
+      if (action === "top-up") return transaction(() => topUp(owner, body.lamports));
+      if (action === "budget") return transaction(() => fundBudget(owner, body.lamports));
+      if (action === "withdraw") return transaction(() => withdraw(owner, body.lamports));
+      return transaction(() => setSegregation(owner, body.segregate));
     }
+    if (pathName === `${PREFIX}/config` && method === "GET") return configOut(configRow());
+    if (pathName === `${PREFIX}/config/fee` && method === "POST") return transaction(() => setFee(identity("user").id, body.bps));
+    if (pathName === `${PREFIX}/config/claim` && method === "POST") return transaction(() => claimFees(identity("user").id));
     if (battleMatch && method === "GET") {
       const row = db.prepare("SELECT * FROM matches WHERE pubkey = ?").get(decodeURIComponent(battleMatch[1]));
       return row ? matchOut(row) : null;
@@ -798,6 +958,11 @@ export function createLedger(dbPath) {
       pathName === `${PREFIX}/armies` ||
       pathName === `${PREFIX}/practice` ||
       pathName === `${PREFIX}/matches` ||
+      pathName === `${PREFIX}/player` ||
+      pathName === `${PREFIX}/config` ||
+      pathName === `${PREFIX}/config/fee` ||
+      pathName === `${PREFIX}/config/claim` ||
+      playerMatch ||
       lockMatch ||
       unlockMatch ||
       battleMatch ||
@@ -827,7 +992,8 @@ export function createServer(ledger) {
       send(res, 200, ledger.call(req.method || "GET", url.pathname, url.searchParams, body), open);
     } catch (err) {
       const status = Number(err.status) || 500;
-      send(res, status, { error: err instanceof Error ? err.message : "failed" });
+      const name = err && typeof err.errorName === "string" ? { name: err.errorName } : {};
+      send(res, status, { error: err instanceof Error ? err.message : "failed", ...name });
     }
   });
 }
