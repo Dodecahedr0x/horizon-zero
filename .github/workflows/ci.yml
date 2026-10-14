@@ -26,7 +26,7 @@ jobs:
           version: 10
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: pnpm
       - name: Wasm replay matches the golden vector
         run: |
@@ -47,14 +47,27 @@ jobs:
         run: |
           sh -c "$(curl -sSfL https://release.anza.xyz/v4.2.1/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            indexer -> target
       - uses: pnpm/action-setup@v4
         with:
           version: 10
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          # The scripts import app/src/codec.ts, which needs Node's default type stripping.
+          node-version: 24
           cache: pnpm
-      - name: Local MagicBlock stack and a VRF-resolved battle
+      # The stack starts the indexer with `cargo run` in indexer/, on its own toolchain file. Built
+      # here, it is ready at once instead of compiling inside the stack's wait.
+      - name: Build the indexer
+        working-directory: indexer
+        run: |
+          rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal
+          cargo build
+      - name: Local MagicBlock stack, a VRF-seeded battle, a withdrawal and a fee claim
         run: |
           pnpm install
           npm install -g @magicblock-labs/ephemeral-validator@0.14.10

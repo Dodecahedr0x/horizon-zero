@@ -1,6 +1,6 @@
 # Testing
 
-Two CI jobs live in `.github/workflows/ci.yml`. Both install Anza `v4.2.1`.
+Two CI jobs live in `.github/workflows/ci.yml`. Both install Anza `v4.2.1` and Node 24, whose default type stripping lets the tests and scripts import `app/src/codec.ts` directly.
 
 ## Combat, wasm, and LiteSVM
 
@@ -50,7 +50,7 @@ The suite's `queue` helper passes the battle read-only, as a lock that only queu
 
 ## Local stack
 
-Job `localnet` installs `@magicblock-labs/ephemeral-validator@0.14.10` globally and runs `pnpm localnet:check`, which is `scripts/local-stack.mjs --check`. The same script without `--check` is `pnpm localnet`, the local cluster for development: [Networks and deployment](deployment.md#local-stack) describes what it starts and the bootstrap it runs. It builds `programs/horizon-zero` with default features, so neither `inline-mock-vrf` nor `inline-mock-magic` is on: the rollup runs the real ephemeral-account, delegation, commit and VRF paths. Every start resets the base ledger, the rollup's storage and the indexer database.
+Job `localnet` caches the cargo builds of the workspace and of `indexer/` (`Swatinem/rust-cache`), installs the indexer's toolchain from `indexer/rust-toolchain.toml` and builds the indexer in `indexer/`, so the stack's `cargo run` starts it at once. It then installs `@magicblock-labs/ephemeral-validator@0.14.10` globally and runs `pnpm localnet:check`, which is `scripts/local-stack.mjs --check`. The same script without `--check` is `pnpm localnet`, the local cluster for development: [Networks and deployment](deployment.md#local-stack) describes what it starts and the bootstrap it runs. It builds `programs/horizon-zero` with default features, so neither `inline-mock-vrf` nor `inline-mock-magic` is on: the rollup runs the real ephemeral-account, delegation, commit and VRF paths. Every start resets the base ledger, the rollup's storage and the indexer database.
 
 With `--check`, `app/scripts/localnet-assert.mjs` then runs against Solana (`8899`), the rollup (`7799`), the ephemeral test queue, the bootstrap admin `target/localnet/admin.json` and the stack's indexer. It imports the instruction builders and decoders from `app/src/codec.ts`. It sends every transaction the way the game does: a blockhash from the connection it sends to, then polling `isBlockhashValid` and `getSignatureStatuses` with `searchTransactionHistory`, and `getTransaction` for the logs. Any failed check stops it with a non-zero exit:
 
