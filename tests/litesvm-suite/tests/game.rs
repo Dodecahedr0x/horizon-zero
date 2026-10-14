@@ -12,12 +12,12 @@ use solana_message::Message;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
 
-const STAKE: u64 = 50_000_000;
+const STAKE: u64 = 10_000_000;
 /// What a won battle at `STAKE` and the default 500 bps fee moves (`fees::win_payout`): the fee to
 /// Config, the loser's lamports to the winner, and what the winner's budget or winnings grows by.
-const FEE: u64 = 5_000_000;
-const TO_WINNER: u64 = 45_000_000;
-const CREDIT: u64 = 95_000_000;
+const FEE: u64 = 1_000_000;
+const TO_WINNER: u64 = 9_000_000;
+const CREDIT: u64 = 19_000_000;
 
 /// One army unit: its kind and its zone-local column and row.
 type Placement = (AshbornKind, u8, u8);
@@ -162,8 +162,8 @@ fn setup_on(svm: LiteSVM) -> Env {
 
     let mut env = Env { svm, program, vrf, queue, admin, config };
     env.create_battleground(0, BUDGET, STAKE, 8, 6);
-    env.create_battleground(1, 16, 200_000_000, 10, 8);
-    env.create_battleground(2, 32, 1_000_000_000, 12, 10);
+    env.create_battleground(1, 16, 50_000_000, 10, 8);
+    env.create_battleground(2, 32, 100_000_000, 12, 10);
     let admin = env.admin.insecure_clone();
     register(&mut env, &admin, 1_000_000_000);
     env
@@ -817,8 +817,8 @@ fn a_player_does_not_match_their_own_army_or_another_battleground() {
     let other = Keypair::new();
     env.fund(&other);
     let (garrison, _) = pda(&[b"battleground", &[1]], &env.program);
-    top_up(&mut env, &player, 200_000_000);
-    let ixs = [player_ix(&env, &player, "fund_budget", &200_000_000u64.to_le_bytes())];
+    top_up(&mut env, &player, 50_000_000);
+    let ixs = [player_ix(&env, &player, "fund_budget", &50_000_000u64.to_le_bytes())];
     send(&mut env.svm, &player, &ixs);
     let elsewhere = env.army(&other, 1, 0, AshbornKind::Guard.id(), hold);
     cover_stake(&mut env, &other, &garrison);

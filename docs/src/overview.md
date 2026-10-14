@@ -62,9 +62,9 @@ The program does not hardcode battleground names, budgets, stakes, or grid sizes
 
 | id | name | budget | stake (lamports) | SOL | grid |
 | --- | --- | --- | --- | --- | --- |
-| 0 | Outpost | 8 | 50,000,000 | 0.05 | 8×6 |
-| 1 | Garrison | 16 | 200,000,000 | 0.2 | 10×8 |
-| 2 | Citadel | 32 | 1,000,000,000 | 1 | 12×10 |
+| 0 | Outpost | 8 | 10,000,000 | 0.01 | 8×6 |
+| 1 | Garrison | 16 | 50,000,000 | 0.05 | 10×8 |
+| 2 | Citadel | 32 | 100,000,000 | 0.1 | 12×10 |
 
 Stakes stay on the Players until `settle_match`. The winner of a resolved battle gets the pot, `2 * stake`, less a protocol fee of `fee_bps` basis points of the pot (at most `1000`; `DEFAULT_FEE_BPS` is `500`, 5%): the loser's Player sends `stake - fee` to the winner's Player and `fee` to Config, where it counts toward `config.fees`. The admin sets the rate with `set_fee`. A draw takes no fee and returns each stake to its budget. A win credits the winner's budget, or their separate winnings when the owner turned segregation on. `settle_match` closes the battle account and refunds its rent to the Player that paid it.
 

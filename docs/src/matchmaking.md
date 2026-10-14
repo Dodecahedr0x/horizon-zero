@@ -176,7 +176,7 @@ The fee is a share of the pot. With `pot = 2 * stake` and the `fee_bps` the batt
 
 `fee_bps` is at most `1000`, so the fee never exceeds the loser's stake. The admin sets it with `set_fee`; `initialize` takes the first value.
 
-Example: at Garrison (stake 0.2 SOL) with a 5% fee, the pot is 0.4 SOL and the fee is 0.02 SOL. The loser's Player sends 0.18 SOL to the winner's and 0.02 SOL to Config. The winner nets +0.18 SOL and the loser loses 0.2 SOL.
+Example: at Garrison (stake 0.05 SOL) with a 5% fee, the pot is 0.1 SOL and the fee is 0.005 SOL. The loser's Player sends 0.045 SOL to the winner's and 0.005 SOL to Config. The winner nets +0.045 SOL and the loser loses 0.05 SOL.
 
 The `HZ_MATCH_RESOLVED` log carries the outcome and the fee, because the battle account is gone after settlement.
 
