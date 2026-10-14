@@ -1487,6 +1487,9 @@ fn send_with(env: &mut Env, payer: &Keypair, build: impl Fn(&Env) -> Vec<Instruc
 }
 
 const OUTBOX_LEN: usize = 49;
+const CONFIG_LEN: usize = 51;
+/// LiteSVM's fee for a transaction with one signature.
+const TX_FEE: u64 = 5_000;
 /// The rollup's magic context, written by every commit. The mock build does not check it.
 const MAGIC_CONTEXT: Address = address!("MagicContext1111111111111111111111111111111");
 
@@ -1572,6 +1575,7 @@ fn withdraw_takes_free_then_winnings_then_budget_and_release_pays_the_owner() {
     seized.accounts[0] = meta(stranger.pubkey(), false, true);
     send_expect_reason(&mut env.svm, &stranger, &[seized], "ConstraintSeeds");
     send_expect_reason_with(&mut env, &owner, |env| vec![withdraw_ix(env, &owner, outbox)], "NothingToWithdraw");
+    send_expect_reason_with(&mut env, &stranger, |env| vec![withdraw_ix(env, &stranger, outbox)], "ConstraintSeeds");
 
     // All the free lamports, then 10_000_000 of the winnings; the budget is untouched.
     let free = player_free(&env, &owner.pubkey());
@@ -1579,6 +1583,7 @@ fn withdraw_takes_free_then_winnings_then_budget_and_release_pays_the_owner() {
     let first = free + 10_000_000;
     let ixs = [fund_outbox_ix(&env, &owner, first), withdraw_ix(&env, &owner, outbox)];
     let logs = send(&mut env.svm, &owner, &ixs);
+    assert!(logs.iter().any(|line| line.contains(&format!("HZ_OUTBOX_FUND {outbox} {} {first}", owner.pubkey()))));
     assert!(logs.iter().any(|line| line.contains(&format!("HZ_WITHDRAW {outbox} {first}"))));
     assert!(logs.iter().any(|line| line.contains("HZ_PLAYER")));
     assert_eq!(player_state(&env, &owner.pubkey()), (40_000_000, CREDIT - 10_000_000, 0, true, 0));
@@ -1586,6 +1591,12 @@ fn withdraw_takes_free_then_winnings_then_budget_and_release_pays_the_owner() {
     assert_eq!(env.balance(&player), held - first);
     assert_eq!(env.balance(&outbox), outbox_rent + first);
     assert_eq!(outbox_state(&env, &outbox), (owner.pubkey(), first));
+
+    // `withdraw` reads the Outbox by hand and refuses one this program does not own.
+    let funded = env.svm.get_account(&outbox).unwrap();
+    env.svm.set_account(outbox, Account { owner: SYSTEM, ..funded.clone() }).unwrap();
+    send_expect_reason_with(&mut env, &owner, |env| vec![withdraw_ix(env, &owner, outbox)], "BadPda");
+    env.svm.set_account(outbox, funded).unwrap();
 
     // One withdrawal at a time, until the Outbox is released.
     send_expect_reason_with(&mut env, &owner, |env| vec![fund_outbox_ix(env, &owner, 1)], "OutboxBusy");
@@ -1597,9 +1608,9 @@ fn withdraw_takes_free_then_winnings_then_budget_and_release_pays_the_owner() {
     assert_eq!(env.balance(&owner.pubkey()), wallet + first);
     assert_eq!(env.balance(&outbox), outbox_rent, "the release leaves the Outbox its rent");
     assert_eq!(outbox_state(&env, &outbox), (owner.pubkey(), 0));
-    // A second release pays nothing.
+    // A second release pays nothing and logs nothing.
     let logs = send_with(&mut env, &stranger, |env| vec![release_ix(env, outbox, owner.pubkey())]);
-    assert!(logs.iter().any(|line| line.contains(&format!("HZ_RELEASE {outbox} 0"))));
+    assert!(!logs.iter().any(|line| line.contains("HZ_RELEASE")));
     assert_eq!(env.balance(&owner.pubkey()), wallet + first);
 
     // The rest of the winnings, then 15_000_000 of the budget; asking past it is short.
@@ -1609,11 +1620,35 @@ fn withdraw_takes_free_then_winnings_then_budget_and_release_pays_the_owner() {
     assert_eq!(player_state(&env, &owner.pubkey()), (25_000_000, 0, 0, true, 0));
     assert_eq!(env.balance(&player), held - first - second);
     send_with(&mut env, &stranger, |env| vec![release_ix(env, outbox, owner.pubkey())]);
-    assert_eq!(env.balance(&owner.pubkey()), wallet + first + second - 5_000, "less the fee for the second withdrawal");
+    assert_eq!(env.balance(&owner.pubkey()), wallet + first + second - TX_FEE, "less the fee for the second withdrawal");
     send_expect_reason_with(&mut env, &owner, |env| vec![fund_outbox_ix(env, &owner, 25_000_001)], "BalanceShort");
     send_with(&mut env, &owner, |env| vec![fund_outbox_ix(env, &owner, 25_000_000)]);
     assert_eq!(player_state(&env, &owner.pubkey()), (0, 0, 0, true, 0));
     assert_eq!(env.balance(&player), env.svm.minimum_balance_for_rent_exemption(PLAYER_LEN), "the Player keeps its rent");
+}
+
+#[test]
+fn funding_an_outbox_keeps_the_players_rent_and_counters() {
+    let mut env = setup();
+    let owner = Keypair::new();
+    env.fund(&owner);
+    register(&mut env, &owner, 100_000_000);
+    let ixs = [player_ix(&env, &owner, "fund_budget", &60_000_000u64.to_le_bytes())];
+    send(&mut env.svm, &owner, &ixs);
+    // A Player that holds one lamport less than its rent and budget claim: the counters allow any
+    // part of the budget, but every move would leave the Player short of what it still claims.
+    let player = player_pda(&env, &owner.pubkey());
+    let rent = env.svm.minimum_balance_for_rent_exemption(PLAYER_LEN);
+    let held = env.svm.get_account(&player).unwrap();
+    env.svm.set_account(player, Account { lamports: rent + 60_000_000 - 1, ..held }).unwrap();
+    for amount in [60_000_000u64, 1] {
+        send_expect_reason_with(&mut env, &owner, |env| vec![fund_outbox_ix(env, &owner, amount)], "BalanceShort");
+    }
+    // Once the lamport is back, the whole budget can leave.
+    top_up(&mut env, &owner, 1);
+    send_with(&mut env, &owner, |env| vec![fund_outbox_ix(env, &owner, 60_000_000)]);
+    assert_eq!(player_state(&env, &owner.pubkey()), (0, 0, 0, false, 0));
+    assert_eq!(env.balance(&player), rent);
 }
 
 #[test]
@@ -1664,13 +1699,20 @@ fn only_the_admin_claims_fees_and_release_pays_the_admin() {
 
     send_expect_reason_with(&mut env, &stranger, |env| vec![treasury_ix(env, &stranger, "fund_treasury_outbox")], "NotAdmin");
     send_expect_reason_with(&mut env, &admin, |env| vec![treasury_ix(env, &admin, "claim_fees")], "NothingToWithdraw");
+    // Config one lamport short of its rent and fees cannot pay the fees out.
+    let config_rent = env.svm.minimum_balance_for_rent_exemption(CONFIG_LEN);
+    let held = env.svm.get_account(&env.config).unwrap();
+    env.svm.set_account(env.config, Account { lamports: config_rent + FEE - 1, ..held.clone() }).unwrap();
+    send_expect_reason_with(&mut env, &admin, |env| vec![treasury_ix(env, &admin, "fund_treasury_outbox")], "BalanceShort");
+    env.svm.set_account(env.config, held).unwrap();
     let config_held = env.balance(&env.config);
     let ixs = [treasury_ix(&env, &admin, "fund_treasury_outbox"), treasury_ix(&env, &admin, "claim_fees")];
     let logs = send(&mut env.svm, &admin, &ixs);
+    assert!(logs.iter().any(|line| line.contains(&format!("HZ_OUTBOX_FUND {outbox} {} {FEE}", admin.pubkey()))));
     assert!(logs.iter().any(|line| line.contains(&format!("HZ_CLAIM {outbox} {FEE}"))));
     assert_eq!(config_fees(&env), 0);
     assert_eq!(env.balance(&env.config), config_held - FEE);
-    assert_eq!(env.balance(&env.config), env.svm.minimum_balance_for_rent_exemption(51), "Config keeps its rent");
+    assert_eq!(env.balance(&env.config), config_rent, "Config keeps its rent");
     assert_eq!(env.balance(&outbox), outbox_rent + FEE);
     assert_eq!(outbox_state(&env, &outbox), (admin.pubkey(), FEE));
     send_expect_reason_with(&mut env, &admin, |env| vec![treasury_ix(env, &admin, "fund_treasury_outbox")], "OutboxBusy");

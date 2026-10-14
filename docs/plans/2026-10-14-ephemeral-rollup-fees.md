@@ -990,6 +990,8 @@ pub fn release_outbox(ctx: Context<ReleaseOutbox>) -> Result<()> {
 
 The LiteSVM tests call `fund_outbox` and then `release_outbox` directly. Under mock, `withdraw` and `claim_fees` do nothing beyond their checks.
 
+As built, two account lists differ from the list below. `Withdraw` takes no Player, because only the Outbox is committed and the wallet pays the intent. `ClaimFees`' Config is not `mut`, because it only supplies the admin.
+
 Accounts:
 - `Withdraw`: `owner` (signer, mut), `player` (mut, seeds), `outbox` (mut, seeds `[b"outbox", owner]`, `has_one = owner`), and `magic: MagicAccounts` (a nested struct with `magic_context` (mut) and `magic_program`; both `UncheckedAccount`, with addresses checked when not mocked).
 - `ClaimFees`: `admin` (signer, mut), `config` (mut, `has_one = admin`), `outbox` (mut, seeds `[b"outbox", config.key()]`), and `magic`.

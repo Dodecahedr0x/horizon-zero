@@ -109,8 +109,8 @@ sequenceDiagram
   participant Base as horizon-zero (Solana)
   Wallet->>ER: fund_outbox(amount)
   ER->>ER: free, then winnings, then budget, never locked (BalanceShort)
-  ER->>ER: Player to Outbox lamports, outbox.amount = amount (HZ_WITHDRAW)
-  Wallet->>ER: withdraw (same transaction)
+  ER->>ER: Player to Outbox lamports, outbox.amount = amount (HZ_OUTBOX_FUND)
+  Wallet->>ER: withdraw (same transaction, HZ_WITHDRAW)
   ER->>Magic: commit-and-undelegate the Outbox, then release_outbox(outbox, owner), paid by the wallet
   Magic-->>Validator: intent queued in the magic context
   Validator->>DLP: commit, finalize, undelegate the Outbox
@@ -122,11 +122,15 @@ sequenceDiagram
   end
 ```
 
-`release_outbox` is permissionless. The delegation program signs the action with an escrow PDA, so the program cannot tell the action from any other caller. That is safe: the instruction pays only the owner recorded in the Outbox, which is the wallet for `[b"outbox", owner]` and the admin for the treasury Outbox, and is checked against the passed account. A second call pays 0. While the Outbox is still delegated, the delegation program owns it on Solana and the call fails. If the action never runs, the client calls `release_outbox` itself once the Outbox is undelegated.
+`release_outbox` is permissionless. The delegation program signs the action with an escrow PDA, so the program cannot tell the action from any other caller. That is safe: the instruction pays only the owner recorded in the Outbox, which is the wallet for `[b"outbox", owner]` and the admin for the treasury Outbox, and is checked against the passed account. A second call finds `amount` 0 and does nothing. While the Outbox is still delegated, the delegation program owns it on Solana and the call fails. If the action never runs, the client calls `release_outbox` itself once the Outbox is undelegated.
 
-A funded Outbox blocks the next `fund_outbox` with `OutboxBusy` until it is released. Every withdrawal also ends the Outbox's delegation, so before the next one the client must delegate the Outbox again. This version of the program has no instruction for that yet. On the local stack one delegation session cost the wallet about 300 000 lamports, or 0.0003 SOL, plus transaction fees: 3 138 960 lamports of delegation record and metadata rent at delegation, of which 2 838 960 come back at undelegation.
+`release_outbox` runs only on Solana. In the rollup it cannot pay anyone: the owner wallet is not delegated, and the rollup rejects any transaction that changes an undelegated account, whether the account is writable (`InvalidWritableAccount`) or the fee payer (`InvalidAccountForFee`). Once `withdraw` has run, the rollup's Outbox belongs to the delegation program, so the typed Outbox check fails as well. On the local stack, a third-party release sent to the rollup never took effect, and the base action paid exactly once.
 
-**Fee claim.** Fees collect on Config (`config.fees`, on top of its rent). The admin creates the treasury Outbox `[b"outbox", config]` once on Solana with `init_treasury_outbox`. A claim is the same two-instruction rollup transaction: `fund_treasury_outbox` moves all of `config.fees` to the treasury Outbox, records the admin as its owner and sets `config.fees` to 0 (`HZ_CLAIM`), and `claim_fees` schedules its commit-and-undelegate with the same `release_outbox` action, which pays the admin. Only the admin can send either instruction (`NotAdmin`). With no fees, `fund_treasury_outbox` fails with `NothingToWithdraw`.
+**A half-sent withdrawal.** If `fund_outbox` lands without `withdraw`, the lamports wait in the delegated Outbox, and `OutboxBusy` blocks another `fund_outbox`. A later `withdraw` on its own schedules the release. No instruction moves the lamports back to the Player.
+
+A funded Outbox blocks the next `fund_outbox` with `OutboxBusy` until it is released. `fund_outbox` also refuses a move that would leave the Player holding less than its rent plus `budget + winnings + locked` (`BalanceShort`). Every withdrawal also ends the Outbox's delegation, so before the next one the client must delegate the Outbox again. This version of the program has no instruction for that yet. On the local stack one delegation session cost the wallet about 300 000 lamports, or 0.0003 SOL, plus transaction fees: 3 138 960 lamports of delegation record and metadata rent at delegation, of which 2 838 960 come back at undelegation.
+
+**Fee claim.** Fees collect on Config (`config.fees`, on top of its rent). The admin creates the treasury Outbox `[b"outbox", config]` once on Solana with `init_treasury_outbox`. A claim is the same two-instruction rollup transaction: `fund_treasury_outbox` moves all of `config.fees` to the treasury Outbox, records the admin as its owner and sets `config.fees` to 0 (`HZ_OUTBOX_FUND`), and `claim_fees` schedules its commit-and-undelegate with the same `release_outbox` action, which pays the admin (`HZ_CLAIM`). Only the admin can send either instruction (`NotAdmin`). With no fees, `fund_treasury_outbox` fails with `NothingToWithdraw`. If `fund_treasury_outbox` lands without `claim_fees`, the fees wait in the delegated treasury Outbox until a later `claim_fees`; no instruction moves them back to Config. Like the player Outbox, every claim ends the treasury Outbox's delegation, so before the next claim the admin must delegate it again. This version of the program has no instruction for that yet. `init_treasury_outbox` reads Config by hand, so it works whether or not Config is delegated.
 
 ## VRF request
 

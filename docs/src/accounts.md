@@ -386,11 +386,11 @@ Log: `HZ_MATCH_RESOLVED <battle> <outcome> <fee> <seed hex> <player_b>`. The out
 
 Rollup. Accounts: owner signer, player writable `[b"player", owner]`, outbox writable `[b"outbox", owner]`. Both must record the signer as `owner` (`NotOwner`).
 
-An Outbox whose `amount` is not 0 fails with `OutboxBusy`: it has not been released yet. An `amount` of 0 fails with `NothingToWithdraw`. The amount comes from free lamports first, then `winnings`, then `budget`. It never comes from `locked`, and more than `free + winnings + budget` fails with `BalanceShort`. The instruction lowers the counters, moves `amount` lamports from the Player to the Outbox, and sets `outbox.amount`. The Player keeps its rent and the locked stakes.
+An Outbox whose `amount` is not 0 fails with `OutboxBusy`: it has not been released yet. An `amount` of 0 fails with `NothingToWithdraw`. The amount comes from free lamports first, then `winnings`, then `budget`. It never comes from `locked`, and more than `free + winnings + budget` fails with `BalanceShort`. The instruction lowers the counters, moves `amount` lamports from the Player to the Outbox, and sets `outbox.amount`. Afterwards the Player must still hold `rent + budget + winnings + locked`, all as checked sums (`BalanceShort` otherwise), so it keeps its rent and every claimed counter.
 
-Send `withdraw` after it in the same transaction. The rollup refuses an instruction that both moves lamports into an account and schedules that account's commit, so the two cannot be one instruction.
+Send `withdraw` after it in the same transaction. The rollup refuses an instruction that both moves lamports into an account and schedules that account's commit, so the two cannot be one instruction. If `fund_outbox` lands without `withdraw`, the lamports wait in the delegated Outbox, and `OutboxBusy` blocks the next `fund_outbox`. A later `withdraw` on its own schedules the release. No instruction moves them back to the Player.
 
-Logs: `HZ_PLAYER …`, then `HZ_WITHDRAW <outbox> <amount>`.
+Logs: `HZ_OUTBOX_FUND <outbox> <owner> <amount>`, then `HZ_PLAYER …`.
 
 ### `withdraw`
 
@@ -398,32 +398,36 @@ Rollup. Accounts: owner signer writable, outbox writable `[b"outbox", owner]`, m
 
 The Outbox is read by hand, because the magic program takes it over during the instruction and Anchor would write a typed account back afterwards. It must be owned by this program (`BadPda`), record the signer as `owner` (`NotOwner`), and hold a non-zero `amount` (`NothingToWithdraw`). The instruction then schedules a commit-and-undelegate of the Outbox alone. A post-undelegate action calls `release_outbox` on Solana with the accounts outbox (writable) and owner (writable). The wallet pays the intent and is the action's escrow authority. No escrow account has to exist.
 
-No log. The release on Solana logs `HZ_RELEASE`.
+Log: `HZ_WITHDRAW <outbox> <amount>`, with the amount read from the Outbox. Under `inline-mock-magic` the instruction runs its checks and logs, and schedules nothing.
 
 ### `release_outbox`
 
-Solana. Permissionless. Accounts: outbox writable, owner writable, which must be `outbox.owner` (`ConstraintAddress`) and a system account. When the delegation program runs it as the post-undelegate action, it appends three more accounts: the destination program, the escrow authority, and the escrow PDA, which signs. The instruction ignores them.
+Solana. Permissionless. Accounts: outbox writable, owner writable, which must be `outbox.owner` (`ConstraintAddress`). The owner is not otherwise checked, so a program account such as a multisig can be paid. When the delegation program runs it as the post-undelegate action, it appends three more accounts: the destination program, the escrow authority, and the escrow PDA, which signs. The instruction ignores them.
 
-The Outbox is a typed account, so while it is still delegated, and owned by the delegation program on Solana, the instruction fails. Once the Outbox is undelegated, the instruction moves `amount` lamports to the owner and sets `amount` to 0. The Outbox keeps its rent. Anyone may call it again; that call pays 0.
+The Outbox is a typed account, so while it is still delegated, and owned by the delegation program on Solana, the instruction fails. Once the Outbox is undelegated, the instruction moves `amount` lamports to the owner and sets `amount` to 0. The Outbox keeps its rent. Anyone may call it again: with `amount` 0 it returns at once, moves nothing and logs nothing.
 
-Log: `HZ_RELEASE <outbox> <amount>`.
+It runs only on Solana. In the rollup the owner wallet is not delegated, and the rollup rejects any transaction that changes an undelegated account (`InvalidWritableAccount`; `InvalidAccountForFee` when the owner pays the fee). After `withdraw`, the rollup's Outbox belongs to the delegation program, so the typed check fails there too. The local stack confirmed both, and the base action paid exactly once in every case.
+
+Log: `HZ_RELEASE <outbox> <amount>`, only when `amount` is not 0.
 
 ### `init_treasury_outbox`
 
 Solana. Accounts: admin signer writable, config, outbox init `[b"outbox", config]`, system program.
 
-The signer must be `config.admin` (`NotAdmin`). It pays the rent. The treasury Outbox starts with `owner` = admin and `amount` 0. A second call fails because the account exists.
+The signer must be `config.admin` (`NotAdmin`). Like every admin instruction that runs on Solana, it reads Config by hand rather than as a typed account, so it works whether or not Config is delegated. A delegated Config's Solana copy is owned by the delegation program and keeps its data. The account must be owned by this program or by the delegation program (`BadPda`), carry the Config discriminator, and sit at `[b"config"]` with its stored bump (`BadPda`). It pays the rent. The treasury Outbox starts with `owner` = admin and `amount` 0. A second call fails because the account exists.
 
 ### `fund_treasury_outbox`
 
 Rollup. Accounts: admin signer, config writable, treasury outbox writable `[b"outbox", config]`.
 
-The signer must be `config.admin` (`NotAdmin`). An unreleased treasury Outbox fails with `OutboxBusy`, and `config.fees` of 0 fails with `NothingToWithdraw`. The instruction moves all of `config.fees` from Config to the treasury Outbox, sets `outbox.owner` to the admin and `outbox.amount` to the fees, and sets `config.fees` to 0. Config keeps its rent. Send `claim_fees` after it in the same transaction.
+The signer must be `config.admin` (`NotAdmin`). An unreleased treasury Outbox fails with `OutboxBusy`, and `config.fees` of 0 fails with `NothingToWithdraw`. The instruction moves all of `config.fees` from Config to the treasury Outbox, sets `outbox.owner` to the admin and `outbox.amount` to the fees, and sets `config.fees` to 0. Afterwards Config must still hold its rent (`BalanceShort`). Send `claim_fees` after it in the same transaction. If it lands without `claim_fees`, the fees wait in the delegated treasury Outbox until a later `claim_fees`. No instruction moves them back to Config.
 
-Log: `HZ_CLAIM <outbox> <amount>`.
+Log: `HZ_OUTBOX_FUND <outbox> <admin> <amount>`.
 
 ### `claim_fees`
 
 Rollup. Accounts: admin signer writable, config, treasury outbox writable `[b"outbox", config]`, magic context writable, magic program.
 
-`withdraw` for the treasury Outbox. The signer must be `config.admin` and the Outbox's `owner` (`NotAdmin`), and `amount` must not be 0 (`NothingToWithdraw`). The admin pays the intent. The post-undelegate `release_outbox` pays the admin.
+`withdraw` for the treasury Outbox. The signer must be `config.admin` and the Outbox's `owner` (`NotAdmin`), and `amount` must not be 0 (`NothingToWithdraw`). The admin pays the intent. The post-undelegate `release_outbox` pays the admin. Config is not writable: the instruction only reads its admin.
+
+Log: `HZ_CLAIM <outbox> <amount>`, with the amount read from the Outbox.

@@ -70,6 +70,8 @@ Stakes stay on the Players until `settle_match`. The winner of a resolved battle
 
 A player registers once with `register_player`, which creates their Player account and deposits lamports into it, and moves lamports into the budget with `fund_budget`. Behaviors, armies and battles are ephemeral rollup accounts whose rent the Player's free lamports pay. A queued army can `unlock_army`; it holds no stake, so nothing moves. A fighting army cannot. `settle_match` sets both armies back to Idle. An Idle army can be deleted with `close_army`, which returns its rent to the owner's Player.
 
+A player withdraws with `fund_outbox` and `withdraw` in one rollup transaction: the first moves lamports from the Player to the wallet's Outbox, taking free lamports, then winnings, then budget, never locked stakes. The second commits and undelegates the Outbox, and `release_outbox` then pays the wallet on Solana. The admin claims fees the same way with `fund_treasury_outbox` and `claim_fees`. See [Money in and out](matchmaking.md#money-in-and-out).
+
 Behaviors are permissionless. The PDA is `[b"behavior", sha256(canonical body)]`. There is no update and no close.
 
 A behavior is an ordered sequence of at most 4 elements. Each element has at most one movement and at most 3 actions. A movement can stop the rest of that element's steps when an action executes. Movement points for a turn equal the unit's speed. Action points come from the unit's own `actions` stat, not from speed. Every unit of every race has exactly 1: one attack or one cast per turn, and a point left unspent makes it defend.

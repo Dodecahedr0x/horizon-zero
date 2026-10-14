@@ -28,6 +28,10 @@ pub const MAGIC_PROGRAM: Pubkey = Pubkey::new_from_array(ephemeral_rollups_sdk::
 /// Queues the rollup's commits. Unchecked under LiteSVM.
 #[cfg(not(feature = "inline-mock-magic"))]
 pub const MAGIC_CONTEXT: Pubkey = Pubkey::new_from_array(ephemeral_rollups_sdk::consts::MAGIC_CONTEXT_ID.to_bytes());
+/// Owns a delegated account's Solana copy. LiteSVM delegates nothing.
+#[cfg(not(feature = "inline-mock-magic"))]
+pub const DELEGATION_PROGRAM: Pubkey =
+    Pubkey::new_from_array(ephemeral_rollups_sdk::consts::DELEGATION_PROGRAM_ID.to_bytes());
 
 #[cfg(feature = "inline-mock-vrf")]
 fn program_identity_bump() -> u8 {
@@ -365,18 +369,22 @@ pub mod horizon_zero {
     /// follows in the same transaction: the rollup refuses a lamport move and the commit of the
     /// account it credits in one instruction.
     pub fn fund_outbox(ctx: Context<FundOutbox>, amount: u64) -> Result<()> {
-        require!(ctx.accounts.outbox.amount == 0, HorizonError::OutboxBusy);
-        require!(amount > 0, HorizonError::NothingToWithdraw);
+        let info = ctx.accounts.player.to_account_info();
         let free = free_lamports(&ctx.accounts.player)?;
         let player = &mut ctx.accounts.player;
         let rest = amount.saturating_sub(free);
         let from_winnings = rest.min(player.winnings);
         player.winnings -= from_winnings;
         player.budget = player.budget.checked_sub(rest - from_winnings).ok_or(HorizonError::BalanceShort)?;
-        move_lamports(&player.to_account_info(), &ctx.accounts.outbox.to_account_info(), amount)?;
-        ctx.accounts.outbox.amount = amount;
-        log_player(&player.key(), player);
-        msg!("HZ_WITHDRAW {} {}", ctx.accounts.outbox.key(), amount);
+        // What the Player must still hold afterwards: its rent and every counter.
+        let keep = Rent::get()?
+            .minimum_balance(info.data_len())
+            .checked_add(player.budget)
+            .and_then(|sum| sum.checked_add(player.winnings))
+            .and_then(|sum| sum.checked_add(player.locked))
+            .ok_or(HorizonError::BalanceShort)?;
+        fill_outbox(&info, keep, &mut ctx.accounts.outbox, ctx.accounts.owner.key(), amount)?;
+        log_player(&info.key(), &ctx.accounts.player);
         Ok(())
     }
 
@@ -386,11 +394,14 @@ pub mod horizon_zero {
         let outbox = ctx.accounts.outbox.to_account_info();
         let state = read_funded_outbox(&outbox)?;
         require_keys_eq!(state.owner, ctx.accounts.owner.key(), HorizonError::NotOwner);
+        msg!("HZ_WITHDRAW {} {}", outbox.key(), state.amount);
         schedule_release(&ctx.accounts.owner.to_account_info(), &outbox, state.owner, &ctx.accounts.magic)
     }
 
     /// Solana, admin only: creates the treasury Outbox `[b"outbox", config]`, which pays the admin.
     pub fn init_treasury_outbox(ctx: Context<InitTreasuryOutbox>) -> Result<()> {
+        let admin = config_admin(&ctx.accounts.config)?;
+        require_keys_eq!(admin, ctx.accounts.admin.key(), HorizonError::NotAdmin);
         ctx.accounts.outbox.owner = ctx.accounts.admin.key();
         ctx.accounts.outbox.amount = 0;
         ctx.accounts.outbox.bump = ctx.bumps.outbox;
@@ -400,15 +411,12 @@ pub mod horizon_zero {
     /// Rollup, admin only: moves all claimable fees from Config to the treasury Outbox, payable to
     /// the admin. `claim_fees` follows in the same transaction.
     pub fn fund_treasury_outbox(ctx: Context<FundTreasuryOutbox>) -> Result<()> {
-        require!(ctx.accounts.outbox.amount == 0, HorizonError::OutboxBusy);
+        let info = ctx.accounts.config.to_account_info();
         let fees = ctx.accounts.config.fees;
-        require!(fees > 0, HorizonError::NothingToWithdraw);
-        move_lamports(&ctx.accounts.config.to_account_info(), &ctx.accounts.outbox.to_account_info(), fees)?;
         ctx.accounts.config.fees = 0;
-        ctx.accounts.outbox.owner = ctx.accounts.admin.key();
-        ctx.accounts.outbox.amount = fees;
-        msg!("HZ_CLAIM {} {}", ctx.accounts.outbox.key(), fees);
-        Ok(())
+        // Config keeps its rent; the fees were the rest.
+        let keep = Rent::get()?.minimum_balance(info.data_len());
+        fill_outbox(&info, keep, &mut ctx.accounts.outbox, ctx.accounts.admin.key(), fees)
     }
 
     /// Rollup, admin only: as `withdraw`, for the funded treasury Outbox.
@@ -416,18 +424,57 @@ pub mod horizon_zero {
         let outbox = ctx.accounts.outbox.to_account_info();
         let state = read_funded_outbox(&outbox)?;
         require_keys_eq!(state.owner, ctx.accounts.admin.key(), HorizonError::NotAdmin);
+        msg!("HZ_CLAIM {} {}", outbox.key(), state.amount);
         schedule_release(&ctx.accounts.admin.to_account_info(), &outbox, state.owner, &ctx.accounts.magic)
     }
 
     /// Solana, permissionless: pays an undelegated Outbox's `amount` to its recorded owner and
-    /// zeroes it. The post-undelegate action calls it; anyone may call it again, which pays 0.
+    /// zeroes it. The post-undelegate action calls it; anyone may call it again, which does nothing.
+    /// It only works on Solana: in the rollup the owner wallet is not delegated, so the rollup refuses
+    /// the credit, and once `withdraw` has run the Outbox belongs to the delegation program.
     pub fn release_outbox(ctx: Context<ReleaseOutbox>) -> Result<()> {
         let amount = ctx.accounts.outbox.amount;
+        if amount == 0 {
+            return Ok(());
+        }
         ctx.accounts.outbox.amount = 0;
         move_lamports(&ctx.accounts.outbox.to_account_info(), &ctx.accounts.owner.to_account_info(), amount)?;
         msg!("HZ_RELEASE {} {}", ctx.accounts.outbox.key(), amount);
         Ok(())
     }
+}
+
+/// The shared step of `fund_outbox` and `fund_treasury_outbox`: moves `amount` from `source` to an
+/// idle Outbox, which then pays `owner`. `source` must still hold `keep` lamports afterwards.
+fn fill_outbox(
+    source: &AccountInfo,
+    keep: u64,
+    outbox: &mut Account<Outbox>,
+    owner: Pubkey,
+    amount: u64,
+) -> Result<()> {
+    require!(outbox.amount == 0, HorizonError::OutboxBusy);
+    require!(amount > 0, HorizonError::NothingToWithdraw);
+    move_lamports(source, &outbox.to_account_info(), amount)?;
+    require!(source.lamports() >= keep, HorizonError::BalanceShort);
+    outbox.owner = owner;
+    outbox.amount = amount;
+    msg!("HZ_OUTBOX_FUND {} {} {}", outbox.key(), owner, amount);
+    Ok(())
+}
+
+/// Config's admin, read by hand for the instructions that run on Solana. Once Config is delegated,
+/// its Solana copy is owned by the delegation program, and a typed `Account<Config>` would refuse
+/// it; the data stays the same. The address must be the `[b"config"]` PDA.
+fn config_admin(info: &AccountInfo) -> Result<Pubkey> {
+    #[cfg(not(feature = "inline-mock-magic"))]
+    let owned = *info.owner == ID || *info.owner == DELEGATION_PROGRAM;
+    #[cfg(feature = "inline-mock-magic")]
+    let owned = *info.owner == ID;
+    require!(owned, HorizonError::BadPda);
+    let config = Config::try_deserialize(&mut &info.try_borrow_data()?[..])?;
+    verify_pda(&[b"config"], &info.key(), config.bump)?;
+    Ok(config.admin)
 }
 
 /// An Outbox read by hand, for the instructions that schedule its undelegation: a typed account
@@ -1217,10 +1264,11 @@ pub struct Withdraw<'info> {
 
 #[derive(Accounts)]
 pub struct InitTreasuryOutbox<'info> {
+    /// Must be Config's admin, checked in the handler.
     #[account(mut)]
     pub admin: Signer<'info>,
-    #[account(seeds = [b"config"], bump = config.bump, has_one = admin @ HorizonError::NotAdmin)]
-    pub config: Account<'info, Config>,
+    /// CHECK: read by hand (see `config_admin`), so it works whether or not Config is delegated
+    pub config: UncheckedAccount<'info>,
     #[account(init, payer = admin, space = 8 + Outbox::INIT_SPACE, seeds = [b"outbox", config.key().as_ref()], bump)]
     pub outbox: Account<'info, Outbox>,
     pub system_program: Program<'info, System>,
@@ -1256,8 +1304,10 @@ pub struct ReleaseOutbox<'info> {
     /// Typed, so an Outbox still delegated (owned by the delegation program) is refused.
     #[account(mut)]
     pub outbox: Account<'info, Outbox>,
+    /// CHECK: only receives lamports; it must be the owner the Outbox records, which may be a
+    /// program account such as a multisig
     #[account(mut, address = outbox.owner)]
-    pub owner: SystemAccount<'info>,
+    pub owner: UncheckedAccount<'info>,
 }
 
 /// Compute left in this transaction (profiling builds only).
