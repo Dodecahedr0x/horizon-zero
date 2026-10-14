@@ -4,48 +4,61 @@
 
 `indexer/` is a Rust service, crate `horizon-indexer`. It uses [Carbon](https://github.com/sevenlabs-hq/carbon) 2.0 (`carbon-core`, `carbon-log-metrics`) and SQLite (`rusqlite`). The old Node process `indexer/server.js` is gone. This is the only indexer.
 
-Carbon's RPC block subscription emits transactions and block details, not account updates, so the pipeline does not use it and does not use a Geyser plugin. Two RPC datasources feed one account pipe:
+`SOLANA_RPC_URL` is the MagicBlock ephemeral rollup's RPC, not the base layer. Armies, Behaviors and Battles are ephemeral accounts that exist only in the rollup, and Battlegrounds and Players are delegated to it, so the rollup is the one place that has every account the indexer stores. Locally that is `http://127.0.0.1:7799`.
+
+Carbon's RPC block subscription emits transactions and block details, not account updates, so the pipeline does not use it and does not use a Geyser plugin. Two RPC datasources feed one account pipe, and a third reads the program's logs:
 
 ```mermaid
 flowchart LR
-  Http["SOLANA_RPC_URL"]
-  Ws["websocket programSubscribe"]
+  Http["SOLANA_RPC_URL (rollup)"]
+  Ws["rollup websocket"]
   Gpa["getProgramAccounts"]
   Sub["programSubscribe"]
+  Logs["logsSubscribe mentions program"]
   Pipe["Carbon pipeline"]
   Dec["HorizonDecoder"]
+  Res["HZ_MATCH_RESOLVED"]
   Db["sqlite"]
   Api["HTTP"]
   Http --> Gpa --> Pipe
   Ws --> Sub --> Pipe
+  Ws --> Logs --> Res --> Db
   Pipe --> Dec --> Db --> Api
 ```
 
-`getProgramAccounts` sends each account once the RPC returns a snapshot that includes a slot. `programSubscribe` then streams account updates for the program. A refused dial on either source is logged with the URL and tried again every 3 seconds until the indexer shuts down. The pipeline stays up, and the HTTP server keeps serving the database. A websocket that closes after it had connected is dialed again the same way. `HorizonDecoder` implements Carbon's `AccountDecoder` and accepts an account only when the Anchor discriminator `SHA-256("account:<Name>")[..8]` and the length both match the layouts in [Accounts and instructions](accounts.md). Config and pots are ignored; the client reads a pot straight from the RPC. `HZ_` logs are not read.
+`getProgramAccounts` sends each account once the RPC returns a snapshot that includes a slot. `programSubscribe` then streams account updates for the program. `logsSubscribe` with `mentions: [program id]` streams the logs of each transaction that names the program. A refused dial on any of the three is logged with the URL and tried again every 3 seconds until the indexer shuts down. The pipeline stays up, and the HTTP server keeps serving the database. A websocket that closes after it had connected is dialed again the same way. `HorizonDecoder` implements Carbon's `AccountDecoder` and accepts an account only when the Anchor discriminator `SHA-256("account:<Name>")[..8]` and the length both match the layouts in [Accounts and instructions](accounts.md): Behavior, Battleground, Army, and Battle (2147 bytes, including `fee_bps`). Config, Player and Outbox are ignored, as is anything else; the client reads Players straight from the rollup. An army's status change, including an eviction, arrives as an account update, so `HZ_EVICT` is not read.
+
+Carbon has no update type for bare logs, so the logs source is not a Carbon datasource. It skips a failed transaction and hands the logs of each successful one to a task that reads `HZ_MATCH_RESOLVED <battle> <outcome> <fee> <seed hex> <player_b>`. A line counts only while the indexed program is the innermost program invoked, so another program in the same transaction cannot log a resolution for it. A line with the wrong word count, an outcome outside 1 to 3, a fee that is not a `u64`, a seed that is not 64 hex digits, or a bad pubkey is dropped. `settle_match` closes the battle, so this log is the only record of its outcome and fee. Every other `HZ_` log is not read.
+
+A resolution is stored in its own table, then applied to the battle's row: status `1` (Resolved), the outcome, and the fee. When the row is stored or updated later, the stored resolution is applied again. So a log that arrives before the battle's row, and a stale Seeded snapshot that arrives after the log, both end on Resolved. A resolution with no row yet does not appear in `/matches` until the row does.
+
+The logs subscription has no history. A battle settled while the indexer was down, or before it first connected, keeps the last state its account showed, usually Seeded (`2`), because the closed account never arrives again and the log is gone. When the game's Solana adapter sends `settle_match` itself, it reads the outcome from that transaction's log and does not need the row.
+
+Whether the MagicBlock rollup RPC serves `getProgramAccounts`, `programSubscribe`, `logsSubscribe`, `getMultipleAccounts` and `getBlockTime` for ephemeral accounts is not confirmed yet; the local stack's end-to-end check (`pnpm localnet --check`) is where it gets checked. Until then the indexer assumes it does.
 
 `close_army` hands the army account back to the System Program, and `programSubscribe` only reports accounts the program still owns, so a closed army never arrives as an update. Every 30 seconds the indexer reads its stored army keys with `getMultipleAccounts`, 100 at a time, and deletes the rows whose account is gone, empty, or no longer owned by the program. A failed RPC call skips that round. Until the next prune `/armies` can still list a closed army; the game's Solana adapter checks the accounts itself and hides it.
 
-The websocket URL is derived from `SOLANA_RPC_URL`. `http` becomes `ws`, `https` becomes `wss`, and an explicit port is incremented by one, so `http://127.0.0.1:8899` uses the local validator's pubsub port `8900`. A URL that is already `ws` or `wss`, or that omits the port, is not shifted.
+The websocket URL is derived from `SOLANA_RPC_URL`. `http` becomes `ws`, `https` becomes `wss`, and an explicit port is incremented by one, so the local rollup `http://127.0.0.1:7799` uses its websocket port `7800`. A URL that is already `ws` or `wss`, or that omits the port, is not shifted.
 
-Each account update carries a slot. The processor calls `getBlockTime` for that slot and stores the unix seconds. A slot Carbon or RPC cannot time is stored as null. Times are not invented. UTC days (`YYYY-MM-DD`) are indexed for range queries.
+Each account update and each logs notification carries a slot. The indexer calls `getBlockTime` for that slot and stores the unix seconds. A slot Carbon or RPC cannot time is stored as null. Times are not invented. UTC days (`YYYY-MM-DD`) are indexed for range queries.
 
 | env | default |
 | --- | --- |
 | `PROGRAM_ID` | `Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c` |
-| `SOLANA_RPC_URL` | `http://127.0.0.1:8899` |
+| `SOLANA_RPC_URL` | `http://127.0.0.1:7799`, the local rollup. Set it to the ephemeral rollup's RPC, not the base layer |
 | `INDEXER_PORT` | `4714`. Preferred local listen port. `pnpm indexer` and `pnpm dev:chain` pass it to this process only. |
 | `PORT` | unset locally. Render injects this on the indexer service. Used when `INDEXER_PORT` is unset. |
 | `DATABASE_PATH` | `indexer/data/horizon.db`, resolved from the repo root |
 
 Local runs read the repo-root `.env` and do not override variables already set in the process. `pnpm indexer` and `pnpm dev:chain` pass `INDEXER_PORT` to this process only, then build the debug binary with Cargo (cached under `indexer/target/`) and run it. They do not set `PORT`. The binary listens on `INDEXER_PORT`, then `PORT`, then `4714`. The binary needs rustc 1.96.1 or newer, which is Carbon 2.0's minimum. Ctrl+C in `dev:chain` kills the process group, including this binary.
 
-An older Node database, one whose `behaviors` table has no `element_count` column, is dropped and recreated on startup.
+An older Node database, one whose `behaviors` table has no `element_count` column, is dropped and recreated on startup. A `matches` table without the `fee` or `fee_bps` column gains it with `ALTER TABLE matches ADD COLUMN`; its rows keep a null fee.
 
 ### What is stored
 
 Behaviors: pubkey, creator, canonical body, element count, and a compact summary (`1 element: March`, or the same words the client uses for a custom sequence). `created_at` is the earliest block time seen. `updated_at` is the latest. Behaviors are not updated on chain, so the two match unless a later observation has a different slot time.
 
-Battles (the program's Battle accounts, served as matches): pubkey, battleground, both army pubkeys, both player pubkeys, stake (decimal string), seq, grid, unit snapshots, status, seed (hex), outcome. `open_at` is the block time of the first observation while status is Awaiting (`0`). `resolved_at` is the block time of the first observation while status is Resolved (`1`). A Seeded battle (`2`, seed stored, waiting for `settle_match`) sets neither time. A battle first seen already resolved has a null open time.
+Battles (the program's Battle accounts, served as matches): pubkey, battleground, both army pubkeys, both player pubkeys, stake (decimal string), seq, grid, unit snapshots, status, seed (hex), outcome, `fee_bps` (Config's rate when the battle opened), and `fee`. The account only ever shows Awaiting (`0`) or Seeded (`2`) with outcome `0`. Status Resolved (`1`), the outcome, and `fee` (lamports the protocol took, a decimal string, `"0"` on a draw) come from `HZ_MATCH_RESOLVED`; `fee` is null until then. `open_at` is the block time of the first observation while status is Awaiting. `resolved_at` is the block time of the slot of the first `HZ_MATCH_RESOLVED` for that battle. A Seeded battle sets neither time. A battle first seen already seeded has a null open time. A settled battle's account is closed, but its row is never deleted: only armies are pruned.
 
 Users: every distinct wallet that creates a behavior, owns an army, or is a player on a battle. `first_seen` and `last_seen` are the earliest and latest block times of those observations. Counts are derived from the behavior, army, and battle rows.
 
@@ -72,7 +85,7 @@ The server listens on `0.0.0.0`. Dates are UTC `YYYY-MM-DD`. `date` is that sing
 
 A behavior or battle with a null time does not match a date filter. A user matches a day when that UTC day is between `first_date` and `last_date` inclusive. Anything else is 404.
 
-Stakes are decimal strings. Unit lists, behavior bodies, and the battleground queue are JSON arrays. The game reads `body`, `queue`, `units`, `unitsA`, `unitsB`, `armyA`, `armyB`, `playerA`, `playerB`, `battlegroundId`, `matchSeq`, and `idx`.
+Stakes and fees are decimal strings. Unit lists, behavior bodies, and the battleground queue are JSON arrays. The game reads `body`, `queue`, `units`, `unitsA`, `unitsB`, `armyA`, `armyB`, `playerA`, `playerB`, `battlegroundId`, `matchSeq`, and `idx`. Match rows also carry `fee` and `feeBps`.
 
 ## App server
 

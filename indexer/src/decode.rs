@@ -12,7 +12,7 @@ pub const PROGRAM_ID: &str = "Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c";
 pub(crate) const BEHAVIOR_LEN: usize = 119;
 pub(crate) const BATTLEGROUND_LEN: usize = 576;
 pub(crate) const ARMY_LEN: usize = 1360;
-pub(crate) const BATTLE_LEN: usize = 2145;
+pub(crate) const BATTLE_LEN: usize = 2147;
 const BODY_CAP: usize = 77;
 const ARMY_UNIT: usize = 128;
 const BATTLE_UNIT: usize = 96;
@@ -25,6 +25,7 @@ const BATTLE_UNITS_A: usize = 188;
 const BATTLE_UNITS_B: usize = BATTLE_UNITS_A + BATTLE_UNIT * MAX_UNITS;
 pub(crate) const BATTLE_STATUS: usize = BATTLE_UNITS_B + BATTLE_UNIT * MAX_UNITS;
 pub(crate) const BATTLE_OUTCOME: usize = BATTLE_STATUS + 1 + 32;
+const BATTLE_FEE_BPS: usize = BATTLE_OUTCOME + 3;
 
 const MOVE_KINDS: [&str; 4] = ["Approach", "Flee", "Flank left", "Flank right"];
 const EXTREMA: [&str; 2] = ["Lowest", "Highest"];
@@ -136,6 +137,7 @@ pub struct BattleAccount {
     pub outcome: u8,
     pub race_a: u8,
     pub race_b: u8,
+    pub fee_bps: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,6 +186,57 @@ pub fn decode_account_data(data: &[u8]) -> Option<HorizonAccount> {
         return decode_battle(data).map(HorizonAccount::Battle);
     }
     None
+}
+
+/// `HZ_MATCH_RESOLVED <battle> <outcome> <fee> <seed hex> <player_b>`, logged by `settle_match` as it
+/// closes the battle: the battle, its outcome (1 A, 2 B, 3 draw) and the fee in lamports.
+pub fn parse_resolved(line: &str) -> Option<(String, u8, u64)> {
+    let mut words = line.split(' ');
+    if words.next()? != "HZ_MATCH_RESOLVED" {
+        return None;
+    }
+    let battle = words.next()?.parse::<Pubkey>().ok()?;
+    let outcome = words.next()?.parse::<u8>().ok().filter(|outcome| (1..=3).contains(outcome))?;
+    let fee = words.next()?.parse::<u64>().ok()?;
+    let seed = words.next()?;
+    if seed.len() != 64 || !seed.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    words.next()?.parse::<Pubkey>().ok()?;
+    if words.next().is_some() {
+        return None;
+    }
+    Some((battle.to_string(), outcome, fee))
+}
+
+/// The resolutions in one transaction's logs. A line counts only while `program` is the innermost
+/// program invoked, so another program in the same transaction cannot log a resolution for it.
+pub fn resolutions(logs: &[String], program: &str) -> Vec<(String, u8, u64)> {
+    let mut stack: Vec<&str> = Vec::new();
+    let mut found = Vec::new();
+    for line in logs {
+        if let Some(text) = line.strip_prefix("Program log: ") {
+            if stack.last() == Some(&program) {
+                found.extend(parse_resolved(text));
+            }
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("Program ") else {
+            continue;
+        };
+        let mut words = rest.split(' ');
+        let (Some(id), Some(event)) = (words.next(), words.next()) else {
+            continue;
+        };
+        match event {
+            "invoke" => stack.push(id),
+            "success" | "failed:" if stack.last() == Some(&id) => {
+                stack.pop();
+            }
+            _ => {}
+        }
+    }
+    found
 }
 
 /// Wallets this account contributes to the user index.
@@ -329,6 +382,7 @@ fn decode_battle(data: &[u8]) -> Option<BattleAccount> {
         outcome: data[BATTLE_OUTCOME],
         race_a: data[BATTLE_OUTCOME + 1],
         race_b: data[BATTLE_OUTCOME + 2],
+        fee_bps: read_u16(data, BATTLE_FEE_BPS),
     })
 }
 
@@ -699,6 +753,82 @@ mod tests {
 
         assert!(decode_account_data(&fixture("Config", 41)).is_none());
         assert!(decode_account_data(&fixture("Behavior", 10)).is_none());
+    }
+
+    #[test]
+    fn battle_carries_its_fee_rate() {
+        let mut battle = fixture("Battle", 2147);
+        battle[2144..2146].copy_from_slice(&500u16.to_le_bytes());
+        battle[2146] = 254;
+        let HorizonAccount::Battle(battle) = decode_account_data(&battle).expect("battle") else {
+            panic!("expected battle");
+        };
+        assert_eq!(battle.fee_bps, 500);
+        assert_eq!(battle.status, 0);
+        // The layout before fee_bps no longer matches.
+        assert!(decode_account_data(&fixture("Battle", 2145)).is_none());
+    }
+
+    #[test]
+    fn players_config_outbox_and_old_pots_are_ignored() {
+        // Player 68, Config 83, Outbox 49; a Pot was 8 + owner 32, battleground 32, budget 8, winnings 8,
+        // segregate 1, fighting 2, bump 1 = 92.
+        for (name, len) in [("Player", 68), ("Config", 83), ("Outbox", 49), ("Pot", 92)] {
+            assert!(decode_account_data(&fixture(name, len)).is_none(), "{name} {len}");
+        }
+        // A Player-sized account under another discriminator is not read as anything either.
+        assert!(decode_account_data(&fixture("Army", 68)).is_none());
+    }
+
+    #[test]
+    fn resolved_log_gives_battle_outcome_and_fee() {
+        let battle = pubkey(5).to_string();
+        let player_b = pubkey(6).to_string();
+        let seed = "ab".repeat(32);
+        let line = format!("HZ_MATCH_RESOLVED {battle} 1 1000000 {seed} {player_b}");
+        assert_eq!(parse_resolved(&line), Some((battle.clone(), 1, 1_000_000)));
+        assert_eq!(parse_resolved(&format!("HZ_MATCH_RESOLVED {battle} 3 0 {seed} {player_b}")), Some((battle.clone(), 3, 0)));
+
+        for bad in [
+            String::new(),
+            format!("HZ_MATCH_SEEDED {battle} {seed}"),
+            format!("HZ_MATCH_RESOLVED {battle} 1 1000000 {seed}"),
+            format!("HZ_MATCH_RESOLVED {battle} 1 1000000 {seed} {player_b} extra"),
+            format!("HZ_MATCH_RESOLVED nope 1 1000000 {seed} {player_b}"),
+            format!("HZ_MATCH_RESOLVED {battle} 0 1000000 {seed} {player_b}"),
+            format!("HZ_MATCH_RESOLVED {battle} 4 1000000 {seed} {player_b}"),
+            format!("HZ_MATCH_RESOLVED {battle} 1 -5 {seed} {player_b}"),
+            format!("HZ_MATCH_RESOLVED {battle} 1 18446744073709551616 {seed} {player_b}"),
+            format!("HZ_MATCH_RESOLVED {battle} 1 1000000 abcd {player_b}"),
+            format!("HZ_MATCH_RESOLVED {battle} 1 1000000 {} {player_b}", "zz".repeat(32)),
+            format!("HZ_MATCH_RESOLVED {battle} 1 1000000 {seed} nope"),
+        ] {
+            assert_eq!(parse_resolved(&bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_the_program_s_own_log_lines_count() {
+        let program = PROGRAM_ID;
+        let other = pubkey(9).to_string();
+        let battle = pubkey(5).to_string();
+        let forged = pubkey(7).to_string();
+        let seed = "00".repeat(32);
+        let player_b = pubkey(6).to_string();
+        let logs: Vec<String> = vec![
+            format!("Program {program} invoke [1]"),
+            format!("Program {other} invoke [2]"),
+            format!("Program log: HZ_MATCH_RESOLVED {forged} 2 9 {seed} {player_b}"),
+            format!("Program {other} success"),
+            format!("Program log: HZ_PLAYER {player_b}"),
+            format!("Program log: HZ_MATCH_RESOLVED {battle} 2 750000 {seed} {player_b}"),
+            format!("Program {program} consumed 1000 of 200000 compute units"),
+            format!("Program {program} success"),
+            format!("Program {other} invoke [1]"),
+            format!("Program log: HZ_MATCH_RESOLVED {forged} 1 1 {seed} {player_b}"),
+            format!("Program {other} failed: custom program error: 0x1"),
+        ];
+        assert_eq!(resolutions(&logs, program), vec![(battle, 2, 750_000)]);
     }
 
     #[test]

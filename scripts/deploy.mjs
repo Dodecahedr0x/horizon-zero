@@ -87,5 +87,5 @@ process.stdout.write(`
   VITE_DEV_MODE=false
   VITE_RPC_URL=${url}
   VITE_ORACLE_QUEUE=${ORACLE_QUEUE}
-and point the indexer at it with SOLANA_RPC_URL=${url}
+and point the indexer at the ephemeral rollup that serves this cluster (not ${url}) with SOLANA_RPC_URL=<rollup RPC>
 `);

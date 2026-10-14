@@ -70,10 +70,19 @@ CREATE TABLE IF NOT EXISTS matches (
     open_at INTEGER,
     resolved_at INTEGER,
     open_date TEXT,
-    resolved_date TEXT
+    resolved_date TEXT,
+    fee TEXT,
+    fee_bps INTEGER
 );
 CREATE INDEX IF NOT EXISTS matches_open_date ON matches(open_date);
 CREATE INDEX IF NOT EXISTS matches_resolved_date ON matches(resolved_date);
+
+CREATE TABLE IF NOT EXISTS resolutions (
+    pubkey TEXT PRIMARY KEY,
+    outcome INTEGER NOT NULL,
+    fee TEXT NOT NULL,
+    resolved_at INTEGER
+);
 
 CREATE TABLE IF NOT EXISTS users (
     wallet TEXT PRIMARY KEY,
@@ -228,6 +237,10 @@ pub struct BattleOut {
     pub resolved_at: Option<i64>,
     pub open_date: Option<String>,
     pub resolved_date: Option<String>,
+    /// Lamports the protocol took, a decimal string. Null until the battle settles; a draw is `"0"`.
+    pub fee: Option<String>,
+    /// Config's fee rate when the battle opened. Null on a row stored before the column existed.
+    pub fee_bps: Option<u16>,
 }
 
 #[derive(Debug, Serialize)]
@@ -274,6 +287,12 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
              DROP TABLE IF EXISTS matches;
              DROP TABLE IF EXISTS users;",
         )?;
+    }
+    let matches = table_columns(conn, "matches")?;
+    for (column, kind) in [("fee", "TEXT"), ("fee_bps", "INTEGER")] {
+        if !matches.is_empty() && !matches.iter().any(|name| name == column) {
+            conn.execute_batch(&format!("ALTER TABLE matches ADD COLUMN {column} {kind};"))?;
+        }
     }
     conn.execute_batch(SCHEMA)
 }
@@ -438,8 +457,8 @@ fn record_battle(
         "INSERT INTO matches (
             pubkey, battleground, army_a, army_b, player_a, player_b, stake, seq,
             cols, rows, units_a, units_b, status, seed, outcome,
-            open_at, resolved_at, open_date, resolved_date
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+            open_at, resolved_at, open_date, resolved_date, fee_bps
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
          ON CONFLICT(pubkey) DO UPDATE SET
             battleground = excluded.battleground,
             army_a = excluded.army_a,
@@ -458,7 +477,8 @@ fn record_battle(
             open_at = excluded.open_at,
             resolved_at = excluded.resolved_at,
             open_date = excluded.open_date,
-            resolved_date = excluded.resolved_date",
+            resolved_date = excluded.resolved_date,
+            fee_bps = excluded.fee_bps",
         params![
             pubkey,
             battle.battleground,
@@ -479,7 +499,45 @@ fn record_battle(
             resolved_at,
             open_at.and_then(utc_day),
             resolved_at.and_then(utc_day),
+            battle.fee_bps,
         ],
+    )?;
+    apply_resolution(conn, pubkey)
+}
+
+/// Records `HZ_MATCH_RESOLVED`. `settle_match` closes the battle, so the log is the only place the
+/// outcome and fee appear. The resolution is kept on its own, so a log that arrives before the
+/// battle's row, or a stale account update that arrives after the log, still ends on Resolved.
+pub fn resolve(conn: &Connection, pubkey: &str, outcome: u8, fee: u64, unix: Option<i64>) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO resolutions (pubkey, outcome, fee, resolved_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(pubkey) DO UPDATE SET
+            outcome = excluded.outcome,
+            fee = excluded.fee,
+            resolved_at = COALESCE(resolutions.resolved_at, excluded.resolved_at)",
+        params![pubkey, outcome, fee.to_string(), unix],
+    )?;
+    apply_resolution(conn, pubkey)
+}
+
+fn apply_resolution(conn: &Connection, pubkey: &str) -> rusqlite::Result<()> {
+    let resolution = conn
+        .query_row("SELECT outcome, fee, resolved_at FROM resolutions WHERE pubkey = ?1", [pubkey], |row| {
+            Ok((row.get::<_, u8>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<i64>>(2)?))
+        })
+        .optional()?;
+    let Some((outcome, fee, resolved_at)) = resolution else {
+        return Ok(());
+    };
+    conn.execute(
+        "UPDATE matches SET
+            status = 1,
+            outcome = ?2,
+            fee = ?3,
+            resolved_at = COALESCE(resolved_at, ?4),
+            resolved_date = COALESCE(resolved_date, ?5)
+         WHERE pubkey = ?1",
+        params![pubkey, outcome, fee, resolved_at, resolved_at.and_then(utc_day)],
     )?;
     Ok(())
 }
@@ -735,7 +793,7 @@ pub fn battles(conn: &Connection, range: &DayRange) -> rusqlite::Result<Vec<Batt
     let sql = format!(
         "SELECT pubkey, battleground, army_a, army_b, player_a, player_b, stake, seq,
                 cols, rows, units_a, units_b, status, seed, outcome,
-                open_at, resolved_at, open_date, resolved_date
+                open_at, resolved_at, open_date, resolved_date, fee, fee_bps
          FROM matches{filter} ORDER BY seq DESC, pubkey"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -747,7 +805,7 @@ pub fn battle(conn: &Connection, pubkey: &str) -> rusqlite::Result<Option<Battle
     conn.query_row(
         "SELECT pubkey, battleground, army_a, army_b, player_a, player_b, stake, seq,
                 cols, rows, units_a, units_b, status, seed, outcome,
-                open_at, resolved_at, open_date, resolved_date
+                open_at, resolved_at, open_date, resolved_date, fee, fee_bps
          FROM matches WHERE pubkey = ?1",
         [pubkey],
         battle_row,
@@ -778,6 +836,8 @@ fn battle_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BattleOut> {
         resolved_at: row.get(16)?,
         open_date: row.get(17)?,
         resolved_date: row.get(18)?,
+        fee: row.get(19)?,
+        fee_bps: row.get(20)?,
     })
 }
 
@@ -1066,6 +1126,97 @@ mod tests {
         cleanup(&path);
     }
 
+    fn seeded_battle(fee_bps: u16) -> HorizonAccount {
+        let mut battle = fixture("Battle", BATTLE_LEN);
+        battle[104..136].copy_from_slice(pubkey(3).as_ref());
+        battle[136..168].copy_from_slice(pubkey(4).as_ref());
+        battle[168..176].copy_from_slice(&50u64.to_le_bytes());
+        battle[BATTLE_STATUS] = 2;
+        battle[BATTLE_OUTCOME + 3..BATTLE_OUTCOME + 5].copy_from_slice(&fee_bps.to_le_bytes());
+        decode_account_data(&battle).expect("seeded")
+    }
+
+    #[test]
+    fn resolved_log_settles_the_seeded_row_and_a_stale_update_does_not_undo_it() {
+        let (conn, path) = temp_db();
+        record(&conn, "battle-1", &seeded_battle(500), Some(noon("2026-10-05"))).expect("seeded");
+        let row = battle(&conn, "battle-1").expect("read").expect("row");
+        assert_eq!((row.status, row.outcome, row.fee.as_deref(), row.fee_bps), (2, 0, None, Some(500)));
+
+        resolve(&conn, "battle-1", 1, 1_000_000, Some(noon("2026-10-06"))).expect("resolve");
+        let row = battle(&conn, "battle-1").expect("read").expect("row");
+        assert_eq!((row.status, row.outcome, row.fee.as_deref()), (1, 1, Some("1000000")));
+        assert_eq!(row.resolved_at, Some(noon("2026-10-06")));
+        assert_eq!(row.resolved_date.as_deref(), Some("2026-10-06"));
+
+        // A snapshot read before the settlement can still land after the log.
+        record(&conn, "battle-1", &seeded_battle(500), Some(noon("2026-10-05"))).expect("stale");
+        let row = battle(&conn, "battle-1").expect("read").expect("row");
+        assert_eq!((row.status, row.outcome, row.fee.as_deref()), (1, 1, Some("1000000")));
+        assert_eq!(row.resolved_date.as_deref(), Some("2026-10-06"));
+
+        let json = serde_json::to_value(&battles(&conn, &DayRange::default()).expect("all")[0]).expect("json");
+        assert_eq!(json["fee"], "1000000");
+        assert_eq!(json["feeBps"], 500);
+        assert_eq!(json["status"], 1);
+        assert_eq!(stats(&conn, noon("2026-10-06")).expect("stats").battles_fought, 1);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_resolution_seen_before_its_battle_is_applied_when_the_battle_arrives() {
+        let (conn, path) = temp_db();
+        resolve(&conn, "battle-2", 3, 0, Some(noon("2026-10-06"))).expect("resolve");
+        assert!(battle(&conn, "battle-2").expect("read").is_none());
+        assert!(battles(&conn, &DayRange::default()).expect("all").is_empty());
+
+        record(&conn, "battle-2", &seeded_battle(250), Some(noon("2026-10-05"))).expect("seeded");
+        let row = battle(&conn, "battle-2").expect("read").expect("row");
+        assert_eq!((row.status, row.outcome, row.fee.as_deref(), row.fee_bps), (1, 3, Some("0"), Some(250)));
+        assert_eq!(row.resolved_at, Some(noon("2026-10-06")));
+        // A repeated log keeps the first resolution time.
+        resolve(&conn, "battle-2", 3, 0, Some(noon("2026-10-07"))).expect("again");
+        assert_eq!(battle(&conn, "battle-2").expect("read").expect("row").resolved_at, Some(noon("2026-10-06")));
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn an_older_matches_table_gains_the_fee_columns() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir()
+            .join(format!("horizon-indexer-old-{}-{}.db", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        {
+            let old = Connection::open(&path).expect("old");
+            old.execute_batch(
+                "CREATE TABLE behaviors (pubkey TEXT PRIMARY KEY, creator TEXT NOT NULL, body_json TEXT NOT NULL,
+                     element_count INTEGER NOT NULL, summary TEXT NOT NULL, created_at INTEGER, updated_at INTEGER,
+                     created_date TEXT, updated_date TEXT);
+                 CREATE TABLE matches (pubkey TEXT PRIMARY KEY, battleground TEXT NOT NULL, army_a TEXT NOT NULL,
+                     army_b TEXT NOT NULL, player_a TEXT NOT NULL, player_b TEXT NOT NULL, stake TEXT NOT NULL,
+                     seq INTEGER NOT NULL, cols INTEGER NOT NULL, rows INTEGER NOT NULL, units_a TEXT NOT NULL,
+                     units_b TEXT NOT NULL, status INTEGER NOT NULL, seed TEXT NOT NULL, outcome INTEGER NOT NULL,
+                     open_at INTEGER, resolved_at INTEGER, open_date TEXT, resolved_date TEXT);
+                 INSERT INTO matches (pubkey, battleground, army_a, army_b, player_a, player_b, stake, seq, cols, rows,
+                     units_a, units_b, status, seed, outcome)
+                 VALUES ('kept', 'g', 'a', 'b', 'w1', 'w2', '5', 0, 8, 6, '[]', '[]', 1, '', 2);",
+            )
+            .expect("old schema");
+        }
+        let conn = open(&path).expect("migrate");
+        let columns = table_columns(&conn, "matches").expect("columns");
+        assert!(columns.iter().any(|name| name == "fee"));
+        assert!(columns.iter().any(|name| name == "fee_bps"));
+        let row = battle(&conn, "kept").expect("read").expect("kept row");
+        assert_eq!((row.outcome, row.fee, row.fee_bps), (2, None, None));
+        drop(conn);
+        // Opening again finds the columns and leaves them be.
+        drop(open(&path).expect("reopen"));
+        cleanup(&path);
+    }
+
     #[test]
     fn forget_armies_drops_only_the_closed_keys() {
         let (conn, path) = temp_db();
@@ -1082,6 +1233,11 @@ mod tests {
         assert_eq!(keys, vec!["closed".to_string(), "kept".to_string()]);
         assert_eq!(forget_armies(&conn, &["closed".to_string(), "never".to_string()]).expect("forget"), 1);
         assert_eq!(army_keys(&conn).expect("keys"), vec!["kept".to_string()]);
+        // Pruning is for armies only: a settled battle's account is closed too, and its row stays.
+        record(&conn, "closed", &seeded_battle(0), None).expect("battle");
+        resolve(&conn, "closed", 1, 7, None).expect("resolve");
+        forget_armies(&conn, &["closed".to_string()]).expect("forget again");
+        assert!(battle(&conn, "closed").expect("read").is_some());
         drop(conn);
         cleanup(&path);
     }

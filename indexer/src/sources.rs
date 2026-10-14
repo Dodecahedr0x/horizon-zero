@@ -3,6 +3,12 @@
 //! `getProgramAccounts` sends one snapshot. `programSubscribe` streams later
 //! updates. A refused dial is logged with the URL and tried again every few
 //! seconds until shutdown. The pipeline stays up while the validator is down.
+//!
+//! `logsSubscribe` streams the logs of transactions that mention the program.
+//! Carbon has no update type for bare logs, and a logs notification carries no
+//! transaction to build one from, so this source is not a Carbon datasource: it
+//! sends the logs of each successful transaction to its own channel. It dials
+//! and retries the same way as `programSubscribe`.
 
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -15,7 +21,10 @@ use carbon_core::error::CarbonResult;
 use futures_util::StreamExt;
 use solana_client::nonblocking::pubsub_client::PubsubClient;
 use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_client::rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig, UiAccountEncoding};
+use solana_client::rpc_config::{
+    RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcTransactionLogsConfig, RpcTransactionLogsFilter,
+    UiAccountEncoding,
+};
 use solana_client::rpc_request::RpcRequest;
 use solana_client::rpc_response::{OptionalContext, RpcKeyedAccount};
 use solana_commitment_config::CommitmentConfig;
@@ -39,6 +48,19 @@ pub struct ProgramSubscribe {
     failures: Arc<AtomicU32>,
 }
 
+pub struct LogsSubscribe {
+    ws_url: String,
+    program_id: Pubkey,
+    retry: Duration,
+    failures: Arc<AtomicU32>,
+}
+
+/// The logs of one successful transaction that mentions the program.
+pub struct ProgramLogs {
+    pub slot: u64,
+    pub logs: Vec<String>,
+}
+
 impl ProgramSnapshot {
     pub fn new(rpc_url: String, program_id: Pubkey) -> Self {
         Self {
@@ -57,6 +79,98 @@ impl ProgramSubscribe {
             program_id,
             retry: RPC_RETRY,
             failures: Arc::new(AtomicU32::new(0)),
+        }
+    }
+}
+
+impl LogsSubscribe {
+    pub fn new(ws_url: String, program_id: Pubkey) -> Self {
+        Self {
+            ws_url,
+            program_id,
+            retry: RPC_RETRY,
+            failures: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    /// Runs until `cancellation_token` fires or the receiver is dropped.
+    pub async fn consume(
+        &self,
+        sender: tokio::sync::mpsc::Sender<ProgramLogs>,
+        cancellation_token: CancellationToken,
+    ) {
+        loop {
+            if cancellation_token.is_cancelled() {
+                return;
+            }
+            let client = match PubsubClient::new(&self.ws_url).await {
+                Ok(client) => client,
+                Err(err) => {
+                    self.failures.fetch_add(1, Ordering::Relaxed);
+                    log::error!(
+                        "Failed to create RPC logs client for {}: {err}; retrying",
+                        self.ws_url
+                    );
+                    if pause(&cancellation_token, self.retry).await {
+                        return;
+                    }
+                    continue;
+                }
+            };
+
+            let filter = RpcTransactionLogsFilter::Mentions(vec![self.program_id.to_string()]);
+            let config = RpcTransactionLogsConfig {
+                commitment: Some(CommitmentConfig::confirmed()),
+            };
+            let (mut logs_stream, _unsub) = match client.logs_subscribe(filter, config).await {
+                Ok(subscription) => subscription,
+                Err(err) => {
+                    log::error!(
+                        "Failed to subscribe to program logs on {}: {err}; retrying",
+                        self.ws_url
+                    );
+                    if pause(&cancellation_token, self.retry).await {
+                        return;
+                    }
+                    continue;
+                }
+            };
+
+            loop {
+                tokio::select! {
+                    _ = cancellation_token.cancelled() => {
+                        return;
+                    }
+                    event = logs_stream.next() => {
+                        match event {
+                            Some(event) => {
+                                // A failed transaction changed nothing, whatever it logged first.
+                                if event.value.err.is_some() {
+                                    continue;
+                                }
+                                let logs = ProgramLogs {
+                                    slot: event.context.slot,
+                                    logs: event.value.logs,
+                                };
+                                if sender.send(logs).await.is_err() {
+                                    return;
+                                }
+                            }
+                            None => {
+                                log::warn!(
+                                    "Program logs stream {} closed; retrying",
+                                    self.ws_url
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if pause(&cancellation_token, self.retry).await {
+                return;
+            }
         }
     }
 }
@@ -310,6 +424,33 @@ mod tests {
         assert!(
             failures.load(Ordering::Relaxed) > 10,
             "program subscribe dialed {} times",
+            failures.load(Ordering::Relaxed)
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_logs_subscribe_retries_until_shutdown() {
+        let failures = Arc::new(AtomicU32::new(0));
+        let source = LogsSubscribe {
+            ws_url: "ws://127.0.0.1:1".to_string(),
+            program_id: Pubkey::from_str("11111111111111111111111111111111").unwrap(),
+            retry: Duration::from_millis(20),
+            failures: Arc::clone(&failures),
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+        let task = tokio::spawn(async move { source.consume(tx, cancel).await });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!task.is_finished(), "logs subscribe stopped after connection failures");
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("logs subscribe did not stop after cancel")
+            .expect("task panicked");
+        assert!(
+            failures.load(Ordering::Relaxed) > 10,
+            "logs subscribe dialed {} times",
             failures.load(Ordering::Relaxed)
         );
     }

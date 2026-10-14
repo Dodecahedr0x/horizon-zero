@@ -2,13 +2,17 @@
 //!
 //! Carbon's RPC block subscription emits transactions and block details, not
 //! account updates, so this process does not use it and does not use Geyser.
+//! `SOLANA_RPC_URL` is the MagicBlock ephemeral rollup's RPC: Armies, Behaviors
+//! and Battles exist only there, and Battlegrounds and Players are delegated to it.
 //! The pipeline's account decoder is fed by two RPC sources in this crate:
 //! `getProgramAccounts` on `SOLANA_RPC_URL`, then WebSocket `programSubscribe`.
+//! A third source, WebSocket `logsSubscribe`, reads `HZ_MATCH_RESOLVED`:
+//! `settle_match` closes the battle, so the outcome and fee are only in that log.
 //! A websocket URL is derived from the HTTP URL the same way the previous
 //! client did: `http` becomes `ws`, `https` becomes `wss`, and an explicit
-//! port is incremented by one so `127.0.0.1:8899` talks to the local
-//! validator's pubsub port 8900. A refused dial is logged and tried again
-//! every 3 seconds until this process shuts down. The pipeline stays up.
+//! port is incremented by one so the local rollup `127.0.0.1:7799` is dialed
+//! on 7800. A refused dial is logged and tried again every 3 seconds until
+//! this process shuts down. The pipeline stays up.
 //!
 //! Account updates carry a slot. Block time is `getBlockTime` for that slot.
 //! If the RPC has no time, the row is stored with a null timestamp.
@@ -37,7 +41,8 @@ use decode::{HorizonAccount, HorizonDecoder, PROGRAM_ID};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
-use sources::{ProgramSnapshot, ProgramSubscribe};
+use sources::{LogsSubscribe, ProgramLogs, ProgramSnapshot, ProgramSubscribe};
+use tokio_util::sync::CancellationToken;
 
 const PRUNE_EVERY: Duration = Duration::from_secs(30);
 
@@ -85,7 +90,7 @@ async fn run(config: Config) -> Result<(), String> {
         .map_err(|err| format!("bind {}: {err}", config.port))?;
     let ws_url = rpc_to_ws(&config.rpc_url);
     log::info!(
-        "indexer :{} db {} rpc {} ws {} program {}",
+        "indexer :{} db {} rollup rpc {} ws {} program {}",
         config.port,
         config.database_path.display(),
         config.rpc_url,
@@ -107,7 +112,7 @@ async fn run(config: Config) -> Result<(), String> {
             config.rpc_url.clone(),
             config.program_id,
         ))
-        .datasource(ProgramSubscribe::new(ws_url, config.program_id))
+        .datasource(ProgramSubscribe::new(ws_url.clone(), config.program_id))
         .metrics(Arc::new(LogMetrics::new()))
         .account(HorizonDecoder, processor)
         .shutdown_strategy(carbon_core::pipeline::ShutdownStrategy::Immediate)
@@ -120,6 +125,18 @@ async fn run(config: Config) -> Result<(), String> {
         config.program_id,
     ));
 
+    let (logs_tx, logs_rx) = tokio::sync::mpsc::channel(256);
+    let logs_stop = CancellationToken::new();
+    let logs_source = LogsSubscribe::new(ws_url, config.program_id);
+    let logs_cancel = logs_stop.clone();
+    tokio::spawn(async move { logs_source.consume(logs_tx, logs_cancel).await });
+    tokio::spawn(record_resolutions(
+        Arc::clone(&db),
+        config.rpc_url.clone(),
+        config.program_id,
+        logs_rx,
+    ));
+
     tokio::spawn(async move {
         if let Err(err) = pipeline.run().await {
             log::error!("carbon pipeline: {err:?}");
@@ -128,10 +145,47 @@ async fn run(config: Config) -> Result<(), String> {
         }
     });
 
-    axum::serve(listener, app)
+    let served = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown())
         .await
-        .map_err(|err| err.to_string())
+        .map_err(|err| err.to_string());
+    logs_stop.cancel();
+    served
+}
+
+/// Applies each `HZ_MATCH_RESOLVED` the program logged. The resolution time is the block time of
+/// the log's slot, or null when the RPC has none.
+async fn record_resolutions(
+    db: Arc<Mutex<rusqlite::Connection>>,
+    rpc_url: String,
+    program_id: Pubkey,
+    mut logs: tokio::sync::mpsc::Receiver<ProgramLogs>,
+) {
+    let rpc = RpcClient::new_with_timeout_and_commitment(rpc_url, Duration::from_secs(10), CommitmentConfig::confirmed());
+    let program = program_id.to_string();
+    while let Some(batch) = logs.recv().await {
+        let found = decode::resolutions(&batch.logs, &program);
+        if found.is_empty() {
+            continue;
+        }
+        let unix = match rpc.get_block_time(batch.slot).await {
+            Ok(time) => Some(time),
+            Err(err) => {
+                log::warn!("no block time for slot {}: {err}", batch.slot);
+                None
+            }
+        };
+        let Ok(conn) = db.lock() else {
+            log::warn!("resolution: sqlite lock poisoned");
+            continue;
+        };
+        for (battle, outcome, fee) in found {
+            match store::resolve(&conn, &battle, outcome, fee, unix) {
+                Ok(()) => log::info!("battle {battle} resolved: outcome {outcome} fee {fee}"),
+                Err(err) => log::warn!("resolution {battle}: {err}"),
+            }
+        }
+    }
 }
 
 async fn prune_closed_armies(db: Arc<Mutex<rusqlite::Connection>>, rpc_url: String, program_id: Pubkey) {
@@ -242,7 +296,7 @@ async fn shutdown() {
 impl Config {
     fn load(repo: &Path, file: &EnvFile) -> Result<Self, String> {
         let rpc_url =
-            lookup(file, "SOLANA_RPC_URL").unwrap_or_else(|| "http://127.0.0.1:8899".to_string());
+            lookup(file, "SOLANA_RPC_URL").unwrap_or_else(|| "http://127.0.0.1:7799".to_string());
         let program = lookup(file, "PROGRAM_ID").unwrap_or_else(|| PROGRAM_ID.to_string());
         let program_id = program
             .parse::<Pubkey>()
@@ -394,6 +448,7 @@ mod tests {
     fn websocket_url_matches_local_validator_and_public_rpc() {
         assert_eq!(rpc_to_ws("http://127.0.0.1:8899"), "ws://127.0.0.1:8900");
         assert_eq!(rpc_to_ws("http://127.0.0.1:8899/"), "ws://127.0.0.1:8900");
+        assert_eq!(rpc_to_ws("http://127.0.0.1:7799"), "ws://127.0.0.1:7800");
         assert_eq!(
             rpc_to_ws("https://api.devnet.solana.com"),
             "wss://api.devnet.solana.com"
