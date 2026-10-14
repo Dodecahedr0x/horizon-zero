@@ -11,6 +11,7 @@ use horizon_combat::{
 
 mod crank;
 mod error;
+mod fees;
 mod state;
 
 use error::HorizonError;
