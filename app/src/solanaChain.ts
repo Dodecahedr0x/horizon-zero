@@ -13,7 +13,6 @@ import {
   configPda,
   createArmyIx,
   createBehaviorIx,
-  customErrorCode,
   decodeArmyHead,
   decodeBattle,
   decodeBattleground,
@@ -26,6 +25,7 @@ import {
   fundBudgetIx,
   fundOutboxIx,
   fundTreasuryOutboxIx,
+  horizonErrorCode,
   lockArmyIx,
   matchPda,
   nameBehavior,
@@ -55,6 +55,8 @@ const DELEGATION_WAIT_MS = 60_000;
 const SEED_WAIT_MS = 60_000;
 const RELEASE_WAIT_MS = 30_000;
 const ACTION_WAIT_MS = 5_000;
+// How many army indexes past the indexer's highest createArmy checks in the rollup.
+const ARMY_INDEX_PROBE = 64;
 // A legacy transaction fits about 33 distinct accounts. lock_army's fixed accounts, the program and
 // the compute-budget program take 15; behaviors, candidates and their Players share the rest.
 const LOCK_ACCOUNT_LIMIT = 32;
@@ -70,6 +72,18 @@ export class ProgramError extends Error {
     this.code = code;
     this.errorName = errorName;
     this.signature = signature;
+  }
+}
+
+/**
+ * An earlier withdrawal or claim was still waiting in the Outbox. The call paid it out and did not
+ * start the new one: withdraw again if that was meant.
+ */
+export class RecoveredError extends Error {
+  readonly amount: bigint;
+  constructor(amount: bigint) {
+    super(`An earlier withdrawal of ${amount} lamports was waiting and has been paid out; nothing more was withdrawn. Withdraw again if you meant to.`);
+    this.amount = amount;
   }
 }
 
@@ -101,26 +115,25 @@ function lamports(value: string | undefined) {
   return BigInt(value ?? "0");
 }
 
-/** `err` as a ProgramError when it carries one of this program's codes, else unchanged. */
-function friendly(err: unknown, signature?: string) {
-  const source = err as { logs?: string[]; transactionLogs?: string[]; message?: string };
-  const code = customErrorCode({ logs: source.logs ?? source.transactionLogs, message: source.message });
+/** A ProgramError when the failure is one of this program's codes (see `horizonErrorCode`), else null. */
+function programFailure(source: { err?: unknown; logs?: readonly string[]; message?: string }, instructions: readonly TransactionInstruction[], signature?: string) {
+  const code = horizonErrorCode({ ...source, programIds: instructions.map((instruction) => instruction.programId) });
   const known = code === null ? null : programError(code);
-  return known ? new ProgramError(known.code, known.name, known.message, signature) : err;
+  return known ? new ProgramError(known.code, known.name, known.message, signature) : null;
 }
 
 /**
  * Polls `check`, a read, until it returns a value; returns null after `ms`. A read that throws is
- * treated as transient and tried again until the deadline.
+ * logged with console.debug and tried again until the deadline: RPC and network failures are
+ * transient, and a read that keeps failing ends as a timeout.
  */
-async function until<T>(ms: number, check: () => Promise<T | null>, signal?: AbortSignal) {
+async function until<T>(ms: number, check: () => Promise<T | null>) {
   for (const end = Date.now() + ms; ;) {
-    signal?.throwIfAborted();
     try {
       const value = await check();
       if (value !== null) return value;
-    } catch {
-      // transient: try again
+    } catch (err) {
+      console.debug("poll read failed; retrying", err);
     }
     if (Date.now() >= end) return null;
     await sleep(POLL_MS);
@@ -143,15 +156,25 @@ type GroundRow = {
 /**
  * Where an Outbox stands. `undelegated`: owned by the program on Solana, maybe holding an unpaid
  * amount. `ready`: delegated and empty in the rollup. `funded`: delegated, with an amount whose
- * `withdraw` never ran. `inFlight`: delegated on Solana but not the program's in the rollup, which
- * is a withdrawal being committed and undelegated, or a delegation the rollup has not picked up.
+ * `withdraw` never ran. `inFlight`: delegated on Solana, and the delegation program's in the rollup:
+ * a withdrawal being committed and undelegated. `unseen`: delegated on Solana, and the rollup has
+ * no copy yet.
  */
 type OutboxState =
   | { kind: "missing" }
   | { kind: "undelegated"; amount: bigint; owner: PublicKey }
   | { kind: "ready" }
   | { kind: "funded"; amount: bigint }
-  | { kind: "inFlight"; amount: bigint };
+  | { kind: "inFlight"; amount: bigint }
+  | { kind: "unseen" };
+
+/** One of the two Outboxes and the instructions that delegate, fund and flush it. */
+type OutboxTarget = {
+  outbox: PublicKey;
+  missing: string;
+  delegate: () => TransactionInstruction;
+  flush: () => TransactionInstruction;
+};
 
 /**
  * Solana holds the Player, the Outbox and their delegations; the rollup holds the live Player,
@@ -182,18 +205,19 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
    * it is confirmed; throws the program error if it failed; throws PendingError if it is still
    * unknown at the deadline.
    */
-  async function confirm(connection: Connection, signature: string) {
+  async function confirm(connection: Connection, signature: string, blockhash: string, instructions: readonly TransactionInstruction[]) {
     const status = await until(CONFIRM_WAIT_MS, async () => {
       const { value } = await connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
       const found = value[0];
-      return found && (found.err || found.confirmationStatus === "confirmed" || found.confirmationStatus === "finalized") ? found : null;
+      if (found && (found.err || found.confirmationStatus === "confirmed" || found.confirmationStatus === "finalized")) return found;
+      // Not seen and its blockhash has expired: it can no longer land.
+      if (!found && !(await connection.isBlockhashValid(blockhash)).value) return "expired" as const;
+      return null;
     });
     if (!status) throw new PendingError(`Transaction ${signature} was sent but is not confirmed yet; it may still land`, signature);
+    if (status === "expired") throw new Error(`Transaction ${signature} expired before it landed; nothing changed`);
     if (status.err) {
-      const code = customErrorCode({ err: status.err });
-      const known = code === null ? null : programError(code);
-      if (known) throw new ProgramError(known.code, known.name, known.message, signature);
-      throw new Error(`Transaction ${signature} failed: ${JSON.stringify(status.err)}`);
+      throw programFailure({ err: status.err }, instructions, signature) ?? new Error(`Transaction ${signature} failed: ${JSON.stringify(status.err)}`);
     }
   }
 
@@ -202,7 +226,8 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
     for (let attempt = 0; ; attempt += 1) {
       const tx = new Transaction().add(...instructions);
       tx.feePayer = payer;
-      tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+      const { blockhash } = await connection.getLatestBlockhash();
+      tx.recentBlockhash = blockhash;
       let signature: string;
       try {
         // Sign, then send through our own connection: a wallet that sends for itself would send a
@@ -218,11 +243,25 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
       } catch (err) {
         // A rollup blockhash can expire while the wallet waits for approval: sign again once.
         if (attempt === 0 && /blockhash not found/i.test((err as Error)?.message ?? "")) continue;
-        throw friendly(err);
+        const source = err as { logs?: string[]; transactionLogs?: string[]; message?: string };
+        throw programFailure({ logs: source.logs ?? source.transactionLogs, message: source.message }, tx.instructions) ?? err;
       }
-      await confirm(connection, signature);
+      await confirm(connection, signature, blockhash, tx.instructions);
       return signature;
     }
+  }
+
+  function playerTarget(owner: PublicKey): OutboxTarget {
+    return { outbox: outboxPda(owner), missing: "Register first", delegate: () => delegateOutboxIx(owner), flush: () => withdrawIx(owner) };
+  }
+
+  function treasuryTarget(admin: PublicKey): OutboxTarget {
+    return {
+      outbox: treasuryOutboxPda(),
+      missing: "The treasury Outbox does not exist: run init_treasury_outbox",
+      delegate: () => delegateTreasuryOutboxIx(admin),
+      flush: () => claimFeesIx(admin),
+    };
   }
 
   async function ownedInRollup(account: PublicKey) {
@@ -239,33 +278,57 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
     }
     if (!onBase.owner.equals(DELEGATION_PROGRAM_ID)) throw new Error("The Outbox has an unexpected owner");
     const inRollup = await er.getAccountInfo(outbox);
-    const amount = lamports(inRollup ? decodeOutbox(inRollup.data)?.amount : "0");
-    if (!inRollup?.owner.equals(PROGRAM_ID)) return { kind: "inFlight", amount };
+    if (!inRollup) return { kind: "unseen" };
+    const amount = lamports(decodeOutbox(inRollup.data)?.amount);
+    if (!inRollup.owner.equals(PROGRAM_ID)) return { kind: "inFlight", amount };
     return amount > 0n ? { kind: "funded", amount } : { kind: "ready" };
   }
 
   /**
-   * Gets an Outbox ready to fund in the rollup: delegated, empty and visible there. An undelegated
-   * Outbox still holding an amount is released in the same Solana transaction that delegates it.
-   * Throws PendingError while a withdrawal is in flight, and after sending `flush` for an amount an
-   * earlier `fund_outbox` left without its `withdraw`, so nothing is funded twice.
+   * Pays out an amount an earlier withdrawal or claim left in the Outbox: `release_outbox` alone
+   * on Solana for an undelegated Outbox, or `flush` (withdraw or claim_fees) alone in the rollup
+   * for a funded one, then the release. Returns the amount paid, 0 when there was none.
    */
-  async function readyOutbox(outbox: PublicKey, missing: string, delegate: () => TransactionInstruction, flush: () => TransactionInstruction) {
-    const state = await outboxState(outbox);
-    if (state.kind === "missing") throw new Error(missing);
-    if (state.kind === "ready") return;
-    if (state.kind === "inFlight") throw new PendingError("An earlier withdrawal is still on its way; try again once it has arrived");
-    if (state.kind === "funded") {
-      const signature = await send(er, flush());
-      await awaitRelease(outbox);
-      throw new PendingError(`An earlier withdrawal of ${state.amount} lamports was waiting in the Outbox; it has been paid out, and nothing more was withdrawn`, signature);
+  async function recover(target: OutboxTarget, state: OutboxState) {
+    if (state.kind === "undelegated" && state.amount > 0n) {
+      await send(base, releaseOutboxIx(target.outbox, state.owner));
+      return state.amount;
     }
-    const instructions = [];
-    if (state.amount > 0n) instructions.push(releaseOutboxIx(outbox, state.owner));
-    instructions.push(delegate());
-    const signature = await send(base, ...instructions);
+    if (state.kind === "funded") {
+      await send(er, target.flush());
+      await awaitRelease(target.outbox);
+      return state.amount;
+    }
+    return 0n;
+  }
+
+  async function releasePending(target: OutboxTarget) {
+    const state = await outboxState(target.outbox);
+    return (await recover(target, state)) > 0n ? ("paid" as const) : ("none" as const);
+  }
+
+  /**
+   * Classifies the Outbox before a new withdrawal or claim. An earlier amount is paid out instead,
+   * with RecoveredError, so a retry never funds twice; a withdrawal in flight or a delegation the
+   * rollup has not picked up is PendingError. Returns the state when a new one may start: `ready`,
+   * or `undelegated` with nothing in it.
+   */
+  async function classify(target: OutboxTarget) {
+    const state = await outboxState(target.outbox);
+    if (state.kind === "missing") throw new Error(target.missing);
+    if (state.kind === "inFlight") throw new PendingError("An earlier withdrawal is still on its way to the wallet; try again once it has arrived");
+    if (state.kind === "unseen") throw new PendingError("The rollup has not picked up the Outbox yet; try again shortly");
+    const recovered = await recover(target, state);
+    if (recovered > 0n) throw new RecoveredError(recovered);
+    return state;
+  }
+
+  /** Delegates an empty, undelegated Outbox and waits for the rollup to hold it. */
+  async function delegateOutbox(target: OutboxTarget, state: OutboxState) {
+    if (state.kind === "ready") return;
+    const signature = await send(base, target.delegate());
     // The wait starts after the wallet approved and the delegation confirmed.
-    const ready = await until(DELEGATION_WAIT_MS, async () => ((await outboxState(outbox)).kind === "ready" ? true : null));
+    const ready = await until(DELEGATION_WAIT_MS, async () => ((await outboxState(target.outbox)).kind === "ready" ? true : null));
     if (!ready) throw new PendingError("The Outbox was delegated but the rollup has not picked it up yet; try again shortly", signature);
   }
 
@@ -283,13 +346,14 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
       const state = decodeOutbox(info.data);
       return state && lamports(state.amount) > 0n ? state : null;
     };
-    if (!unpaid(back)) return;
+    let latest = back;
+    if (!unpaid(latest)) return;
     const paid = await until(ACTION_WAIT_MS, async () => {
       const info = await base.getAccountInfo(outbox);
+      if (info) latest = info;
       return info && !unpaid(info) ? true : null;
     });
-    if (paid) return;
-    const state = unpaid((await base.getAccountInfo(outbox))!);
+    const state = paid ? null : unpaid(latest);
     if (state) await send(base, releaseOutboxIx(outbox, new PublicKey(state.owner)));
   }
 
@@ -428,7 +492,8 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
       const existing = await this.armies(owner.toBase58());
       let index = existing.reduce((max, army) => Math.max(max, army.index + 1), 0);
       // The indexer may not list an army created a moment ago: skip indexes taken in the rollup.
-      for (;;) {
+      for (let probed = 0; ; probed += 8) {
+        if (probed >= ARMY_INDEX_PROBE) throw new Error(`Army indexes ${index - probed} to ${index - 1} are all taken in the rollup; the indexer is far behind, try again later`);
         const batch = Array.from({ length: 8 }, (_, i) => armyPda(owner, index + i));
         const taken = await er.getMultipleAccountsInfo(batch);
         const free = taken.findIndex((info) => !info || info.data.length === 0);
@@ -498,9 +563,9 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
       const outboxState = outboxOnBase?.owner.equals(PROGRAM_ID) ? decodeOutbox(outboxOnBase.data) : null;
       if (!outboxOnBase || (outboxState && lamports(outboxState.amount) === 0n)) instructions.push(delegateOutboxIx(owner));
       const signature = instructions.length ? await send(base, ...instructions) : undefined;
-      if (!(await until(DELEGATION_WAIT_MS, () => ownedInRollup(player)))) {
-        throw new PendingError("Registered on Solana; the rollup has not picked up the Player yet", signature);
-      }
+      const outbox = outboxPda(owner);
+      const picked = await until(DELEGATION_WAIT_MS, async () => ((await ownedInRollup(player)) && (await ownedInRollup(outbox)) ? true : null));
+      if (!picked) throw new PendingError("Registered on Solana; the rollup has not picked up the Player and Outbox yet", signature);
     },
     async topUp(amount) {
       const owner = me();
@@ -520,15 +585,19 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
     },
     async withdraw(amount) {
       const owner = me();
+      const target = playerTarget(owner);
+      const state = await classify(target);
       if (amount <= 0n) throw new Error("Withdraw a positive amount");
       const balance = await this.player();
       if (!balance) throw new Error("Register first");
       const available = lamports(balance.free) + lamports(balance.winnings) + lamports(balance.budget);
       if (amount > available) throw new Error(`You can withdraw at most ${available} lamports`);
-      const outbox = outboxPda(owner);
-      await readyOutbox(outbox, "Register first", () => delegateOutboxIx(owner), () => withdrawIx(owner));
+      await delegateOutbox(target, state);
       await send(er, fundOutboxIx(owner, amount), withdrawIx(owner));
-      await awaitRelease(outbox);
+      await awaitRelease(target.outbox);
+    },
+    async releasePending(which = "player") {
+      return releasePending(which === "player" ? playerTarget(me()) : treasuryTarget(me()));
     },
     async setSegregation(segregate) {
       await send(er, setSegregationIx(me(), segregate));
@@ -543,13 +612,14 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
     },
     async claimFees() {
       const admin = me();
+      const target = treasuryTarget(admin);
+      const state = await classify(target);
       const config = await this.admin();
       if (!config) throw new Error("Config is missing");
       if (lamports(config.fees) === 0n) throw new Error("There are no fees to claim");
-      const outbox = treasuryOutboxPda();
-      await readyOutbox(outbox, "The treasury Outbox does not exist: run init_treasury_outbox", () => delegateTreasuryOutboxIx(admin), () => claimFeesIx(admin));
+      await delegateOutbox(target, state);
       await send(er, fundTreasuryOutboxIx(admin), claimFeesIx(admin));
-      await awaitRelease(outbox);
+      await awaitRelease(target.outbox);
     },
     async setFee(bps) {
       await send(er, setFeeIx(me(), bps));

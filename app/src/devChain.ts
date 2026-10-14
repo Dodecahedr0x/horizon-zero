@@ -90,8 +90,16 @@ export interface ChainAdapter {
   topUp(lamports: bigint): Promise<void>;
   /** Moves free lamports into the stake budget. */
   fundBudget(lamports: bigint): Promise<void>;
-  /** Pays lamports from the Player (free, then winnings, then budget) back to the wallet through the Outbox. */
+  /**
+   * Pays lamports from the Player (free, then winnings, then budget) back to the wallet through the
+   * Outbox. If an earlier withdrawal was still waiting, pays that instead and throws RecoveredError.
+   */
   withdraw(lamports: bigint): Promise<void>;
+  /**
+   * Pays out an amount an earlier withdrawal (or, with "treasury", an earlier fee claim) left
+   * behind. "paid" when it paid something, "none" when there was nothing to pay.
+   */
+  releasePending(which?: "player" | "treasury"): Promise<"none" | "paid">;
   setSegregation(segregate: boolean): Promise<void>;
   /** Settles a Seeded battle. Anyone may. */
   settle(match: Match): Promise<void>;
