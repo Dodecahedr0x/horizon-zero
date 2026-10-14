@@ -33,7 +33,7 @@ mod store;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use carbon_core::account::AccountProcessorInputType;
 use carbon_core::error::CarbonResult;
@@ -249,7 +249,9 @@ async fn prune_closed_armies(db: Arc<Mutex<rusqlite::Connection>>, rpc_url: Stri
 struct IndexProcessor {
     db: Arc<Mutex<rusqlite::Connection>>,
     rpc: RpcClient,
-    times: HashMap<u64, i64>,
+    /// Block times by slot. A slot the RPC could not time is remembered as None until
+    /// `NO_TIME_FOR`, so a burst of updates in that slot does not wait out the retries each time.
+    times: HashMap<u64, (Option<i64>, Instant)>,
 }
 
 impl Processor<AccountProcessorInputType<'_, HorizonAccount>> for IndexProcessor {
@@ -273,15 +275,24 @@ impl Processor<AccountProcessorInputType<'_, HorizonAccount>> for IndexProcessor
 
 impl IndexProcessor {
     async fn block_time(&mut self, slot: u64) -> Option<i64> {
-        if let Some(time) = self.times.get(&slot).copied() {
-            return Some(time);
+        if let Some(&(time, at)) = self.times.get(&slot) {
+            if time.is_some() || at.elapsed() < NO_TIME_FOR {
+                return time;
+            }
         }
-        let time = block_time(&self.rpc, slot).await?;
-        self.times.insert(slot, time);
-        Some(time)
+        let time = block_time(&self.rpc, slot).await;
+        if self.times.len() >= TIMES_KEPT {
+            self.times.clear();
+        }
+        self.times.insert(slot, (time, Instant::now()));
+        time
     }
 }
 
+/// How long a slot the RPC could not time is not asked again.
+const NO_TIME_FOR: Duration = Duration::from_secs(30);
+/// The block-time cache is cleared when it holds this many slots.
+const TIMES_KEPT: usize = 10_000;
 /// How often, and how far apart, a slot's block time is asked for before the row keeps a null time.
 const BLOCK_TIME_TRIES: u32 = 5;
 const BLOCK_TIME_RETRY: Duration = Duration::from_millis(200);

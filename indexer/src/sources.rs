@@ -178,7 +178,6 @@ impl LogsSubscribe {
     }
 }
 
-/// Wait before the next dial. `true` means the indexer is shutting down.
 /// An account update for the pipeline. Not Carbon's `AccountUpdate::into_update`: it turns an
 /// account with 0 lamports into a deletion, and every rollup ephemeral account (Army, Behavior,
 /// Battle) holds 0 lamports, its rent sitting with the sponsor. A closed account does not reach this
@@ -187,6 +186,7 @@ fn account_update(pubkey: Pubkey, account: solana_account::Account, slot: u64) -
     Update::Account(AccountUpdate { pubkey, account, slot, transaction_signature: None })
 }
 
+/// Wait before the next dial. `true` means the indexer is shutting down.
 async fn pause(token: &CancellationToken, retry: Duration) -> bool {
     tokio::select! {
         _ = token.cancelled() => true,
@@ -347,9 +347,10 @@ impl Datasource for ProgramSubscribe {
                                     continue;
                                 };
                                 let update = account_update(pubkey, decoded, event.context.slot);
-                                if sender.try_send((update, id.clone())).is_err() {
-                                    log::error!("Error sending account update");
-                                    break;
+                                // Wait for room rather than drop an update; a closed channel
+                                // means the pipeline has stopped.
+                                if sender.send((update, id.clone())).await.is_err() {
+                                    return Ok(());
                                 }
                             }
                             None => {
@@ -371,7 +372,8 @@ impl Datasource for ProgramSubscribe {
     }
 
     fn update_types(&self) -> Vec<UpdateType> {
-        vec![UpdateType::AccountUpdate, UpdateType::AccountDeletion]
+        // `account_update` never builds a deletion.
+        vec![UpdateType::AccountUpdate]
     }
 }
 

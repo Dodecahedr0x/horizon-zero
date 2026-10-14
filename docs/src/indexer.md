@@ -47,7 +47,7 @@ The local rollup (ephemeral-validator 0.14.10) serves all five calls the indexer
 
 The websocket URL is derived from `SOLANA_RPC_URL`. `http` becomes `ws`, `https` becomes `wss`, and an explicit port is incremented by one, so the local rollup `http://127.0.0.1:7799` uses its websocket port `7800`. A URL that is already `ws` or `wss`, or that omits the port, is not shifted.
 
-Each account update and each logs notification carries a slot. The indexer calls `getBlockTime` for that slot and stores the unix seconds. The rollup answers "not yet available" for a slot until about 100 ms after it, which is when a live update arrives, so the indexer asks up to five times, 200 ms apart. A slot the RPC still cannot time is stored as null. Times are not invented. UTC days (`YYYY-MM-DD`) are indexed for range queries.
+Each account update and each logs notification carries a slot. The indexer calls `getBlockTime` for that slot and stores the unix seconds. The rollup answers "not yet available" for a slot until about 100 ms after it, which is when a live update arrives, so the indexer asks up to five times, 200 ms apart. A slot the RPC still cannot time is stored as null, and account updates in that slot are not timed again for 30 seconds. Times are not invented. UTC days (`YYYY-MM-DD`) are indexed for range queries.
 
 | env | default |
 | --- | --- |
