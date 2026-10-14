@@ -17,9 +17,9 @@ jobs:
       - name: Combat and LiteSVM
         run: |
           cargo test -p combat
+          cargo test -p horizon-zero
           cargo-build-sbf --manifest-path programs/mock-vrf/Cargo.toml
-          cargo-build-sbf --manifest-path programs/mock-hydra/Cargo.toml
-          cargo-build-sbf --manifest-path programs/horizon-zero/Cargo.toml -- --features inline-mock-vrf
+          cargo-build-sbf --manifest-path programs/horizon-zero/Cargo.toml -- --features inline-mock-vrf,inline-mock-magic
           cargo test -p horizon-litesvm-tests -- --test-threads=1
       - uses: pnpm/action-setup@v4
         with:
