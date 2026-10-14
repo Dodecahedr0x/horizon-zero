@@ -1728,3 +1728,48 @@ fn only_the_admin_claims_fees_and_release_pays_the_admin() {
     // No fees left: nothing to claim.
     send_expect_reason_with(&mut env, &admin, |env| vec![treasury_ix(env, &admin, "fund_treasury_outbox")], "NothingToWithdraw");
 }
+
+#[test]
+fn solana_admin_checks_read_config_by_hand() {
+    let mut env = setup();
+    let admin = env.admin.insecure_clone();
+    let stranger = Keypair::new();
+    env.fund(&stranger);
+
+    // `create_battleground` reads Config by hand too: the fixture's three grounds went through it,
+    // and a stranger is refused.
+    let ground = pda(&[b"battleground", &[3]], &env.program).0;
+    let mut args = vec![3u8];
+    args.extend_from_slice(&BUDGET.to_le_bytes());
+    args.extend_from_slice(&STAKE.to_le_bytes());
+    args.extend_from_slice(&[8, 6]);
+    let create = |env: &Env, signer: &Keypair, config: Address| {
+        let accounts = vec![meta(signer.pubkey(), true, true), meta(config, false, false), meta(ground, true, false), meta(SYSTEM, false, false)];
+        ix(env.program, accounts, disc("create_battleground", &args))
+    };
+    send_expect_reason_with(&mut env, &stranger, |env| vec![create(env, &stranger, env.config)], "NotAdmin");
+
+    // `init_treasury_outbox` with something other than Config. The treasury Outbox's seeds follow
+    // the account passed as Config, so each call names the Outbox of that account.
+    let init = |env: &Env, config: Address| {
+        let outbox = pda(&[b"outbox", config.as_ref()], &env.program).0;
+        let accounts = vec![meta(admin.pubkey(), true, true), meta(config, false, false), meta(outbox, true, false), meta(SYSTEM, false, false)];
+        ix(env.program, accounts, disc("init_treasury_outbox", &[]))
+    };
+    // A program account of another type: the admin's Player.
+    let player = player_pda(&env, &admin.pubkey());
+    send_expect_reason_with(&mut env, &admin, |env| vec![init(env, player)], "AccountDiscriminatorMismatch");
+    // Config's own bytes at another address, owned by this program, then by the system program.
+    let copy = Address::new_unique();
+    let config = env.svm.get_account(&env.config).unwrap();
+    env.svm.set_account(copy, config.clone()).unwrap();
+    send_expect_reason_with(&mut env, &admin, |env| vec![init(env, copy)], "BadPda");
+    send_expect_reason_with(&mut env, &admin, |env| vec![create(env, &admin, copy)], "BadPda");
+    env.svm.set_account(copy, Account { owner: SYSTEM, ..config }).unwrap();
+    send_expect_reason_with(&mut env, &admin, |env| vec![init(env, copy)], "BadPda");
+
+    // The real Config still passes.
+    send_with(&mut env, &admin, |env| vec![init(env, env.config)]);
+    let logs = send_with(&mut env, &admin, |env| vec![create(env, &admin, env.config)]);
+    assert!(logs.iter().any(|line| line.contains(&format!("HZ_BATTLEGROUND {ground} 3"))));
+}

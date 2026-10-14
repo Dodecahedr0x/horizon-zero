@@ -18,6 +18,38 @@ The program is Anchor. Every account begins with the 8-byte discriminator `SHA-2
 
 The scoped VRF identity is a different account, owned by the derivation under the VRF program: `[b"identity", horizon_program_id]`. It signs `seed_match`. It is not the program identity above.
 
+## Where each account lives
+
+| account | created on Solana by | delegated to the rollup by | leaves the rollup |
+| --- | --- | --- | --- |
+| Config | `initialize` | `delegate_config` | never |
+| Battleground | `create_battleground` | `delegate_battleground` | never |
+| Player | `register_player` | `delegate_player` | never |
+| Outbox | `register_player` | `delegate_outbox`, before each withdrawal | `withdraw` commits and undelegates it |
+| treasury Outbox | `init_treasury_outbox` | `delegate_treasury_outbox`, before each claim | `claim_fees` commits and undelegates it |
+| program identity | `initialize` | not delegated | — |
+| Behavior, Army, Battle | not on Solana | ephemeral: created in the rollup (see [Ephemeral accounts](#ephemeral-accounts)) | never |
+
+The first five are program PDAs. Once delegated, each one's Solana copy is owned by the delegation program `DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh` and keeps the data of its last commit; the rollup holds the live copy. The program has no instruction that undelegates Config, a Battleground or a Player. The flows that need the rollup (creating behaviors and armies, `lock_army`, `settle_match`, `fund_outbox`, `withdraw`, `fund_treasury_outbox`, `claim_fees`) run there once the accounts they write are delegated. The program does not check which side it runs on; an instruction that writes an account the rollup does not hold delegated fails there.
+
+Each account must exist before it is delegated, and `initialize` comes first. Otherwise the order does not matter: every admin instruction that runs on Solana reads Config by hand (see [`init_treasury_outbox`](#init_treasury_outbox)), so `create_battleground`, `init_treasury_outbox`, `delegate_battleground` and `delegate_treasury_outbox` work before or after `delegate_config`.
+
+```mermaid
+flowchart LR
+  subgraph solana [Solana]
+    Init["initialize, create_battleground,<br/>register_player, init_treasury_outbox"]
+    Release["release_outbox"]
+  end
+  subgraph rollup [Rollup]
+    Live["Config, Battleground, Player,<br/>Outbox, treasury Outbox (delegated)"]
+    Eph["Behavior, Army, Battle (ephemeral)"]
+  end
+  Init -->|"delegate_config, delegate_battleground, delegate_player,<br/>delegate_outbox, delegate_treasury_outbox"| Live
+  Live -->|"Player sponsors"| Eph
+  Live -->|"withdraw, claim_fees: commit and undelegate the Outbox"| Release
+  Release -->|"delegate_outbox or delegate_treasury_outbox again"| Live
+```
+
 ## Ephemeral accounts
 
 Behavior, Army and Battle are ephemeral accounts: they exist only in the MagicBlock rollup, hold 0 lamports, and are owned by this program. The program creates one with the magic program's `CreateEphemeralAccount`, through `ephemeral_rollups_sdk::ephemeral_accounts::EphemeralAccount`. The sponsor is a Player PDA, which signs with its seeds `[b"player", owner, bump]`. The new account signs with its own PDA seeds. The sponsor pays `(len + 60) * 32` lamports of rent to the ephemeral vault. Closing refunds that rent to the sponsor.
@@ -245,9 +277,9 @@ Log: `HZ_FEE <fee_bps>`.
 
 ### `create_battleground(battleground_id: u8, budget: u16, stake_lamports: u64, cols: u8, rows: u8)`
 
-Accounts: admin signer writable, config, battleground init, system program.
+Solana. Accounts: admin signer writable, config, battleground init, system program.
 
-The signer must be `config.admin`. The battleground stores that admin, the five arguments, `zone_depth` 2, an empty queue, and `match_seq` 0. `cols` and `rows` must describe a playable grid.
+The signer must be `config.admin` (`NotAdmin`). Config is read by hand, as in [`init_treasury_outbox`](#init_treasury_outbox), so the instruction works whether or not Config is delegated. The battleground stores that admin, the five arguments, `zone_depth` 2, an empty queue, and `match_seq` 0. `cols` and `rows` must describe a playable grid.
 
 Log: `HZ_BATTLEGROUND <battleground> <id> <budget> <stake> <cols> <rows>`.
 
@@ -414,7 +446,7 @@ Log: `HZ_RELEASE <outbox> <amount>`, only when `amount` is not 0.
 
 Solana. Accounts: admin signer writable, config, outbox init `[b"outbox", config]`, system program.
 
-The signer must be `config.admin` (`NotAdmin`). Like every admin instruction that runs on Solana, it reads Config by hand rather than as a typed account, so it works whether or not Config is delegated. A delegated Config's Solana copy is owned by the delegation program and keeps its data. The account must be owned by this program or by the delegation program (`BadPda`), carry the Config discriminator, and sit at `[b"config"]` with its stored bump (`BadPda`). It pays the rent. The treasury Outbox starts with `owner` = admin and `amount` 0. A second call fails because the account exists.
+The signer must be `config.admin` (`NotAdmin`). Every admin instruction that runs on Solana (`create_battleground`, `init_treasury_outbox`, `delegate_config`, `delegate_battleground` and `delegate_treasury_outbox`) reads Config by hand rather than as a typed account, so it works whether or not Config is delegated. A delegated Config's Solana copy is owned by the delegation program and keeps the data of its last commit. The account must be owned by this program or by the delegation program (`BadPda`), carry the Config discriminator (`AccountDiscriminatorMismatch`), and sit at `[b"config"]` with its stored bump (`BadPda`). The check trusts the last committed Config. That is sound only because `admin` never changes after `initialize`. The admin pays the rent. The treasury Outbox starts with `owner` = admin and `amount` 0. A second call fails because the account exists.
 
 ### `fund_treasury_outbox`
 
@@ -431,3 +463,43 @@ Rollup. Accounts: admin signer writable, config, treasury outbox writable `[b"ou
 `withdraw` for the treasury Outbox. The signer must be `config.admin` and the Outbox's `owner` (`NotAdmin`), and `amount` must not be 0 (`NothingToWithdraw`). The admin pays the intent. The post-undelegate `release_outbox` pays the admin. Config is not writable: the instruction only reads its admin.
 
 Log: `HZ_CLAIM <outbox> <amount>`, with the amount read from the Outbox.
+
+## Delegation
+
+Five Solana instructions delegate the program's PDAs to the rollup. Each takes `validator`, the identity of the rollup validator that will hold the account, as its last argument (a 32-byte pubkey after the discriminator). The program has no default: the SDK's default identity is not the local rollup's, which is `mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev`. The commit frequency is the SDK's default, `DelegateConfig::default()`, which is `u32::MAX` ms (about 49.7 days). The signer pays the rent of the delegation record and metadata.
+
+Each instruction CPIs the delegation program `DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh`, which takes the account over. The delegated account is an unchecked account, so Anchor does not write it back after the CPI. `#[delegate]` (`ephemeral-rollups-sdk` 0.17.3) sets the account order: before the delegated account `<a>` come its buffer `[b"buffer", a]` under this program, its delegation record `[b"delegation", a]` and its delegation metadata `[b"delegation-metadata", a]` under the delegation program, all writable. After the last listed account come this program's id, the delegation program and the system program. Before the CPI each instruction requires the account it delegates to be owned by this program (`BadPda`). That refuses an account that does not exist yet, which would otherwise be handed to the delegation program empty, and one that is already delegated.
+
+`#[ephemeral]` on the program module adds `process_undelegation(account_seeds: Vec<Vec<u8>>)`, which the delegation program calls on Solana when it undelegates an account, to give the account back to this program with its committed data. Clients do not send it.
+
+Under `inline-mock-magic` the five instructions and `process_undelegation` are compiled out: LiteSVM has no delegation program. The mock build answers them with Anchor's `InstructionFallbackNotFound`.
+
+### `delegate_player(validator: Pubkey)`
+
+Solana. Accounts: owner signer writable, buffer, delegation record, delegation metadata, player writable `[b"player", owner]` (`ConstraintSeeds`), this program, delegation program, system program.
+
+Delegates the signer's Player. It must be owned by this program (`BadPda`).
+
+### `delegate_outbox(validator: Pubkey)`
+
+Solana. Accounts: owner signer writable, buffer, delegation record, delegation metadata, outbox writable `[b"outbox", owner]` (`ConstraintSeeds`), this program, delegation program, system program.
+
+Delegates the signer's Outbox again before a withdrawal, since every `withdraw` undelegates it. The Outbox is read by hand before the CPI: it must be owned by this program (`BadPda`, which an Outbox still delegated also gets), carry the Outbox discriminator, and have `amount` 0 (`OutboxBusy`). An Outbox that `withdraw` undelegated but `release_outbox` has not paid yet is refused, so the payment is never locked back into the rollup. `register_player` leaves the Outbox at 0, so the first delegation needs no release.
+
+### `delegate_config(validator: Pubkey)`
+
+Solana, admin only. Accounts: admin signer writable, buffer, delegation record, delegation metadata, config writable `[b"config"]` (`ConstraintSeeds`), this program, delegation program, system program.
+
+The signer must be `config.admin` (`NotAdmin`), read by hand as in [`init_treasury_outbox`](#init_treasury_outbox). Config must then be owned by this program (`BadPda`): an already delegated Config passes the admin check and is refused here.
+
+### `delegate_battleground(battleground_id: u8, validator: Pubkey)`
+
+Solana, admin only. Accounts: admin signer writable, config, buffer, delegation record, delegation metadata, battleground writable `[b"battleground", &[battleground_id]]` (`ConstraintSeeds`), this program, delegation program, system program.
+
+The signer must be `config.admin` (`NotAdmin`), read by hand. The battleground must be owned by this program (`BadPda`). The instruction data is the discriminator, the id byte, then `validator`.
+
+### `delegate_treasury_outbox(validator: Pubkey)`
+
+Solana, admin only. Accounts: admin signer writable, config, buffer, delegation record, delegation metadata, treasury outbox writable `[b"outbox", config]` (`ConstraintSeeds`), this program, delegation program, system program.
+
+The signer must be `config.admin` (`NotAdmin`), read by hand. Delegates the treasury Outbox again before a claim, since every `claim_fees` undelegates it. The same rule as `delegate_outbox` applies: the Outbox must be owned by this program (`BadPda`) and have `amount` 0 (`OutboxBusy`), so an unpaid claim is released first.
