@@ -51,6 +51,7 @@ pub mod horizon_zero {
     /// `validator` is the rollup validator every delegate instruction delegates to. Nothing changes it.
     pub fn initialize(ctx: Context<Initialize>, fee_bps: u16, validator: Pubkey) -> Result<()> {
         require!(fee_bps <= fees::MAX_FEE_BPS, HorizonError::FeeTooHigh);
+        require!(validator != Pubkey::default(), HorizonError::BadValidator);
         ctx.accounts.config.admin = ctx.accounts.admin.key();
         ctx.accounts.config.fee_bps = fee_bps;
         ctx.accounts.config.fees = 0;

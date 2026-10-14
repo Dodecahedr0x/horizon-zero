@@ -270,7 +270,7 @@ Each snapshot unit is 96 bytes: `kind`, `len`, `body` (77 bytes), `col`, `row`, 
 
 Accounts: admin signer writable, config init, identity writable, system program.
 
-`fee_bps` above `1000` fails with `FeeTooHigh`. Sets `config.admin` to the signer, stores `fee_bps` with `fees` 0 and `validator`, and creates the program identity PDA with space 0. The first successful caller is the admin. There is no admin transfer and no instruction that changes `validator`. On the local stack `validator` is `mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev`. The program cannot check it: a wrong identity delegates every account to a validator that does not serve them, and nothing undelegates a Player.
+`fee_bps` above `1000` fails with `FeeTooHigh`, and a `validator` of all zeros (`Pubkey::default()`) fails with `BadValidator`. Sets `config.admin` to the signer, stores `fee_bps` with `fees` 0 and `validator`, and creates the program identity PDA with space 0. The first successful caller is the admin. There is no admin transfer and no instruction that changes `validator`. On the local stack `validator` is `mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev`. Beyond the all-zeros check, the program cannot check it: a wrong identity delegates every account to a validator that does not serve them, and nothing undelegates a Player.
 
 ### `set_fee(fee_bps: u16)`
 

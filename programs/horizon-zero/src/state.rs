@@ -316,7 +316,8 @@ mod layout_tests {
         assert_eq!(8 + Army::INIT_SPACE, 1360);
         assert_eq!(8 + Battle::INIT_SPACE, 2147); // + fee_bps 2
         assert_eq!(8 + Config::INIT_SPACE, 83); // admin 32, fee_bps 2, fees 8, validator 32, bump 1
-        assert_eq!(8 + Player::INIT_SPACE, 68); // owner 32, budget 8, winnings 8, locked 8, segregate 1, fighting 2, bump 1
+                                                // owner 32, budget 8, winnings 8, locked 8, segregate 1, fighting 2, bump 1
+        assert_eq!(8 + Player::INIT_SPACE, 68);
         assert_eq!(8 + Outbox::INIT_SPACE, 49); // owner 32, amount 8, bump 1
     }
 

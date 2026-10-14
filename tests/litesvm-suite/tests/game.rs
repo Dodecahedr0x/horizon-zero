@@ -391,6 +391,24 @@ fn still_body() -> Vec<u8> {
 }
 
 #[test]
+fn initialize_needs_a_validator_identity() {
+    let mut env = setup();
+    // Config and the identity exist after setup; clear both so `initialize` can run again.
+    let identity = pda(&[b"identity"], &env.program).0;
+    for key in [env.config, identity] {
+        env.svm.set_account(key, Account::default()).unwrap();
+    }
+    let init = |env: &Env, admin: &Keypair, validator: Address| {
+        let accounts = vec![meta(admin.pubkey(), true, true), meta(env.config, true, false), meta(identity, true, false), meta(SYSTEM, false, false)];
+        ix(env.program, accounts, disc("initialize", &[&500u16.to_le_bytes()[..], validator.as_ref()].concat()))
+    };
+    let admin = env.admin.insecure_clone();
+    send_expect_reason_with(&mut env, &admin, |env| vec![init(env, &admin, Address::default())], "BadValidator");
+    send_with(&mut env, &admin, |env| vec![init(env, &admin, VALIDATOR)]);
+    assert_eq!(Address::try_from(&env.svm.get_account(&env.config).unwrap().data[50..82]).unwrap(), VALIDATOR);
+}
+
+#[test]
 fn fee_is_capped_and_only_the_admin_sets_it() {
     let mut env = setup();
     let set = |env: &Env, signer: &Keypair, bps: u16| ix(env.program, vec![meta(signer.pubkey(), false, true), meta(env.config, true, false)], disc("set_fee", &bps.to_le_bytes()));

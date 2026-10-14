@@ -66,4 +66,6 @@ pub enum HorizonError {
     NotSeeded,
     #[msg("There is nothing to withdraw")]
     NothingToWithdraw,
+    #[msg("Validator identity must be set")]
+    BadValidator,
 }
