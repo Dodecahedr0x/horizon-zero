@@ -3,7 +3,8 @@
 //   node scripts/deploy.mjs devnet  [--keypair ~/.config/solana/id.json] [--url <rpc>]
 //   node scripts/deploy.mjs mainnet --confirm-mainnet [--keypair <path>] [--url <rpc>] [--priority <micro-lamports>]
 //   extra flags: --skip-build (reuse target/deploy/horizon_zero.so), --skip-bootstrap,
-//                --er-url <rollup rpc> (required unless --skip-bootstrap), --validator <identity>
+//                --er-url <rollup rpc> and --validator <its identity> (both required unless --skip-bootstrap;
+//                the identity must be what the rollup's getIdentity returns)
 //
 // The program id is the address of target/deploy/horizon_zero-keypair.json, which must be
 // Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c. The --keypair wallet pays, holds the upgrade
@@ -59,6 +60,27 @@ const url = value("--url", CLUSTERS[cluster]);
 // The rollup Config is pinned to: bootstrap delegates every account to its validator identity.
 const erUrl = value("--er-url", "");
 if (!erUrl && !has("--skip-bootstrap")) fail("--er-url <rollup rpc> is required: Config pins that rollup's validator for good");
+// Config pins the validator once and for all, so a wrong rollup is caught before any SOL is
+// spent: the operator names the identity they expect, and it must be the one the rollup reports.
+let validator = "";
+if (!has("--skip-bootstrap")) {
+  let identity;
+  try {
+    const response = await fetch(erUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getIdentity" }),
+    });
+    identity = (await response.json()).result?.identity;
+  } catch (err) {
+    fail(`getIdentity on ${erUrl} failed: ${err.message}`);
+  }
+  if (!identity) fail(`the rollup at ${erUrl} did not return its identity`);
+  process.stdout.write(`[deploy] rollup ${erUrl} identity ${identity}\n`);
+  validator = value("--validator", "");
+  if (!validator) fail(`pass --validator ${identity} to confirm: initialize pins it in Config and nothing changes it`);
+  if (validator !== identity) fail(`--validator ${validator} is not the identity ${identity} that ${erUrl} reports`);
+}
 const keypair = value("--keypair", "~/.config/solana/id.json").replace(/^~(?=$|\/)/, os.homedir());
 if (!fs.existsSync(keypair)) fail(`wallet keypair not found: ${keypair}`);
 const programKeypair = path.join(root, "target/deploy/horizon_zero-keypair.json");
@@ -67,7 +89,8 @@ const programAddress = output("solana-keygen", ["pubkey", programKeypair]);
 if (programAddress !== PROGRAM_ID) fail(`program keypair is ${programAddress}, but declare_id! is ${PROGRAM_ID}`);
 
 if (!has("--skip-build")) {
-  // Default features only: inline-mock-vrf is for LiteSVM and would break the real VRF callback.
+  // Default features only: inline-mock-vrf and inline-mock-magic are for LiteSVM; they would break
+  // the real VRF callback and skip the rollup's ephemeral accounts and delegation.
   run("cargo-build-sbf", ["--manifest-path", "programs/horizon-zero/Cargo.toml"]);
 }
 
@@ -86,8 +109,7 @@ if (priority) deploy.push("--with-compute-unit-price", priority);
 run("solana", deploy);
 
 if (!has("--skip-bootstrap")) {
-  const validator = value("--validator", "");
-  run("node", ["app/scripts/bootstrap.mjs", "--url", url, "--er-url", erUrl, "--keypair", keypair, ...(validator ? ["--validator", validator] : [])]);
+  run("node", ["app/scripts/bootstrap.mjs", "--url", url, "--er-url", erUrl, "--keypair", keypair, "--validator", validator]);
 }
 
 const rollup = erUrl || "<rollup RPC>";

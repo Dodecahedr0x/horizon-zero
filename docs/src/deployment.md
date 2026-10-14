@@ -5,8 +5,8 @@ Horizon Zero runs on three clusters. Local development and testing use a local S
 | cluster | Solana RPC | rollup RPC (`VITE_ER_RPC_URL`, indexer `SOLANA_RPC_URL`) | VRF queue | how |
 | --- | --- | --- | --- | --- |
 | local | `http://127.0.0.1:8899` | `http://127.0.0.1:7799` | `Sc9MJUngNbQXSXGP3F67KvKwVnhaYn6kcioxXNVowYT` (SDK ephemeral test queue) | `pnpm localnet` |
-| devnet | `https://api.devnet.solana.com` | the MagicBlock rollup you bootstrap against | `5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc` (SDK `DEFAULT_EPHEMERAL_QUEUE`) | `pnpm deploy:devnet --er-url <rollup>` |
-| mainnet | your mainnet RPC (default `https://api.mainnet-beta.solana.com`) | the MagicBlock rollup you bootstrap against | `5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc` | `pnpm deploy:mainnet --confirm-mainnet --er-url <rollup>` |
+| devnet | `https://api.devnet.solana.com` | the MagicBlock rollup you bootstrap against | `5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc` (SDK `DEFAULT_EPHEMERAL_QUEUE`) | `pnpm deploy:devnet --er-url <rollup> --validator <identity>` |
+| mainnet | your mainnet RPC (default `https://api.mainnet-beta.solana.com`) | the MagicBlock rollup you bootstrap against | `5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc` | `pnpm deploy:mainnet --confirm-mainnet --er-url <rollup> --validator <identity>` |
 
 `lock_army` runs in the rollup, so every queue is an ephemeral one, whose oracle calls back into the rollup. The rollup must be the one serving the validator that `initialize` pins in Config: every delegation names that validator and nothing changes it. A production build has no rollup default and must set `VITE_ER_RPC_URL` (see [Client and dev mode](client.md)).
 
@@ -64,10 +64,11 @@ It does not create standard behaviors: behaviors live in the rollup and a Player
 `scripts/deploy.mjs <devnet|mainnet>` deploys or upgrades the program, then bootstraps:
 
 1. Mainnet requires `--confirm-mainnet`.
-2. The program keypair `target/deploy/horizon_zero-keypair.json` must be `Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c`, the `declare_id!`. Keep that file; without it the program cannot be upgraded at the same address.
-3. `cargo-build-sbf` with default features, unless `--skip-build`. `inline-mock-vrf` and `inline-mock-magic` never reach a real cluster.
-4. `solana program deploy` with `--keypair` (default `~/.config/solana/id.json`) as payer and upgrade authority, and `--with-compute-unit-price` when `--priority` is given.
-5. The bootstrap above with `--er-url` (required unless `--skip-bootstrap`) and `--validator` when given, unless `--skip-bootstrap`. The first bootstrap pins that rollup's validator in Config for good.
+2. Unless `--skip-bootstrap`, `--er-url <rollup rpc>` and `--validator <identity>` are required. Before anything is built or any SOL is spent, the script calls `getIdentity` on `--er-url`, prints it, and stops unless `--validator` equals it: the first bootstrap pins that validator in Config for good.
+3. The program keypair `target/deploy/horizon_zero-keypair.json` must be `Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c`, the `declare_id!`. Keep that file; without it the program cannot be upgraded at the same address.
+4. `cargo-build-sbf` with default features, unless `--skip-build`. `inline-mock-vrf` and `inline-mock-magic` never reach a real cluster.
+5. `solana program deploy` with `--keypair` (default `~/.config/solana/id.json`) as payer and upgrade authority, and `--with-compute-unit-price` when `--priority` is given.
+6. The bootstrap above with `--er-url` and `--validator`, unless `--skip-bootstrap`.
 
 It ends by printing the build variables for the game (`VITE_DEV_MODE=false`, `VITE_RPC_URL`, `VITE_ER_RPC_URL`, and `VITE_ORACLE_QUEUE` = `5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc`) and the indexer's `SOLANA_RPC_URL`, the same rollup URL. `render.yaml` lists `VITE_RPC_URL` and `VITE_ER_RPC_URL` (set them in the dashboard) and `VITE_ORACLE_QUEUE` for the game service, and `SOLANA_RPC_URL` (the rollup) for the indexer.
 
