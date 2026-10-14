@@ -12,7 +12,7 @@ Job `litesvm` uses Rust `1.97.1`.
 3. `cargo-build-sbf` for `programs/horizon-zero` with `--features inline-mock-vrf,inline-mock-magic`.
 4. `cargo test -p horizon-litesvm-tests -- --test-threads=1`.
 5. `wasm-pack` builds of `crates/combat` (`--features wasm`) into `app/src/combat-node` and `app/src/combat-wasm`.
-6. `pnpm --filter app test` and `pnpm --filter asset-studio test`. The app command runs the combat golden replay and `app/local-ledger.test.mjs`.
+6. `pnpm --filter app test` and `pnpm --filter asset-studio test`. The app command runs the combat golden replay, the codec checks (`app/src/codec.test.mjs`), the SOL amount parser and error reading (`app/src/money.test.mjs`), and `app/local-ledger.test.mjs`.
 
 LiteSVM loads `horizon_zero.so` at `Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c` and `mock_vrf.so` at `Vrf1RNUjXmQGjmQrQLvJHs9SNkvDJEsRVFPkfSQUwGz`. The suite creates its own oracle-queue account, owned by the VRF program id, with 256 zero bytes. That is enough for the ownership check. It is not a MagicBlock queue.
 

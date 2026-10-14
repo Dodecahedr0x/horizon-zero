@@ -54,8 +54,8 @@ export function tourSteps(devMode: boolean): TourStep[] {
     {
       title: "Lock to fight",
       body: devMode
-        ? "Full armies wait here, per battleground. Lock one to queue and stake. Dev mode has a single player, so a locked army waits in the queue; use Simulate on the Army tab to see a fight."
-        : "Full armies wait here, per battleground. Lock one to queue and stake; the battle opens as soon as a foe locks there too. Unlock leaves the queue, and an idle army can be deleted.",
+        ? "Full armies wait here, per battleground. First create your player and fund its budget in the wallet above; the budget must cover one stake. Lock an army to queue and stake. Dev mode has a single player, so a locked army waits in the queue; use Simulate on the Army tab to see a fight."
+        : "Full armies wait here, per battleground. First create your player and fund its budget in the wallet above; the budget must cover one stake. Lock an army to queue and stake; the battle opens as soon as a foe locks there too. Unlock leaves the queue, and an idle army can be deleted.",
       screen: "battle",
       target: "armies",
     },

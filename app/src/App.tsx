@@ -9,7 +9,7 @@ import { armyCost, isFull, matchUnit, MAX_UNITS, randomArmy } from "./armyRules"
 import { Gem, GroundPicker, Select, UnitArt, swatch } from "./ui";
 import { play, setSoundEnabled, soundEnabled } from "./sfx";
 import { tourSteps, Walkthrough, walkthroughSeen } from "./Walkthrough";
-import { AdminPanel, CreatePlayer, explain, WalletPanel } from "./Wallet";
+import { AdminPanel, CreatePlayer, explain, WalletPanel, type Tone } from "./Wallet";
 
 const devMode = import.meta.env.VITE_DEV_MODE === "true";
 const SCREENS = ["battle", "army", "behaviors"] as const;
@@ -141,10 +141,17 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
     await Promise.all([refreshLocked(), refreshPlayer()]);
   }
 
+  // A failed read leaves the Player unknown (not "no Player"), so nothing offers to register again.
   async function refreshPlayer() {
-    const [mine, protocol] = await Promise.all([chain.player(), chain.admin().catch(() => null)]);
-    setPlayer(mine);
-    setConfig(protocol);
+    try {
+      const [mine, protocol] = await Promise.all([chain.player(), chain.admin().catch(() => null)]);
+      setPlayer(mine);
+      setConfig(protocol);
+    } catch (err) {
+      setPlayer(undefined);
+      setConfig(null);
+      throw new Error(`Your player could not be read: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   // Armies locked and waiting in each battleground's queue, from every player.
@@ -154,6 +161,10 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
   }
 
   useEffect(() => {
+    // Another wallet or backend: forget the last one's Player, Config and identity before reading.
+    setOwner("");
+    setPlayer(undefined);
+    setConfig(null);
     if (connected) refresh().catch((err) => setError(err.message));
   }, [connected, chain]);
 
@@ -183,22 +194,37 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
   // A pending or recovered result is not a failure: it reads as a notice, and the page still refreshes.
   function report(err: unknown) {
     const outcome = explain(err);
-    if (outcome.tone === "error") setError(outcome.text);
-    else setNotice(outcome.text);
+    if (outcome.tone === "error") {
+      setNotice("");
+      setError(outcome.text);
+    } else {
+      setNotice(outcome.text);
+    }
     return outcome;
   }
 
-  async function run(action: () => Promise<void>) {
+  /**
+   * Runs one action, then refreshes. Returns how the action ended; a refresh that fails afterwards
+   * does not turn a landed action into a failure.
+   */
+  async function run(action: () => Promise<void>): Promise<Tone> {
     setError("");
     setNotice("");
     setBusy(true);
     try {
-      await action();
-      await refresh();
-      return true;
-    } catch (err) {
-      if (report(err).tone !== "error") await refresh().catch(() => {});
-      return false;
+      let tone: Tone = "success";
+      try {
+        await action();
+      } catch (err) {
+        tone = report(err).tone;
+        if (tone === "error") return tone;
+      }
+      try {
+        await refresh();
+      } catch {
+        setNotice((current) => (current ? `${current} The balances could not be refreshed.` : "Done; the balances could not be refreshed."));
+      }
+      return tone;
     } finally {
       setBusy(false);
     }
@@ -461,7 +487,7 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
 
   const selectedUnit = selected !== null ? draft[selected] : null;
   const canStake = !!player && BigInt(player.budget) >= BigInt(ground.stake);
-  const needsPlayer = player === null ? "Create your player on the Battle tab first" : undefined;
+  const needsPlayer = player === null ? "Create your player on the Battle tab first" : player === undefined ? "Loading your player" : undefined;
 
   return (
     <div className="hz-root shell">
@@ -554,15 +580,15 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
                   const theirs = side === 0 ? item.unitsB : item.unitsA;
                   return (
                     <li key={item.pubkey} className={`log__row log__row--${outcome}`}>
-                      <span className="log__outcome">{OUTCOME_LABEL[outcome]}</span>
+                      <span className="log__outcome">{item.status === 2 ? "Ready to settle" : OUTCOME_LABEL[outcome]}</span>
                       <span className="log__ground">{groundOf(item)?.name || `${item.cols}×${item.rows}`}</span>
                       <span className="log__armies">
                         <span className="log__side">{mine.map((unit, index) => <UnitArt key={index} race={unit.race || 0} kind={unit.kind} />)}</span>
                         <span className="log__vs">vs</span>
                         <span className="log__side">{theirs.map((unit, index) => <UnitArt key={index} race={unit.race || 0} kind={unit.kind} />)}</span>
                       </span>
-                      {outcome === "pending" && !devMode
-                        ? <button type="button" className="hz-button mini" disabled={busy} title="Settles the battle once its seed has landed" onClick={() => run(() => chain.settle(item))}>Settle</button>
+                      {item.status === 2
+                        ? <button type="button" className="hz-button mini" disabled={busy} title="The seed has landed; settle the battle to pay the stakes" onClick={() => run(() => chain.settle(item))}>Settle</button>
                         : <button type="button" className="hz-button mini quiet" disabled={outcome === "pending"} onClick={() => watch(item)}>Watch</button>}
                     </li>
                   );
@@ -571,6 +597,11 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
               </ol>
             </Section>
 
+            {player === undefined && connected && (
+              <Section title="Wallet">
+                <p className="panel__note">Loading your player.</p>
+              </Section>
+            )}
             {player === null && (
               <Section title="Create your player">
                 <CreatePlayer busy={busy} fees={!devMode} onRegister={(lamports) => run(async () => { await chain.register(lamports); setNotice("Your player is ready. Fund your budget to lock an army."); })} />
@@ -610,7 +641,7 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
                       <>
                         {army.status === 1
                           ? <button type="button" className="hz-button" disabled={busy} onClick={() => run(() => chain.unlock(army))}>Unlock</button>
-                          : <button type="button" className="hz-button hz-button--primary" disabled={busy || army.status !== 0 || !canStake} title={!player ? "Create your player first" : !canStake ? "Your budget must cover one stake" : undefined} onClick={() => lock(army)}><span className="hz-diamond hz-diamond--ember" />Lock · {ground.stake / 1e9} SOL</button>}
+                          : <button type="button" className="hz-button hz-button--primary" disabled={busy || army.status !== 0 || !canStake} title={needsPlayer ?? (!canStake ? "Your budget must cover one stake" : undefined)} onClick={() => lock(army)}><span className="hz-diamond hz-diamond--ember" />Lock · {ground.stake / 1e9} SOL</button>}
                         {deleteControls(army)}
                       </>
                     )}
@@ -771,8 +802,8 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
               elements={draftElements}
               disabledReason={needsPlayer}
               onChange={setDraftElements}
-              onCreate={() => run(() => chain.createBehavior(draftElements)).then((ok) => {
-                if (!ok) return;
+              onCreate={() => run(() => chain.createBehavior(draftElements)).then((tone) => {
+                if (tone !== "success") return;
                 setForging(false);
                 setNotice("The behavior is forged.");
               })}

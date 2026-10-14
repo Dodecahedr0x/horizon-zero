@@ -589,14 +589,16 @@ button, input, select { font: inherit; color: inherit; }
 .pot__figures strong { font-size: 22px; font-variant-numeric: tabular-nums; }
 .pot__figures small { color: var(--muted); }
 .pot__controls { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; }
-.pot__amount { display: grid; gap: 6px; flex: 1 1 160px; min-width: 0; }
-.pot__amount input { min-height: 44px; padding: 6px 12px; border: 1px solid var(--line-2); background: var(--soot); color: inherit; font: inherit; font-variant-numeric: tabular-nums; }
+.pot__amount { display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; flex: 1 1 160px; min-width: 0; }
+.pot__amount input { box-sizing: border-box; width: 100%; min-width: 0; min-height: 44px; padding: 6px 12px; border: 1px solid var(--line-2); background: var(--soot); color: inherit; font: inherit; font-variant-numeric: tabular-nums; }
 .pot__amount input:focus-visible { outline: 2px solid var(--ember-hot); outline-offset: 2px; }
 .pot__amount input:disabled { opacity: 0.5; }
 .pot__amount input[aria-invalid="true"] { border-color: rgba(224, 88, 74, 0.6); }
 .wallet-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
 .wallet-action { display: grid; gap: 8px; align-content: start; min-width: 0; }
 .wallet-action .panel__note { font-size: 13px; }
+.pot__controls > .hz-button { flex: none; }
+.wallet-action__notes { display: grid; gap: 8px; }
 .wallet-action__hint { margin: 0; color: #ffc7bf; font-size: 13px; }
 .wallet-pending { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; color: var(--ember-hot); font-size: 14px; font-weight: 500; }
 
