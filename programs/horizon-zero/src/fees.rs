@@ -20,7 +20,11 @@ const _: () = assert!(MAX_FEE_BPS <= 5_000);
 pub fn win_payout(stake: u64, fee_bps: u16) -> WinPayout {
     let pot = stake as u128 * 2;
     let fee = (pot * fee_bps.min(MAX_FEE_BPS) as u128 / 10_000) as u64;
-    WinPayout { fee, to_winner: stake - fee, credit: (pot - fee as u128) as u64 }
+    // The cap keeps `fee <= stake`, so `pot - fee >= stake` and `pot - fee <= 2 * stake`. That
+    // fits a u64 for every stake a Player can hold, which is far under `u64::MAX / 2`.
+    let credit = pot - fee as u128;
+    debug_assert!(credit <= u64::MAX as u128);
+    WinPayout { fee, to_winner: stake - fee, credit: credit as u64 }
 }
 
 #[cfg(test)]
@@ -49,8 +53,10 @@ mod tests {
 
     #[test]
     fn the_cap_never_takes_more_than_the_loser_stake() {
-        let payout = win_payout(u64::MAX / 2, MAX_FEE_BPS);
-        assert!(payout.fee <= u64::MAX / 2);
-        assert_eq!(payout.to_winner + payout.fee, u64::MAX / 2);
+        let stake = u64::MAX / 2;
+        let payout = win_payout(stake, MAX_FEE_BPS);
+        assert!(payout.fee <= stake);
+        assert_eq!(payout.to_winner + payout.fee, stake);
+        assert_eq!(payout.credit as u128, 2 * stake as u128 - payout.fee as u128);
     }
 }

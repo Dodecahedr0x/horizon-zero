@@ -1,6 +1,8 @@
 use anchor_lang::prelude::*;
 use horizon_combat::MAX_BEHAVIOR_LEN;
 
+use crate::error::HorizonError;
+
 pub const MAX_UNITS: usize = 10;
 pub const MAX_QUEUE: usize = 16;
 
@@ -25,7 +27,8 @@ pub enum BattleStatus {
     /// Waiting for the VRF callback.
     #[default]
     Awaiting = 0,
-    /// Settled and paid out.
+    /// Never stored: `settle_match` closes the battle, and the outcome is only in its
+    /// `HZ_MATCH_RESOLVED` log. Kept so the other ids stay put.
     Resolved = 1,
     /// The VRF seed is stored; anyone may settle.
     Seeded = 2,
@@ -102,17 +105,20 @@ pub struct Player {
 
 impl Player {
     /// Adds a payout to the balance `segregate` picks.
-    pub fn credit(&mut self, lamports: u64) {
-        if self.segregate {
-            self.winnings += lamports;
-        } else {
-            self.budget += lamports;
-        }
+    pub fn credit(&mut self, lamports: u64) -> Result<()> {
+        let balance = if self.segregate { &mut self.winnings } else { &mut self.budget };
+        *balance = balance.checked_add(lamports).ok_or(HorizonError::BalanceShort)?;
+        Ok(())
     }
 
-    /// Lamports the counters do not claim: `lamports - rent - budget - winnings - locked`.
-    pub fn free(&self, lamports: u64, rent: u64) -> u64 {
-        lamports.saturating_sub(rent).saturating_sub(self.budget + self.winnings + self.locked)
+    /// Lamports the counters do not claim: `lamports - rent - budget - winnings - locked`, or 0.
+    pub fn free(&self, lamports: u64, rent: u64) -> Result<u64> {
+        let claimed = self
+            .budget
+            .checked_add(self.winnings)
+            .and_then(|sum| sum.checked_add(self.locked))
+            .ok_or(HorizonError::BalanceShort)?;
+        Ok(lamports.saturating_sub(rent).saturating_sub(claimed))
     }
 }
 
@@ -231,6 +237,7 @@ pub struct Battle {
     pub battleground: Pubkey,
     pub army_a: Pubkey,
     pub army_b: Pubkey,
+    /// The owners' wallets. Their Players are `[b"player", wallet]`.
     pub player_a: Pubkey,
     pub player_b: Pubkey,
     pub stake: u64,
@@ -243,6 +250,8 @@ pub struct Battle {
     pub units_b: [SnapshotUnit; MAX_UNITS],
     pub status: BattleStatus,
     pub seed: [u8; 32],
+    /// Never written past `Pending`: kept for layout stability. `settle_match` closes the battle,
+    /// and the outcome is only in its `HZ_MATCH_RESOLVED` log.
     pub outcome: Outcome,
     pub race_a: u8,
     pub race_b: u8,
@@ -319,7 +328,9 @@ mod layout_tests {
             fighting: 1,
             bump: 0,
         };
-        assert_eq!(player.free(100, 20), 35);
-        assert_eq!(player.free(40, 20), 0);
+        assert_eq!(player.free(100, 20).unwrap(), 35);
+        assert_eq!(player.free(40, 20).unwrap(), 0);
+        let corrupt = Player { budget: u64::MAX, ..player };
+        assert!(corrupt.free(100, 20).is_err(), "an overflowing claim is an error, not a wrap");
     }
 }

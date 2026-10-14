@@ -54,6 +54,7 @@ stateDiagram-v2
   [*] --> Idle: create_army
   Idle --> Queued: lock_army with no opponent (budget covers one stake)
   Queued --> Idle: unlock_army
+  Queued --> Idle: evicted by a lock_army that sees its owner's budget under one stake
   Queued --> Fighting: chosen as opponent
   Idle --> Fighting: lock_army finds an opponent
   Fighting --> Idle: settle_match
@@ -253,7 +254,7 @@ Accounts: owner signer writable, player init `[b"player", owner]`, outbox init `
 
 Creates the wallet's Player and Outbox, both paid by the owner, then transfers `deposit` from the owner into the Player, where it is free lamports. A second call fails because the accounts exist.
 
-Log: `HZ_PLAYER <player> <owner> <budget> <winnings> <locked> <segregate> <fighting>`, also sent by every instruction below that changes a Player, and by `lock_army` and `settle_match` for both Players.
+Log: `HZ_PLAYER <player> <owner> <budget> <winnings> <locked> <segregate> <fighting>`. `fund_budget` and `set_segregation` send it too, and `lock_army` (when a match opens) and `settle_match` send it for both Players. The instructions that only pay ephemeral rent from a Player (`create_behavior`, `create_army`, `close_army`) do not.
 
 ### `fund_budget(amount: u64)`
 
@@ -322,7 +323,13 @@ The player must own the army. The army must belong to this battleground, be Idle
 
 The player's Player must have a `budget` of at least `stake_lamports` (`BudgetTooLow`), whether the army queues or matches.
 
-Candidates are queue entries whose account was passed, whose status is Queued, whose owner is not the player, and whose owner's Player was passed with a `budget` of at least `stake_lamports`. A passed account counts as a Player when this program owns it, it is 68 bytes, and it deserializes as `Player`; Players exist only at their PDA, so no derivation is needed. A player therefore queues behind their own waiting armies instead of matching them, and an army whose owner's budget ran dry is skipped.
+A passed account counts as a Player when this program owns it, it is 68 bytes, it deserializes as `Player`, and its address is `[b"player", owner]` with its stored bump. The program then looks at each queue entry whose account was passed, whose status is Queued, and whose owner is not the player. A player therefore queues behind their own waiting armies instead of matching them.
+
+- If the entry's owner's Player was passed with a `budget` of at least `stake_lamports`, the entry is a candidate.
+- If the owner's Player was passed with less, the entry is evicted: it leaves the queue and becomes Idle, and the instruction logs `HZ_EVICT <army>`. Such an army could never be met, and left in place it would hold one of the 16 queue slots for good. Its owner can lock it again once the budget covers a stake.
+- If the owner's Player was not passed, the entry is skipped and stays queued. Only a passed, authentic Player is evidence for an eviction.
+
+Evictions happen before the army is queued or the match opens, whichever follows.
 
 When the candidate list is empty the instruction appends the army to the battleground queue and sets Queued. No lamports move and no counter changes. Log: `HZ_QUEUED <army> <battleground>`.
 
@@ -358,7 +365,7 @@ Log: `HZ_MATCH_SEEDED <battle> <seed hex>`.
 
 Permissionless. No instruction arguments. Accounts, in order: battle, army A, army B, player A's Player, player B's Player, config (all writable), vault (writable), magic program.
 
-The battle account is read by hand, because the instruction closes it. It must be owned by this program and hold data, and its status must be Seeded; otherwise the instruction fails with `AlreadyResolved`, which is also what a second settlement gets. Its address must be `[b"match", battleground, seq]` with the stored bump. Each army must be the battle's, and each Player must be `[b"player", player_a]` and `[b"player", player_b]` with its stored bump (`BadPda` otherwise). Both armies must be Fighting.
+The battle account is read by hand, because the instruction closes it. An account with no data fails with `AlreadyResolved`, which is what a second settlement gets, since the first one closed the battle. An account this program does not own fails with `BadPda`. An Awaiting battle fails with `NotSeeded`, and any status other than Seeded with `AlreadyResolved`. Its address must be `[b"match", battleground, seq]` with the stored bump. Each army must be the battle's, and each Player must be `[b"player", player_a]` and `[b"player", player_b]` with its stored bump (`BadPda` otherwise). Both armies must be Fighting.
 
 `simulate` runs on the stored snapshots, the stored seed, and the stored `cols` and `rows`. The battle is then closed and its rent goes back to player B's Player, which sponsored it. The close comes before the payout: in the rollup it is a CPI, and the runtime checks at a CPI that lamports moved only between the accounts it is given. With `pot = 2 * stake` and `fee = pot * fee_bps / 10_000` rounded down, using the battle's `fee_bps`:
 
@@ -368,6 +375,6 @@ The battle account is read by hand, because the instruction closes it. It must b
 | B wins (`Some(1)` → outcome 2) | Player A sends `stake - fee` to Player B and `fee` to Config | Player B credits `pot - fee`; `config.fees += fee` |
 | draw (outcome 3) | none | each `budget += stake`; no fee |
 
-A credit goes to `budget`, or to `winnings` when the winner's `segregate` is on. For both Players, `locked -= stake` and `fighting` drops by one. Both armies return to Idle. `programs/horizon-zero/src/fees.rs` (`win_payout`) holds the arithmetic.
+A credit goes to `budget`, or to `winnings` when the winner's `segregate` is on. For both Players, `locked -= stake` and `fighting` drops by one. Every counter change is checked: an overflow fails with `BalanceShort`, and a `locked` or `fighting` that would go below zero fails with `NoStake`. Both armies return to Idle. `programs/horizon-zero/src/fees.rs` (`win_payout`) holds the arithmetic.
 
 Log: `HZ_MATCH_RESOLVED <battle> <outcome> <fee> <seed hex> <player_b>`. The outcome byte is the `Outcome` id. `player_b` is the locker's wallet, whose Player got the battle rent back.

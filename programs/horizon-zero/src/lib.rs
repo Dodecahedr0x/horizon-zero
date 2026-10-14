@@ -102,11 +102,9 @@ pub mod horizon_zero {
 
     /// Moves `amount` of the Player's free lamports into its budget. No lamports move.
     pub fn fund_budget(ctx: Context<OwnPlayer>, amount: u64) -> Result<()> {
-        let info = ctx.accounts.player.to_account_info();
-        let rent = Rent::get()?.minimum_balance(info.data_len());
+        require!(amount <= free_lamports(&ctx.accounts.player)?, HorizonError::BalanceShort);
         let player = &mut ctx.accounts.player;
-        require!(amount <= player.free(info.lamports(), rent), HorizonError::BalanceShort);
-        player.budget += amount;
+        player.budget = player.budget.checked_add(amount).ok_or(HorizonError::BalanceShort)?;
         log_player(&player.key(), player);
         Ok(())
     }
@@ -131,7 +129,7 @@ pub mod horizon_zero {
             &ctx.accounts.player,
             &info,
             &[b"behavior", &hash, &[bump]],
-            &ctx.accounts.vault,
+            &ctx.accounts.ephemeral.vault,
             8 + Behavior::INIT_SPACE,
         )?;
         let mut stored = [0u8; MAX_BEHAVIOR_LEN];
@@ -161,7 +159,7 @@ pub mod horizon_zero {
             &ctx.accounts.player,
             &info,
             &[b"army", owner.as_ref(), &index_bytes, &[bump]],
-            &ctx.accounts.vault,
+            &ctx.accounts.ephemeral.vault,
             8 + Army::INIT_SPACE,
         )?;
         let mut army = Box::new(Army {
@@ -213,7 +211,7 @@ pub mod horizon_zero {
             &player.to_account_info(),
             &[b"player", owner.as_ref(), &[player.bump]],
             &info,
-            &ctx.accounts.vault,
+            &ctx.accounts.ephemeral.vault,
         )?;
         msg!("HZ_ARMY_CLOSE {}", info.key());
         Ok(())
@@ -240,7 +238,11 @@ pub mod horizon_zero {
 
         let stake = ctx.accounts.battleground.stake_lamports;
         require!(ctx.accounts.player_account.budget >= stake, HorizonError::BudgetTooLow);
-        let candidates = queued_opponents(&ctx.accounts.battleground, player, stake, ctx.remaining_accounts)?;
+        let QueueScan { found: candidates, evict: evicted } =
+            queued_opponents(&ctx.accounts.battleground, player, stake, ctx.remaining_accounts)?;
+        for key in &evicted {
+            evict(&mut ctx.accounts.battleground, ctx.remaining_accounts, key)?;
+        }
         if candidates.is_empty() {
             let army_key = ctx.accounts.army.key();
             ctx.accounts.battleground.enqueue(army_key)?;
@@ -286,9 +288,11 @@ pub mod horizon_zero {
         let info = ctx.accounts.battle.to_account_info();
         let battle_key = info.key();
         // A settled battle is closed, so a second settlement finds no battle.
-        require!(*info.owner == ID && !info.data_is_empty(), HorizonError::AlreadyResolved);
+        require!(!info.data_is_empty(), HorizonError::AlreadyResolved);
+        require_keys_eq!(*info.owner, ID, HorizonError::BadPda);
         let battle = read_battle(&info.try_borrow_data()?)?;
         let (head, tail) = (&battle.head, &battle.tail);
+        require!(tail.status != BattleStatus::Awaiting, HorizonError::NotSeeded);
         require!(tail.status == BattleStatus::Seeded, HorizonError::AlreadyResolved);
         battle_seeds(&head.battleground, head.seq, tail.bump, &battle_key)?;
         require_keys_eq!(ctx.accounts.army_a.key(), head.army_a, HorizonError::BadPda);
@@ -313,7 +317,12 @@ pub mod horizon_zero {
         // moved only between the accounts it is given.
         let sponsor = ctx.accounts.player_b.to_account_info();
         let sponsor_bump = [ctx.accounts.player_b.bump];
-        eph::close(&sponsor, &[b"player", head.player_b.as_ref(), &sponsor_bump], &info, &ctx.accounts.vault)?;
+        eph::close(
+            &sponsor,
+            &[b"player", head.player_b.as_ref(), &sponsor_bump],
+            &info,
+            &ctx.accounts.ephemeral.vault,
+        )?;
 
         let stake = head.stake;
         let (outcome, fee) = match winner {
@@ -325,19 +334,21 @@ pub mod horizon_zero {
                 };
                 move_lamports(&loser.to_account_info(), &winner.to_account_info(), payout.to_winner)?;
                 move_lamports(&loser.to_account_info(), &ctx.accounts.config.to_account_info(), payout.fee)?;
-                winner.credit(payout.credit);
+                winner.credit(payout.credit)?;
                 (if side == Side::A { Outcome::A } else { Outcome::B }, payout.fee)
             }
             None => {
-                ctx.accounts.player_a.budget += stake;
-                ctx.accounts.player_b.budget += stake;
+                for player in [&mut ctx.accounts.player_a, &mut ctx.accounts.player_b] {
+                    player.budget = player.budget.checked_add(stake).ok_or(HorizonError::BalanceShort)?;
+                }
                 (Outcome::Draw, 0)
             }
         };
-        ctx.accounts.config.fees += fee;
+        let config = &mut ctx.accounts.config;
+        config.fees = config.fees.checked_add(fee).ok_or(HorizonError::BalanceShort)?;
         for player in [&mut ctx.accounts.player_a, &mut ctx.accounts.player_b] {
             player.locked = player.locked.checked_sub(stake).ok_or(HorizonError::NoStake)?;
-            player.fighting = player.fighting.saturating_sub(1);
+            player.fighting = player.fighting.checked_sub(1).ok_or(HorizonError::NoStake)?;
             log_player(&player.key(), player);
         }
         ctx.accounts.army_a.status = ArmyStatus::Idle;
@@ -406,6 +417,12 @@ fn read_battle(data: &[u8]) -> Result<SettledBattle> {
     Ok(SettledBattle { head, units_a, units_b, tail })
 }
 
+/// The Player's lamports above its rent that no counter claims.
+fn free_lamports(player: &Account<Player>) -> Result<u64> {
+    let info = player.to_account_info();
+    player.free(info.lamports(), Rent::get()?.minimum_balance(info.data_len()))
+}
+
 /// Creates an ephemeral account sponsored by `player`, after checking its free lamports cover the
 /// rent so a stake or a payout is never spent on storage.
 fn create_sponsored<'info>(
@@ -415,9 +432,8 @@ fn create_sponsored<'info>(
     vault: &AccountInfo<'info>,
     space: usize,
 ) -> Result<()> {
+    require!(free_lamports(player)? >= eph::rent(space)?, HorizonError::RentShort);
     let info = player.to_account_info();
-    let rent = Rent::get()?.minimum_balance(info.data_len());
-    require!(player.free(info.lamports(), rent) >= eph::rent(space)?, HorizonError::RentShort);
     let bump = [player.bump];
     eph::create(&info, &[b"player", player.owner.as_ref(), &bump], account, account_seeds, vault, space)
 }
@@ -459,7 +475,7 @@ fn open_matched<'info>(
         &ctx.accounts.player_account,
         &ctx.accounts.battle.to_account_info(),
         &[b"match", ground.as_ref(), &seq_bytes, &[battle_bump]],
-        &ctx.accounts.vault,
+        &ctx.accounts.ephemeral.vault,
         8 + Battle::INIT_SPACE,
     )?;
 
@@ -491,8 +507,8 @@ fn open_matched<'info>(
     }
     // Stakes stay on the Players until settlement; only the counters move.
     for account in [&mut **ctx.accounts.player_account, &mut opponent_state] {
-        account.budget -= stake;
-        account.locked += stake;
+        account.budget = account.budget.checked_sub(stake).ok_or(HorizonError::BudgetTooLow)?;
+        account.locked = account.locked.checked_add(stake).ok_or(HorizonError::BalanceShort)?;
         account.fighting = account.fighting.checked_add(1).ok_or(HorizonError::PlayerBusy)?;
     }
     opponent_state.try_serialize(&mut opponent_player.try_borrow_mut_data()?.as_mut())?;
@@ -614,38 +630,62 @@ fn recheck_behaviors(army: &Army, accounts: &[AccountInfo]) -> Result<()> {
     Ok(())
 }
 
-/// The queued armies a locker may meet, each with the index of its owner's Player in `accounts`. An
-/// army whose owner's Player was not passed, or no longer covers the stake, is skipped.
+/// What `queued_opponents` found in the battleground queue.
+struct QueueScan {
+    /// Armies a locker may meet, each with the index of its owner's Player in the accounts.
+    found: Vec<(Pubkey, usize)>,
+    /// Armies whose owner's Player was passed and no longer covers the stake.
+    evict: Vec<Pubkey>,
+}
+
+/// The queued armies a locker may meet, each with the index of its owner's Player in `accounts`,
+/// and the queued armies to evict: their owner's Player was passed and no longer covers the stake.
+/// An army whose owner's Player was not passed is neither, so it stays queued.
 fn queued_opponents(
     ground: &Account<Battleground>,
     player: Pubkey,
     stake: u64,
     accounts: &[AccountInfo],
-) -> Result<Vec<(Pubkey, usize)>> {
-    // Every Player is a program account at its PDA, so a program-owned `Player` is genuine.
+) -> Result<QueueScan> {
+    // (owner, index, budget) of each authentic Player passed: program-owned, Player-sized, a
+    // `Player`, and at `[b"player", owner]` with its stored bump.
     let mut players = Vec::new();
     for (at, account) in accounts.iter().enumerate() {
         if account.owner == &ID && account.data_len() == 8 + Player::INIT_SPACE {
             if let Ok(state) = Player::try_deserialize(&mut &account.try_borrow_data()?[..]) {
-                if state.budget >= stake {
-                    players.push((state.owner, at));
+                if verify_pda(&[b"player", state.owner.as_ref()], account.key, state.bump).is_ok() {
+                    players.push((state.owner, at, state.budget));
                 }
             }
         }
     }
-    let mut found = Vec::new();
+    let (mut found, mut evict) = (Vec::new(), Vec::new());
     for key in ground.queue[..ground.queue_len as usize].iter() {
         if let Some(account) = accounts.iter().find(|account| account.key == key) {
             let army = Army::try_deserialize(&mut &account.try_borrow_data()?[..])?;
             if army.owner == player || army.status != ArmyStatus::Queued {
                 continue;
             }
-            if let Some(&(_, at)) = players.iter().find(|(owner, _)| *owner == army.owner) {
-                found.push((*key, at));
+            match players.iter().find(|(owner, _, _)| *owner == army.owner) {
+                Some(&(_, at, budget)) if budget >= stake => found.push((*key, at)),
+                Some(_) => evict.push(*key),
+                None => {}
             }
         }
     }
-    Ok(found)
+    Ok(QueueScan { found, evict })
+}
+
+/// Takes a queued army out of the queue and sets it Idle: its owner's budget no longer covers a
+/// stake, so no locker could meet it, and left there it would hold a queue slot forever.
+fn evict(ground: &mut Battleground, accounts: &[AccountInfo], key: &Pubkey) -> Result<()> {
+    let account = accounts.iter().find(|account| account.key == key).ok_or(HorizonError::MissingAccount)?;
+    let mut army = Box::new(Army::try_deserialize(&mut &account.try_borrow_data()?[..])?);
+    army.status = ArmyStatus::Idle;
+    army.try_serialize(&mut account.try_borrow_mut_data()?.as_mut())?;
+    ground.remove(key);
+    msg!("HZ_EVICT {}", key);
+    Ok(())
 }
 
 /// The fields of a new battle that do not come from the two armies.
@@ -807,7 +847,7 @@ fn transfer_sol<'info>(from: &Signer<'info>, to: &AccountInfo<'info>, lamports: 
 }
 
 pub(crate) fn move_lamports(from: &AccountInfo, to: &AccountInfo, lamports: u64) -> Result<()> {
-    require!(from.lamports() >= lamports, HorizonError::NoStake);
+    require!(from.lamports() >= lamports, HorizonError::BalanceShort);
     **from.try_borrow_mut_lamports()? -= lamports;
     **to.try_borrow_mut_lamports()? += lamports;
     Ok(())
@@ -901,6 +941,18 @@ fn behavior_bytes(behavior: &Behavior) -> Result<&[u8]> {
     Ok(bytes)
 }
 
+/// What creating or closing an ephemeral account needs besides the sponsor and the account.
+#[derive(Accounts)]
+pub struct EphAccounts<'info> {
+    /// CHECK: the ephemeral rent vault
+    #[cfg_attr(not(feature = "inline-mock-magic"), account(mut, address = EPH_VAULT))]
+    #[cfg_attr(feature = "inline-mock-magic", account(mut))]
+    pub vault: UncheckedAccount<'info>,
+    /// CHECK: the magic program, which creates and closes ephemeral accounts
+    #[cfg_attr(not(feature = "inline-mock-magic"), account(address = MAGIC_PROGRAM))]
+    pub magic_program: UncheckedAccount<'info>,
+}
+
 #[derive(Accounts)]
 pub struct CreateBehavior<'info> {
     pub creator: Signer<'info>,
@@ -910,13 +962,7 @@ pub struct CreateBehavior<'info> {
     /// CHECK: the behavior PDA, created here as an ephemeral account
     #[account(mut)]
     pub behavior: UncheckedAccount<'info>,
-    /// CHECK: the ephemeral rent vault
-    #[cfg_attr(not(feature = "inline-mock-magic"), account(mut, address = EPH_VAULT))]
-    #[cfg_attr(feature = "inline-mock-magic", account(mut))]
-    pub vault: UncheckedAccount<'info>,
-    /// CHECK: the magic program, which creates ephemeral accounts
-    #[cfg_attr(not(feature = "inline-mock-magic"), account(address = MAGIC_PROGRAM))]
-    pub magic_program: UncheckedAccount<'info>,
+    pub ephemeral: EphAccounts<'info>,
     pub system_program: Program<'info, System>,
 }
 
@@ -930,13 +976,7 @@ pub struct CreateArmy<'info> {
     /// CHECK: the army PDA, created here as an ephemeral account
     #[account(mut)]
     pub army: UncheckedAccount<'info>,
-    /// CHECK: the ephemeral rent vault
-    #[cfg_attr(not(feature = "inline-mock-magic"), account(mut, address = EPH_VAULT))]
-    #[cfg_attr(feature = "inline-mock-magic", account(mut))]
-    pub vault: UncheckedAccount<'info>,
-    /// CHECK: the magic program, which creates ephemeral accounts
-    #[cfg_attr(not(feature = "inline-mock-magic"), account(address = MAGIC_PROGRAM))]
-    pub magic_program: UncheckedAccount<'info>,
+    pub ephemeral: EphAccounts<'info>,
     pub system_program: Program<'info, System>,
 }
 
@@ -957,13 +997,7 @@ pub struct CloseArmy<'info> {
     /// CHECK: closed here, so read by hand: owner, status and address are checked in the handler
     #[account(mut)]
     pub army: UncheckedAccount<'info>,
-    /// CHECK: the ephemeral rent vault
-    #[cfg_attr(not(feature = "inline-mock-magic"), account(mut, address = EPH_VAULT))]
-    #[cfg_attr(feature = "inline-mock-magic", account(mut))]
-    pub vault: UncheckedAccount<'info>,
-    /// CHECK: the magic program, which closes ephemeral accounts
-    #[cfg_attr(not(feature = "inline-mock-magic"), account(address = MAGIC_PROGRAM))]
-    pub magic_program: UncheckedAccount<'info>,
+    pub ephemeral: EphAccounts<'info>,
 }
 
 #[vrf]
@@ -984,13 +1018,7 @@ pub struct LockArmy<'info> {
     /// CHECK: created when two armies match
     #[account(mut)]
     pub battle: UncheckedAccount<'info>,
-    /// CHECK: the ephemeral rent vault
-    #[cfg_attr(not(feature = "inline-mock-magic"), account(mut, address = EPH_VAULT))]
-    #[cfg_attr(feature = "inline-mock-magic", account(mut))]
-    pub vault: UncheckedAccount<'info>,
-    /// CHECK: the magic program, which creates ephemeral accounts
-    #[cfg_attr(not(feature = "inline-mock-magic"), account(address = MAGIC_PROGRAM))]
-    pub magic_program: UncheckedAccount<'info>,
+    pub ephemeral: EphAccounts<'info>,
     /// CHECK: oracle queue owned by the VRF program
     #[account(mut)]
     pub oracle_queue: UncheckedAccount<'info>,
@@ -1031,13 +1059,7 @@ pub struct SettleMatch<'info> {
     /// Receives the fee.
     #[account(mut, seeds = [b"config"], bump = config.bump)]
     pub config: Box<Account<'info, Config>>,
-    /// CHECK: the ephemeral rent vault
-    #[cfg_attr(not(feature = "inline-mock-magic"), account(mut, address = EPH_VAULT))]
-    #[cfg_attr(feature = "inline-mock-magic", account(mut))]
-    pub vault: UncheckedAccount<'info>,
-    /// CHECK: the magic program, which closes ephemeral accounts
-    #[cfg_attr(not(feature = "inline-mock-magic"), account(address = MAGIC_PROGRAM))]
-    pub magic_program: UncheckedAccount<'info>,
+    pub ephemeral: EphAccounts<'info>,
 }
 
 /// Compute left in this transaction (profiling builds only).
@@ -1056,4 +1078,175 @@ fn log_program_overhead(units: u64) {
         fn sol_log_64_(a: u64, b: u64, c: u64, d: u64, e: u64);
     }
     unsafe { sol_log_64_(0xC0FFEE, 9, units, 1, 0) }
+}
+
+#[cfg(test)]
+mod battle_layout_tests {
+    use super::*;
+
+    fn unit(seed: u8) -> SnapshotUnit {
+        let mut body = [0u8; MAX_BEHAVIOR_LEN];
+        body.iter_mut().enumerate().for_each(|(at, byte)| *byte = seed.wrapping_add(at as u8));
+        SnapshotUnit {
+            kind: seed,
+            len: seed % 77,
+            body,
+            col: seed.wrapping_add(1),
+            row: seed.wrapping_add(2),
+            cost: 1000 + seed as u16,
+            hp: seed.wrapping_add(3),
+            atk: seed.wrapping_add(4),
+            range: seed.wrapping_add(5),
+            speed: seed.wrapping_add(6),
+            cast: CastParams {
+                damage: seed.wrapping_add(7),
+                range: seed.wrapping_add(8),
+                aoe: seed.wrapping_add(9),
+                effect: seed.wrapping_add(10),
+                aim: seed.wrapping_add(11),
+                power: seed.wrapping_add(12),
+                rounds: seed.wrapping_add(13),
+                cooldown: seed.wrapping_add(14),
+            },
+            actions: seed.wrapping_add(15),
+        }
+    }
+
+    fn bytes(value: &impl AnchorSerialize) -> Vec<u8> {
+        let mut out = Vec::new();
+        value.serialize(&mut out).unwrap();
+        out
+    }
+
+    fn army(seed: u8, count: u8) -> Army {
+        let mut units = [ArmyUnit::default(); MAX_UNITS];
+        for (at, slot) in units.iter_mut().enumerate().take(count as usize) {
+            let from = unit(seed.wrapping_add(at as u8 * 16));
+            *slot = ArmyUnit {
+                kind: from.kind,
+                behavior: Pubkey::new_unique(),
+                len: from.len,
+                body: from.body,
+                col: from.col,
+                row: from.row,
+                cost: from.cost,
+                hp: from.hp,
+                atk: from.atk,
+                range: from.range,
+                speed: from.speed,
+                cast: from.cast,
+                actions: from.actions,
+            };
+        }
+        Army {
+            owner: Pubkey::new_unique(),
+            battleground: Pubkey::new_unique(),
+            race: seed % 3,
+            index: seed as u32,
+            unit_count: count,
+            units,
+            status: ArmyStatus::Queued,
+            bump: seed,
+        }
+    }
+
+    #[test]
+    fn read_battle_mirrors_the_battle_layout() {
+        let mut units_a = [SnapshotUnit::default(); MAX_UNITS];
+        let mut units_b = [SnapshotUnit::default(); MAX_UNITS];
+        (0..4).for_each(|at| units_a[at] = unit(at as u8 * 20));
+        (0..7).for_each(|at| units_b[at] = unit(100 + at as u8 * 9));
+        let battle = Box::new(Battle {
+            battleground: Pubkey::new_unique(),
+            army_a: Pubkey::new_unique(),
+            army_b: Pubkey::new_unique(),
+            player_a: Pubkey::new_unique(),
+            player_b: Pubkey::new_unique(),
+            stake: 123_456_789,
+            seq: 42,
+            count_a: 4,
+            count_b: 7,
+            cols: 10,
+            rows: 8,
+            units_a,
+            units_b,
+            status: BattleStatus::Seeded,
+            seed: [9; 32],
+            outcome: Outcome::Pending,
+            race_a: 1,
+            race_b: 2,
+            fee_bps: 777,
+            bump: 253,
+        });
+        let mut data = Vec::new();
+        battle.try_serialize(&mut data).unwrap();
+        assert_eq!(data.len(), 8 + Battle::INIT_SPACE);
+
+        let read = read_battle(&data).unwrap();
+        let (head, tail) = (&read.head, &read.tail);
+        assert_eq!(
+            (head.battleground, head.army_a, head.army_b, head.player_a, head.player_b),
+            (battle.battleground, battle.army_a, battle.army_b, battle.player_a, battle.player_b)
+        );
+        assert_eq!(
+            (head.stake, head.seq, head.count_a, head.count_b, head.cols, head.rows),
+            (123_456_789, 42, 4, 7, 10, 8)
+        );
+        assert_eq!(read.units_a.len(), 4);
+        assert_eq!(read.units_b.len(), 7);
+        read.units_a.iter().zip(&battle.units_a).for_each(|(got, want)| assert_eq!(bytes(got), bytes(want)));
+        read.units_b.iter().zip(&battle.units_b).for_each(|(got, want)| assert_eq!(bytes(got), bytes(want)));
+        assert_eq!((tail.status, tail.seed, tail.fee_bps, tail.bump), (BattleStatus::Seeded, [9; 32], 777, 253));
+        assert!(read_battle(&data[8..]).is_err(), "a missing discriminator does not read");
+    }
+
+    #[test]
+    fn write_battle_output_deserializes_as_a_battle() {
+        let (army_a, army_b) = (army(3, 4), army(50, 10));
+        let head = BattleHead {
+            battleground: Pubkey::new_unique(),
+            army_a: Pubkey::new_unique(),
+            army_b: Pubkey::new_unique(),
+            player_a: army_a.owner,
+            player_b: army_b.owner,
+            stake: 10_000_000,
+            seq: 7,
+            cols: 12,
+            rows: 10,
+            fee_bps: 500,
+            bump: 250,
+        };
+        let mut data = vec![0u8; 8 + Battle::INIT_SPACE];
+        write_battle(&mut data, &head, &army_a, &army_b).unwrap();
+        let battle = Box::new(Battle::try_deserialize(&mut &data[..]).unwrap());
+        assert_eq!(
+            (battle.battleground, battle.army_a, battle.army_b, battle.player_a, battle.player_b),
+            (head.battleground, head.army_a, head.army_b, head.player_a, head.player_b)
+        );
+        assert_eq!(
+            (battle.stake, battle.seq, battle.count_a, battle.count_b, battle.cols, battle.rows),
+            (10_000_000, 7, 4, 10, 12, 10)
+        );
+        assert_eq!((battle.status, battle.seed, battle.outcome), (BattleStatus::Awaiting, [0; 32], Outcome::Pending));
+        assert_eq!((battle.race_a, battle.race_b, battle.fee_bps, battle.bump), (army_a.race, army_b.race, 500, 250));
+        for (army, units) in [(&army_a, &battle.units_a), (&army_b, &battle.units_b)] {
+            for (at, snapshot) in units.iter().enumerate() {
+                if at < army.unit_count as usize {
+                    let from = &army.units[at];
+                    assert_eq!((snapshot.kind, snapshot.len, snapshot.body), (from.kind, from.len, from.body));
+                    assert_eq!(
+                        (snapshot.col, snapshot.row, snapshot.cost, snapshot.actions),
+                        (from.col, from.row, from.cost, from.actions)
+                    );
+                    assert_eq!(
+                        (snapshot.hp, snapshot.atk, snapshot.range, snapshot.speed),
+                        (from.hp, from.atk, from.range, from.speed)
+                    );
+                    assert_eq!(bytes(&snapshot.cast), bytes(&from.cast));
+                } else {
+                    assert_eq!(bytes(snapshot), bytes(&SnapshotUnit::default()), "unused slot {at} is zero");
+                }
+            }
+        }
+    }
 }

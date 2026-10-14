@@ -12,6 +12,7 @@ sequenceDiagram
   participant Anyone as any wallet
   Locker->>Program: lock_army
   Program->>Program: locker's Player budget >= stake, or BudgetTooLow
+  Program->>Queue: evict each passed queued army whose owner's passed Player budget < stake (HZ_EVICT, army Idle)
   alt no other player's queued army whose Player budget covers a stake
     Program->>Queue: append this army
     Program->>Program: army becomes Queued, nothing moves
@@ -60,7 +61,7 @@ flowchart LR
 
 Opening a match moves no lamports. Each Player's `budget` drops by the stake, its `locked` grows by it, and its `fighting` count grows by one. The lamports stay on the Player until `settle_match`, because an ephemeral battle cannot hold lamports.
 
-The budget is spent one stake per match, in the order the owner's armies are met. Once it is under one stake, the owner's remaining queued armies stay in the queue but no locker can meet them, and the owner cannot lock another army. Funding the budget again makes them reachable without another transaction. `unlock_army` only leaves the queue; nothing moves.
+The budget is spent one stake per match, in the order the owner's armies are met. Once it is under one stake, no locker can meet the owner's remaining queued armies, and the owner cannot lock another army. Those armies stay in the queue until a locker passes one of them together with its owner's Player: that `lock_army` evicts the army, which leaves the queue and becomes Idle (`HZ_EVICT <army>`). Without the eviction such armies could fill all 16 queue slots for good. A locker passes no Player, or one that is not authentic, and nothing is evicted. Until then, funding the budget again makes the armies reachable without another transaction; after it, the owner locks them again. `unlock_army` only leaves the queue; nothing moves.
 
 A won payout goes back to the Player. With `segregate` off, the default, it goes into the budget, so a winning player keeps fighting on their winnings. With `set_segregation(true)` it goes to `winnings`, which no match stakes; the budget is then a hard cap on what the player risks. A draw always returns each stake to its budget.
 

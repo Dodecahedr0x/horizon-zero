@@ -62,4 +62,6 @@ pub enum HorizonError {
     OutboxBusy,
     #[msg("Account already exists")]
     AlreadyExists,
+    #[msg("Battle has no VRF seed yet")]
+    NotSeeded,
 }
