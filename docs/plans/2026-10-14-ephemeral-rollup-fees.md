@@ -11,7 +11,27 @@
 **Design:** [2026-10-14-ephemeral-rollup-fees-design.md](2026-10-14-ephemeral-rollup-fees-design.md). The design has two refinements, found while reading the SDK for this plan:
 
 1. `release_outbox` is **permissionless**. The delegation program runs a base action through `CallHandler`, signed by an escrow PDA, so the program can't tell the action from any other caller. That's safe, because `release_outbox` only pays the owner recorded in the Outbox. The client calls it itself if the action hasn't run.
-2. **Delegating the Outbox again is the client's job.** Before a withdrawal, if the Outbox is not owned by the delegation program on Solana, the client sends `delegate_outbox` (paid by the wallet) and then `withdraw` in the rollup. Every withdrawal opens a new delegation session for the Outbox, and MagicBlock charges 3,000,000 lamports per session at undelegation. The UI must show that cost.
+2. **Delegating the Outbox again is the client's job.** Before a withdrawal, if the Outbox is not owned by the delegation program on Solana, the client sends `delegate_outbox` (paid by the wallet) and then `withdraw` in the rollup. Every withdrawal opens a new delegation session for the Outbox, The spike measured the net cost of each session at about 300,000 lamports plus transaction fees. The UI must show that cost.
+
+**Spike findings, binding on Tasks 10, 11, 14, 16 and 18.** Evidence is in [2026-10-14-outbox-spike-result.md](2026-10-14-outbox-spike-result.md), and working code is on branch `spike/outbox` (`spike/outbox/programs/spike/src/lib.rs`, `spike/outbox/run.mjs`, `spike/outbox/stack.sh`). Copy account lists from there.
+
+- **Split the lamport move from the scheduling.** Moving lamports and scheduling commit-and-undelegate in one instruction fails with `UnbalancedInstruction`. Use two instructions in the same transaction:
+  - `fund_outbox(amount)` moves the lamports and sets `amount`.
+  - `withdraw` schedules commit-and-undelegate.
+  - Do the same for fees: `fund_treasury_outbox` followed by `claim_fees`.
+- **In the scheduling instruction, the Outbox is an `UncheckedAccount`.** Write any data to it by hand before scheduling. A typed `Account<Outbox>` there fails with `ExternalAccountDataModified`.
+- **How the intent is built:**
+  - Call `MagicIntentBundleBuilder::new(payer, MAGIC_CONTEXT_ID, MAGIC_PROGRAM_ID).commit_and_undelegate(&[outbox]).add_post_undelegate_actions([CallHandler { destination_program: ID, accounts: [outbox (w), owner (w)], args: ActionArgs::new(ReleaseOutbox::DISCRIMINATOR), escrow_authority: payer, compute_units: 20_000 }]).build_and_invoke()`.
+  - The payer is the signing wallet.
+  - No escrow account needs to exist.
+  - Import `FoldableIntentBuilder` explicitly.
+  - The delegation program appends three accounts to `release_outbox`; Anchor treats them as remaining accounts.
+- **Delegate with `DelegateConfig { validator: Some(<rollup validator identity>) }`.** Locally the identity is `mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev`; the SDK's default validator is a different key. Pass the validator as an instruction argument or an optional account, so it is never a hardcoded constant.
+- **Delegated accounts must be committed now and then.** Lamports that are topped up, staked or withdrawn reach Solana only when the Player is committed. Set a `commit_frequency_ms` on Player delegation; the default from `DelegateConfig::default()` is acceptable.
+- **The local stack needs two additions:**
+  - It must create and fund the eSPL rent PDA (`initRentPdaIx`, 1 SOL), or top-ups fail with "insufficient lamports 300000, need 890880".
+  - It must run a second `vrf-oracle` against the rollup (`--rpc-url http://127.0.0.1:7799 --websocket-url ws://127.0.0.1:7800`) for the ephemeral queue `Sc9MJUngNbQXSXGP3F67KvKwVnhaYn6kcioxXNVowYT`.
+- **Load programs at genesis.** `solana program deploy` of a default build is rejected locally. Use `--bpf-program`, as `local-stack.mjs` already does.
 
 ---
 
@@ -962,7 +982,13 @@ pub fn release_outbox(ctx: Context<ReleaseOutbox>) -> Result<()> {
 - Under `inline-mock-magic`, it does nothing: the test calls `release_outbox` directly, because the Outbox is never delegated there.
 - Otherwise it builds `MagicIntentBundleBuilder::new(payer, magic_context, magic_program).commit_and_undelegate(&[outbox]).add_post_undelegate_actions([CallHandler { .. release_outbox .. }]).build_and_invoke()`, exactly as proven in Task 1. Before writing it, read the spike's `withdraw` and copy its account list.
 
-Exit order matters. Anchor serializes `outbox` at exit, but the commit snapshot is taken by the magic program at the end of the transaction in the rollup, so the in-handler write is included. Confirm this on the local stack in Task 18. If it isn't included, call `ctx.accounts.outbox.exit(&ID)?` before `schedule_release`.
+**The spike overrides the code above** (see "Spike findings" at the top). Split each instruction:
+
+- `fund_outbox(amount)` holds the lamport and counter logic shown for `withdraw`, with a typed Outbox.
+- `withdraw()` only checks `amount != 0` on an `UncheckedAccount` Outbox (`seeds = [b"outbox", owner]`), then calls `schedule_release`.
+- Likewise, `fund_treasury_outbox()` (admin) holds the fee move, and `claim_fees()` only schedules.
+
+The LiteSVM tests call `fund_outbox` and then `release_outbox` directly. Under mock, `withdraw` and `claim_fees` do nothing beyond their checks.
 
 Accounts:
 - `Withdraw`: `owner` (signer, mut), `player` (mut, seeds), `outbox` (mut, seeds `[b"outbox", owner]`, `has_one = owner`), and `magic: MagicAccounts` (a nested struct with `magic_context` (mut) and `magic_program`; both `UncheckedAccount`, with addresses checked when not mocked).
@@ -1131,7 +1157,7 @@ Use a 5% default fee. Run `pnpm --filter app test` and confirm the failures.
 - Rows: Free, Budget, Winnings, Locked.
 - Buttons: Top up, Fund budget and Withdraw, each with an amount field, plus the segregation toggle.
 - A note under Top up: "MagicBlock charges 0.0003 SOL per top-up."
-- A note under Withdraw: "Each withdrawal costs about 0.003 SOL in rollup fees."
+- A note under Withdraw: "Each withdrawal costs about 0.0003 SOL in rollup fees."
 - While `outboxPending > 0`, Withdraw is disabled and shows "Withdrawal in flight".
 
 Show a first-run Create player step with a deposit field when `player()` returns null. Show an Admin section only when `admin()?.admin` equals the wallet: the fee rate input (bps, at most 1000), Set fee, the claimable fees, and Claim fees.
