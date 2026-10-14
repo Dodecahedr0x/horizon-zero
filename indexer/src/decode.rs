@@ -189,8 +189,9 @@ pub fn decode_account_data(data: &[u8]) -> Option<HorizonAccount> {
 }
 
 /// `HZ_MATCH_RESOLVED <battle> <outcome> <fee> <seed hex> <player_b>`, logged by `settle_match` as it
-/// closes the battle: the battle, its outcome (1 A, 2 B, 3 draw) and the fee in lamports.
-pub fn parse_resolved(line: &str) -> Option<(String, u8, u64)> {
+/// closes the battle: the battle, its outcome (1 A, 2 B, 3 draw), the fee in lamports and the seed
+/// in lowercase hex, the form a decoded Battle's `seed` takes.
+pub fn parse_resolved(line: &str) -> Option<(String, u8, u64, String)> {
     let mut words = line.split(' ');
     if words.next()? != "HZ_MATCH_RESOLVED" {
         return None;
@@ -206,12 +207,12 @@ pub fn parse_resolved(line: &str) -> Option<(String, u8, u64)> {
     if words.next().is_some() {
         return None;
     }
-    Some((battle.to_string(), outcome, fee))
+    Some((battle.to_string(), outcome, fee, seed.to_ascii_lowercase()))
 }
 
 /// The resolutions in one transaction's logs. A line counts only while `program` is the innermost
 /// program invoked, so another program in the same transaction cannot log a resolution for it.
-pub fn resolutions(logs: &[String], program: &str) -> Vec<(String, u8, u64)> {
+pub fn resolutions(logs: &[String], program: &str) -> Vec<(String, u8, u64, String)> {
     let mut stack: Vec<&str> = Vec::new();
     let mut found = Vec::new();
     for line in logs {
@@ -786,8 +787,11 @@ mod tests {
         let player_b = pubkey(6).to_string();
         let seed = "ab".repeat(32);
         let line = format!("HZ_MATCH_RESOLVED {battle} 1 1000000 {seed} {player_b}");
-        assert_eq!(parse_resolved(&line), Some((battle.clone(), 1, 1_000_000)));
-        assert_eq!(parse_resolved(&format!("HZ_MATCH_RESOLVED {battle} 3 0 {seed} {player_b}")), Some((battle.clone(), 3, 0)));
+        assert_eq!(parse_resolved(&line), Some((battle.clone(), 1, 1_000_000, seed.clone())));
+        assert_eq!(parse_resolved(&format!("HZ_MATCH_RESOLVED {battle} 3 0 {seed} {player_b}")), Some((battle.clone(), 3, 0, seed.clone())));
+
+        let upper = format!("HZ_MATCH_RESOLVED {battle} 1 1000000 {} {player_b}", seed.to_uppercase());
+        assert_eq!(parse_resolved(&upper), Some((battle.clone(), 1, 1_000_000, seed.clone())));
 
         for bad in [
             String::new(),
@@ -828,7 +832,7 @@ mod tests {
             format!("Program log: HZ_MATCH_RESOLVED {forged} 1 1 {seed} {player_b}"),
             format!("Program {other} failed: custom program error: 0x1"),
         ];
-        assert_eq!(resolutions(&logs, program), vec![(battle, 2, 750_000)]);
+        assert_eq!(resolutions(&logs, program), vec![(battle, 2, 750_000, seed)]);
     }
 
     #[test]

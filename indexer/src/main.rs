@@ -129,12 +129,18 @@ async fn run(config: Config) -> Result<(), String> {
     let logs_stop = CancellationToken::new();
     let logs_source = LogsSubscribe::new(ws_url, config.program_id);
     let logs_cancel = logs_stop.clone();
-    tokio::spawn(async move { logs_source.consume(logs_tx, logs_cancel).await });
+    tokio::spawn(async move {
+        logs_source.consume(logs_tx, logs_cancel.clone()).await;
+        if !logs_cancel.is_cancelled() {
+            log::error!("logs subscribe stopped before shutdown; battles settled from now on stay Seeded");
+        }
+    });
     tokio::spawn(record_resolutions(
         Arc::clone(&db),
         config.rpc_url.clone(),
         config.program_id,
         logs_rx,
+        logs_stop.clone(),
     ));
 
     tokio::spawn(async move {
@@ -160,10 +166,18 @@ async fn record_resolutions(
     rpc_url: String,
     program_id: Pubkey,
     mut logs: tokio::sync::mpsc::Receiver<ProgramLogs>,
+    stop: CancellationToken,
 ) {
     let rpc = RpcClient::new_with_timeout_and_commitment(rpc_url, Duration::from_secs(10), CommitmentConfig::confirmed());
     let program = program_id.to_string();
     while let Some(batch) = logs.recv().await {
+        if batch.logs.last().is_some_and(|line| line == "Log truncated") {
+            log::warn!(
+                "logs of {} at slot {} are truncated; a resolution past the cut is lost",
+                batch.signature,
+                batch.slot
+            );
+        }
         let found = decode::resolutions(&batch.logs, &program);
         if found.is_empty() {
             continue;
@@ -176,15 +190,20 @@ async fn record_resolutions(
             }
         };
         let Ok(conn) = db.lock() else {
-            log::warn!("resolution: sqlite lock poisoned");
+            for (battle, outcome, fee, _) in &found {
+                log::error!("resolution {battle} (outcome {outcome} fee {fee}) dropped: sqlite lock poisoned");
+            }
             continue;
         };
-        for (battle, outcome, fee) in found {
-            match store::resolve(&conn, &battle, outcome, fee, unix) {
+        for (battle, outcome, fee, seed) in found {
+            match store::resolve(&conn, &battle, outcome, fee, &seed, unix) {
                 Ok(()) => log::info!("battle {battle} resolved: outcome {outcome} fee {fee}"),
-                Err(err) => log::warn!("resolution {battle}: {err}"),
+                Err(err) => log::error!("resolution {battle} (outcome {outcome} fee {fee}) dropped: {err}"),
             }
         }
+    }
+    if !stop.is_cancelled() {
+        log::error!("resolution task stopped before shutdown: the logs channel closed");
     }
 }
 
@@ -205,7 +224,7 @@ async fn prune_closed_armies(db: Arc<Mutex<rusqlite::Connection>>, rpc_url: Stri
             match rpc.get_multiple_accounts(&pubkeys).await {
                 Ok(accounts) => {
                     for (pubkey, account) in pubkeys.iter().zip(accounts) {
-                        let closed = account.map_or(true, |account| account.owner != program_id || account.data.is_empty());
+                        let closed = account.is_none_or(|account| account.owner != program_id || account.data.is_empty());
                         if closed {
                             gone.push(pubkey.to_string());
                         }

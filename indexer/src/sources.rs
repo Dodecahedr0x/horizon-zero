@@ -57,6 +57,7 @@ pub struct LogsSubscribe {
 
 /// The logs of one successful transaction that mentions the program.
 pub struct ProgramLogs {
+    pub signature: String,
     pub slot: u64,
     pub logs: Vec<String>,
 }
@@ -125,6 +126,7 @@ impl LogsSubscribe {
             let (mut logs_stream, _unsub) = match client.logs_subscribe(filter, config).await {
                 Ok(subscription) => subscription,
                 Err(err) => {
+                    self.failures.fetch_add(1, Ordering::Relaxed);
                     log::error!(
                         "Failed to subscribe to program logs on {}: {err}; retrying",
                         self.ws_url
@@ -149,6 +151,7 @@ impl LogsSubscribe {
                                     continue;
                                 }
                                 let logs = ProgramLogs {
+                                    signature: event.value.signature,
                                     slot: event.context.slot,
                                     logs: event.value.logs,
                                 };
@@ -303,6 +306,7 @@ impl Datasource for ProgramSubscribe {
                 match client.program_subscribe(&self.program_id, None).await {
                     Ok(subscription) => subscription,
                     Err(err) => {
+                        self.failures.fetch_add(1, Ordering::Relaxed);
                         log::error!(
                             "Failed to subscribe to program updates on {}: {err}; retrying",
                             self.ws_url
