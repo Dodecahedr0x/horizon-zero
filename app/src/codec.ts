@@ -292,6 +292,63 @@ export function resolvedOutcome(logs: readonly string[], battle: string) {
   return null;
 }
 
+// HorizonError in programs/horizon-zero/src/error.rs, in order: Anchor numbers them from 6000.
+export const PROGRAM_ERRORS: readonly (readonly [name: string, message: string])[] = [
+  ["InvalidBehavior", "Behavior body is not valid"],
+  ["HashMismatch", "Behavior hash does not match the body"],
+  ["MissingBehavior", "Behavior account is missing or does not match the unit"],
+  ["BudgetExceeded", "Army cost exceeds the battleground budget"],
+  ["TooManyUnits", "An army can have at most 10 units"],
+  ["BadRace", "Race is not in the catalog"],
+  ["BadStatus", "Army cannot be changed in its current status"],
+  ["NotAdmin", "Battleground admin signature is required"],
+  ["OwnArmy", "You cannot match your own army"],
+  ["NoStake", "Account does not hold the stake"],
+  ["AlreadyResolved", "Match is already resolved"],
+  ["BadPda", "Account is not the expected PDA"],
+  ["NotOwner", "Signer does not own this army"],
+  ["WrongBattleground", "Army is not in this battleground"],
+  ["BadUnit", "Unit kind is not in the catalog"],
+  ["QueueFull", "Battleground queue is full"],
+  ["MissingAccount", "A required account is missing"],
+  ["BadMatch", "Match account was not the next battleground match PDA"],
+  ["VrfRequest", "VRF request failed"],
+  ["BadQueue", "Oracle queue is not owned by the VRF program"],
+  ["BadGrid", "Battleground grid is not playable"],
+  ["BadPosition", "Unit position is outside the starting zone"],
+  ["DuplicatePosition", "Two units in one army cannot share a tile"],
+  ["FeeTooHigh", "Fee rate is above the cap"],
+  ["BudgetTooLow", "Player budget does not cover the battleground stake"],
+  ["PlayerBusy", "Player has battles that have not settled"],
+  ["BalanceShort", "Player holds less than the amount asked for"],
+  ["RentShort", "Player free balance does not cover the account rent"],
+  ["OutboxBusy", "Outbox still holds an unreleased withdrawal"],
+  ["AlreadyExists", "Account already exists"],
+  ["NotSeeded", "Battle has no VRF seed yet"],
+  ["NothingToWithdraw", "There is nothing to withdraw"],
+  ["BadValidator", "Validator identity must be set"],
+];
+
+/** The program error for an Anchor custom code, or null for any other code. */
+export function programError(code: number) {
+  const entry = PROGRAM_ERRORS[code - 6000];
+  return entry ? { code, name: entry[0], message: entry[1] } : null;
+}
+
+/** The first custom error code in a transaction error, its logs or an RPC error message. */
+export function customErrorCode(source: { err?: unknown; logs?: readonly string[]; message?: string }) {
+  const err = source.err as { InstructionError?: [number, unknown] } | undefined;
+  const custom = err?.InstructionError?.[1] as { Custom?: number } | undefined;
+  if (typeof custom?.Custom === "number") return custom.Custom;
+  for (const text of [...(source.logs ?? []), source.message ?? ""]) {
+    const number = /Error Number: (\d+)/.exec(text);
+    if (number) return Number(number[1]);
+    const hex = /custom program error: 0x([0-9a-f]+)/i.exec(text);
+    if (hex) return Number.parseInt(hex[1], 16);
+  }
+  return null;
+}
+
 function data(name: string, rest: Uint8Array = new Uint8Array()) {
   const out = new Uint8Array(8 + rest.length);
   out.set(sighash(name), 0);

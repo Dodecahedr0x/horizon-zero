@@ -27,9 +27,18 @@ export type Battleground = {
 /**
  * The connected wallet's Player, read in the rollup. Lamport amounts are decimal strings, like `stake`.
  * `free` is what the Player holds beyond its rent and the three counters. `outboxPending` is a
- * withdrawal that left the rollup but has not been paid to the wallet yet.
+ * withdrawal that has left the Player but has not been paid to the wallet yet; `outboxInFlight` is
+ * true while it is being committed and undelegated, so no new withdrawal can start.
  */
-export type PlayerBalance = { free: string; budget: string; winnings: string; locked: string; segregate: boolean; outboxPending: string };
+export type PlayerBalance = {
+  free: string;
+  budget: string;
+  winnings: string;
+  locked: string;
+  segregate: boolean;
+  outboxPending: string;
+  outboxInFlight: boolean;
+};
 /** Config, read in the rollup. `fees` is the claimable fee balance in lamports. */
 export type ProtocolConfig = { admin: string; feeBps: number; fees: string };
 export type MatchUnit = {

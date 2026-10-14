@@ -9,8 +9,16 @@ import { createSolanaChain } from "./solanaChain";
 
 function SolanaApp() {
   const wallet = useWallet();
-  const chain = useMemo(() => createSolanaChain(wallet), [wallet.publicKey, wallet.sendTransaction]);
-  return <App chain={chain} connected={!!wallet.publicKey} wallet={<WalletMultiButton />} />;
+  const made = useMemo(() => {
+    try {
+      return { chain: createSolanaChain(wallet), error: "" };
+    } catch (err) {
+      return { chain: null, error: err instanceof Error ? err.message : String(err) };
+    }
+  }, [wallet.publicKey, wallet.sendTransaction, wallet.signTransaction]);
+  // A misconfigured build (no rollup endpoint) says so instead of rendering a blank page.
+  if (!made.chain) return <p role="alert" style={{ padding: 16 }}>{made.error}</p>;
+  return <App chain={made.chain} connected={!!wallet.publicKey} wallet={<WalletMultiButton />} />;
 }
 
 export function SolanaRoot() {

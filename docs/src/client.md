@@ -29,8 +29,8 @@ The local stack does not serve these yet: `pnpm localnet` starts the rollup but 
 | `lock(army)` | queue, or open a match |
 | `unlock(army)` | leave the queue |
 | `closeArmy(army)` | delete an Idle army |
-| `player()` | the wallet's Player, `{ free, budget, winnings, locked, segregate, outboxPending }` with lamports as decimal strings, or `null` before it registers |
-| `register(depositLamports)` | create the Player and Outbox with that deposit free, and delegate both to the rollup |
+| `player()` | the wallet's Player, `{ free, budget, winnings, locked, segregate, outboxPending, outboxInFlight }` with lamports as decimal strings, or `null` before it registers |
+| `register(depositLamports)` | create the Player and Outbox with that deposit free, and delegate both to the rollup; a retry only delegates and never deposits again |
 | `topUp(lamports)` | move lamports from the wallet into the Player's free balance |
 | `fundBudget(lamports)` | move free lamports into the stake budget |
 | `withdraw(lamports)` | pay lamports back to the wallet: free first, then winnings, then budget |
@@ -153,7 +153,16 @@ The ledger and the Vite proxy both use the `/api/local` prefix. A failed call re
 
 ## Solana chain
 
-`createSolanaChain` keeps two `Connection`s at `confirmed`: `base` for Solana and `er` for the rollup. Every write is a legacy transaction sent to one of them. The client fetches the blockhash from that connection, has the wallet sign with `signTransaction`, sends the raw transaction through that same connection, and throws when the confirmation carries an error. It does not use the wallet's own send, which would send a rollup transaction to Solana. A wallet without `signTransaction` can only send to Solana.
+`createSolanaChain` keeps two `Connection`s at `confirmed`: `base` for Solana and `er` for the rollup. It throws when `VITE_ER_RPC_URL` is unset in a production build; `app/src/solanaEntry.tsx` catches that and renders the message instead of a blank page.
+
+Every write is a legacy transaction sent to one of the two connections. The client fetches the blockhash from that connection, has the wallet sign with `signTransaction`, and sends the raw transaction through that same connection. It does not use the wallet's own send, which would send a rollup transaction to Solana; a wallet without `signTransaction` can only send to Solana. If the send fails with "Blockhash not found", for instance because a rollup blockhash expired while the wallet waited for approval, the client fetches a new blockhash, signs and sends once more. It confirms on both connections by polling `getSignatureStatuses` with `searchTransactionHistory` every half second for up to 60 seconds, not by the block-height strategy, since rollup blockhashes are short-lived. Both behaviors still have to be checked against a real rollup in the local-stack task.
+
+Errors the UI can tell apart, exported from `app/src/solanaChain.ts`:
+
+- `ProgramError`, with `code`, `errorName` and the program's message, when a transaction fails with one of the program's codes, whether in preflight (the code in the logs or the RPC message) or in the confirmed status (`InstructionError` `Custom`). `PROGRAM_ERRORS` in `app/src/codec.ts` maps `6000 + i` to the `i`th `HorizonError` variant in `programs/horizon-zero/src/error.rs`, and a test checks the order against that file.
+- `PendingError`, with the signature when there is one, when the work was sent but has not finished: a transaction not confirmed in time, a top-up the rollup has not credited, a delegation the rollup has not picked up, a withdrawal still on its way. It may still land, so the UI should show it as pending and not resend blindly.
+
+Any other error, such as a wallet rejection, is thrown unchanged.
 
 Where each instruction goes:
 
@@ -162,49 +171,57 @@ Where each instruction goes:
 | Solana | `register_player`, `delegate_player`, `delegate_outbox`, `delegate_treasury_outbox`, `release_outbox`, the eSPL top-up |
 | rollup | `create_behavior`, `create_army`, `lock_army`, `unlock_army`, `close_army`, `fund_budget`, `set_segregation`, `fund_outbox` + `withdraw`, `settle_match`, `set_fee`, `fund_treasury_outbox` + `claim_fees` |
 
-`app/src/codec.ts` builds each instruction with the account order in [Accounts and instructions](accounts.md). The delegate instructions derive the delegation buffer, record and metadata with the `@magicblock-labs/ephemeral-rollups-sdk` helpers (0.17.3, the version the spike used). Instructions that create or close an ephemeral account pass the vault and the magic program; `withdraw` and `claim_fees` pass the magic context and the magic program. `app/src/codec.test.mjs` checks the discriminators, the account order of several builders, and the decoders' offsets.
+`app/src/codec.ts` builds each instruction with the account order in [Accounts and instructions](accounts.md). The delegate instructions derive the delegation buffer, record and metadata with the `@magicblock-labs/ephemeral-rollups-sdk` helpers (0.17.3, the version the spike used). Instructions that create or close an ephemeral account pass the vault and the magic program; `withdraw` and `claim_fees` pass the magic context and the magic program. `app/src/codec.test.mjs` checks each builder's discriminator, data and account order, and the decoders' offsets and length checks.
 
-Reads:
+Reads (every polling wait, for a confirmation, a delegation, a seed or a release, treats a failed read as transient until its deadline):
 
 - `behaviors` and `matches(owner)` come from the indexer, through `fetch("/api...")`, which the static server proxies to it (see [Indexer and Render](indexer.md)). `matches(owner)` keeps the first 20 rows where the owner is player A or B.
 - `battlegrounds` lists the indexer's rows and replaces each queue and `matchSeq` with the battleground account read in the rollup.
-- `armies(owner)` lists the indexer's rows, reads each army in the rollup, drops those it no longer finds there, and takes the status from the rollup, so a closed or newly queued army shows at once.
+- `armies(owner)` lists the indexer's rows, reads each army in the rollup, drops those it no longer finds there, and takes the owner, battleground and status from the rollup, so a closed or newly queued army shows at once.
 - `match(pubkey)` reads the indexer and falls back to the battle account in the rollup.
-- `player()` reads the Player in the rollup. `free` is its lamports minus the rent-exempt minimum for 68 bytes (read once from Solana) and `budget + winnings + locked`. `outboxPending` is the Outbox's `amount` from Solana while the Outbox is undelegated there, otherwise the rollup copy's `amount` (a `fund_outbox` whose `withdraw` did not land). `player()` only reads: it does not send `release_outbox`. A pending amount is paid by the next `withdraw` (which releases before it delegates again) or, later, by a UI action.
+- `player()` reads the Player in the rollup. `free` is its lamports minus the rent-exempt minimum for 68 bytes (read once from Solana, read again if that read failed) and `budget + winnings + locked`. `outboxPending` is the amount that has left the Player but has not reached the wallet: the Outbox's `amount` on Solana while it is undelegated there (waiting for `release_outbox`), or the rollup copy's `amount` while it is delegated (a `fund_outbox` whose `withdraw` did not land, or a withdrawal on its way). `outboxInFlight` is true while the Outbox is delegated on Solana but not the program's in the rollup: a withdrawal being committed and undelegated, or a delegation the rollup has not picked up yet. `player()` only reads: it does not send `release_outbox`. A pending amount is paid by the next `withdraw` (which releases before it delegates again) or, later, by a UI action.
 - `admin()` reads Config in the rollup.
 
-`createArmy` uses the next index above any army the indexer lists for this wallet.
+`createArmy` starts at the next index above any army the indexer lists for this wallet, then skips indexes whose army PDA already exists in the rollup, so an army the indexer has not listed yet is not collided with.
 
 ### Registration and top-up
 
-`register(deposit)` sends one Solana transaction: `register_player(deposit)`, `delegate_player` and `delegate_outbox`. A retry after a partial registration sends only what is missing, and moves the deposit with a top-up when the Player already exists. It then polls the rollup until it sees the Player owned by the program, for up to 60 seconds.
+`register(deposit)` sends one Solana transaction: `register_player(deposit)`, `delegate_player` and `delegate_outbox`. A retry after a partial registration sends only the missing delegations and never deposits again; the player tops up an existing Player with `topUp`. It then polls the rollup for up to 60 seconds, counted after the transaction confirms, until it sees the Player owned by the program, and throws `PendingError` if it does not.
 
-`topUp(lamports)` first waits, for up to 60 seconds, until the rollup holds the delegated Player, and throws if it does not. It then sends the SDK's `lamportsDelegatedTransferIx(wallet, player, lamports, salt)` to Solana with a random 32-byte salt, then waits until the rollup shows the Player's lamports grown past what it read before. The wallet pays the amount plus 300 000 lamports and the fee (see [Money in and out](matchmaking.md#money-in-and-out)).
+`topUp(lamports)` first waits, for up to 60 seconds, until the rollup holds the delegated Player, and throws if it does not. It then sends the SDK's `lamportsDelegatedTransferIx(wallet, player, lamports, salt)` to Solana with a random 32-byte salt, then waits until the rollup shows the Player's lamports grown past what it read before, and throws `PendingError` if they have not grown in 60 seconds. The wallet pays the amount plus 300 000 lamports and the fee (see [Money in and out](matchmaking.md#money-in-and-out)).
 
 ### Lock and settle
 
-`lock(army)` reads the battleground in the rollup for its queue and `match_seq`, and reads each queued army there. It offers, in queue order, every queued army whose status is Queued and whose owner is another wallet, each with its owner's Player once, so the program can match a funded owner and evict one whose budget no longer covers a stake. It stops adding candidates when the transaction would pass 32 accounts. It sends a compute budget of `1_400_000` and `lock_army` with the player's Player, Config, the battle `[b"match", battleground, match_seq]`, the vault and the magic program, the oracle queue, and the army's distinct behaviors.
+`lock(army)` reads the battleground in the rollup for its queue and `match_seq`, and reads each queued army there. It offers, in queue order, every queued army whose status is Queued and whose owner is another wallet, each with its owner's Player once, so the program can match a funded owner and evict one whose budget no longer covers a stake. It stops adding candidates when the transaction would pass 32 accounts. It sends a compute budget of `1_400_000` and `lock_army` with the player's Player, Config, the battle `[b"match", battleground, match_seq]`, the vault and the magic program, the oracle queue, and the army's distinct behaviors. If the program answers `BadMatch`, another lock opened a match after the read; the client reads the battleground again and sends once more.
 
-If the battle account then exists in the rollup, a match opened. The client polls it every half second until it is Seeded (status 2), for up to 60 seconds, then sends `settle_match` and reads the outcome from the transaction's `HZ_MATCH_RESOLVED` log. `lock` returns the battle decoded from the rollup with that outcome and status 1. The outcome is unknown when someone else settled first (the battle is gone and `settle_match` fails with `AlreadyResolved`) or when the log line cannot be read; `lock` then returns the indexer's row for the battle, or, before the indexer has it, the last decoded state with status 1 and outcome 0 (pending). If the seed has not arrived in time, `lock` returns the battle still Awaiting, and `settle(match)` can settle it later. `settle` treats a battle that is already closed as settled and throws while it is still Awaiting (`NotSeeded`).
+If the battle account then exists in the rollup, a match opened. The client polls it every half second until it is Seeded (status 2), for up to 60 seconds, then sends `settle_match` and reads the outcome from the transaction's `HZ_MATCH_RESOLVED` log. `lock` returns the battle decoded from the rollup with that outcome and status 1. The outcome is unknown when someone else settled first (the battle is gone, or `settle_match` fails with `AlreadyResolved`) or when the log line cannot be read; `lock` then returns the indexer's row for the battle, or, before the indexer has it, the last decoded state with status 1 and outcome 0 (pending). If the seed has not arrived in time, `lock` returns the battle still Awaiting, and `settle(match)` can settle it later. `settle` treats `AlreadyResolved` as settled and throws `NotSeeded`, and any other error, unchanged.
 
 ### Withdrawal and fee claim
 
 ```mermaid
 flowchart TD
-  Start["withdraw(amount)"] --> Read{"Outbox on Solana"}
-  Read -->|"owned by horizon-zero"| Release["Solana tx: release_outbox if amount > 0, then delegate_outbox"]
-  Release --> Read
-  Read -->|"owned by the delegation program"| Rollup{"Outbox in the rollup"}
-  Rollup -->|"not visible yet, or still being undelegated"| Read
-  Rollup -->|"amount > 0: an earlier fund_outbox without withdraw"| Flush["rollup tx: withdraw"]
-  Flush --> Read
-  Rollup -->|"owned by horizon-zero, amount 0"| Send["rollup tx: fund_outbox(amount), withdraw"]
-  Send --> Wait["poll Solana until the Outbox is undelegated;<br/>release_outbox if the action left an amount"]
+  Start["withdraw(amount)"] --> Check{"0 < amount <= free + winnings + budget"}
+  Check -->|no| Refuse["throw, nothing sent"]
+  Check -->|yes| State{"Outbox state"}
+  State -->|"delegated on Solana, not the program's in the rollup"| InFlight["PendingError: a withdrawal is in flight"]
+  State -->|"delegated, rollup copy holds an amount"| Flush["rollup tx: withdraw alone;<br/>await its release; PendingError: nothing more withdrawn"]
+  State -->|"owned by horizon-zero on Solana"| Delegate["Solana tx: release_outbox if amount > 0, then delegate_outbox;<br/>wait up to 60 s for the rollup (PendingError otherwise)"]
+  Delegate --> Send
+  State -->|"delegated, empty in the rollup"| Send["rollup tx: fund_outbox(amount), withdraw"]
+  Send --> Back["poll Solana up to 30 s until the Outbox is the program's again (PendingError otherwise)"]
+  Back --> Action["poll up to 5 s for the action to pay;<br/>release_outbox only if it has not"]
 ```
 
-`withdraw(amount)` first readies the Outbox, polling for up to 60 seconds. While the Outbox is owned by the program on Solana, a previous withdrawal undelegated it: the client sends one Solana transaction with `release_outbox` when its `amount` is not 0, then `delegate_outbox`. While it is delegated, the client waits until the rollup shows it owned by the program. A rollup copy holding an amount is a `fund_outbox` whose `withdraw` never landed: the client sends `withdraw` alone to release it and starts again. Once the Outbox is delegated, empty and visible in the rollup, the client sends one rollup transaction with `fund_outbox(amount)` and `withdraw`. It then polls Solana for up to 30 seconds until the Outbox is owned by the program again, and sends `release_outbox` itself if the post-undelegate action left an amount. Each withdrawal that needs `delegate_outbox` costs the wallet about 300 000 lamports of delegation rent that does not come back, plus fees.
+`withdraw(amount)` refuses an amount of 0 or more than `free + winnings + budget` before it sends anything. It then reads the Outbox:
 
-`claimFees()` is the same flow for the treasury Outbox `[b"outbox", config]`, with `delegate_treasury_outbox`, and `fund_treasury_outbox` + `claim_fees` in the rollup transaction. `setFee(bps)` sends `set_fee` to the rollup.
+- Delegated on Solana but not the program's in the rollup: an earlier withdrawal is in flight. It throws `PendingError` and funds nothing, so a retry after a withdrawal that landed cannot start a second one while the first is on its way.
+- Delegated with an amount in the rollup: an earlier `fund_outbox` whose `withdraw` never ran. It sends `withdraw` alone, waits for that release, and throws `PendingError` saying the earlier amount was paid and nothing more was withdrawn.
+- Owned by the program on Solana: a previous withdrawal undelegated it. It sends one Solana transaction with `release_outbox` when `amount` is not 0, then `delegate_outbox`, and waits up to 60 seconds, counted after that transaction confirms, until the rollup shows the Outbox delegated and empty.
+- Delegated and empty in the rollup: ready.
+
+It then sends one rollup transaction with `fund_outbox(amount)` and `withdraw`. It polls Solana for up to 30 seconds until the Outbox is owned by the program again, then up to 5 seconds for the post-undelegate action to set `amount` to 0, and sends `release_outbox` itself only if it has not. An Outbox that has not come back in 30 seconds throws `PendingError`. Each withdrawal that needs `delegate_outbox` costs the wallet about 300 000 lamports of delegation rent that does not come back, plus fees.
+
+`claimFees()` refuses when Config's `fees` is 0, then runs the same flow for the treasury Outbox `[b"outbox", config]`, with `delegate_treasury_outbox`, and `fund_treasury_outbox` + `claim_fees` in the rollup transaction. A missing treasury Outbox throws a message saying `init_treasury_outbox` has not run. `setFee(bps)` sends `set_fee` to the rollup.
 
 ## Replay and board
 
