@@ -14,8 +14,10 @@
 //! on 7800. A refused dial is logged and tried again every 3 seconds until
 //! this process shuts down. The pipeline stays up.
 //!
-//! Account updates carry a slot. Block time is `getBlockTime` for that slot.
-//! If the RPC has no time, the row is stored with a null timestamp.
+//! Account updates carry a slot. Block time is `getBlockTime` for that slot,
+//! asked up to five times 200 ms apart: the rollup has no time for a slot until
+//! about 100 ms after it. If the RPC still has none, the row is stored with a
+//! null timestamp.
 //!
 //! `close_army` hands the account back to the System Program, and
 //! `programSubscribe` only reports accounts the program still owns, so a
@@ -182,13 +184,7 @@ async fn record_resolutions(
         if found.is_empty() {
             continue;
         }
-        let unix = match rpc.get_block_time(batch.slot).await {
-            Ok(time) => Some(time),
-            Err(err) => {
-                log::warn!("no block time for slot {}: {err}", batch.slot);
-                None
-            }
-        };
+        let unix = block_time(&rpc, batch.slot).await;
         let Ok(conn) = db.lock() else {
             for (battle, outcome, fee, _) in &found {
                 log::error!("resolution {battle} (outcome {outcome} fee {fee}) dropped: sqlite lock poisoned");
@@ -280,17 +276,29 @@ impl IndexProcessor {
         if let Some(time) = self.times.get(&slot).copied() {
             return Some(time);
         }
-        match self.rpc.get_block_time(slot).await {
-            Ok(time) => {
-                self.times.insert(slot, time);
-                Some(time)
-            }
-            Err(err) => {
+        let time = block_time(&self.rpc, slot).await?;
+        self.times.insert(slot, time);
+        Some(time)
+    }
+}
+
+/// How often, and how far apart, a slot's block time is asked for before the row keeps a null time.
+const BLOCK_TIME_TRIES: u32 = 5;
+const BLOCK_TIME_RETRY: Duration = Duration::from_millis(200);
+
+/// The block time of `slot`, or None when the RPC still has none after a few tries. The rollup
+/// answers "not yet available" for about 100 ms after a slot, which is when a live update arrives.
+async fn block_time(rpc: &RpcClient, slot: u64) -> Option<i64> {
+    for attempt in 1..=BLOCK_TIME_TRIES {
+        match rpc.get_block_time(slot).await {
+            Ok(time) => return Some(time),
+            Err(err) if attempt == BLOCK_TIME_TRIES => {
                 log::warn!("no block time for slot {slot}: {err}");
-                None
             }
+            Err(_) => tokio::time::sleep(BLOCK_TIME_RETRY).await,
         }
     }
+    None
 }
 
 async fn shutdown() {

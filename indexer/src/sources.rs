@@ -179,6 +179,14 @@ impl LogsSubscribe {
 }
 
 /// Wait before the next dial. `true` means the indexer is shutting down.
+/// An account update for the pipeline. Not Carbon's `AccountUpdate::into_update`: it turns an
+/// account with 0 lamports into a deletion, and every rollup ephemeral account (Army, Behavior,
+/// Battle) holds 0 lamports, its rent sitting with the sponsor. A closed account does not reach this
+/// point: `programSubscribe` stops reporting it, and the prune pass forgets closed armies.
+fn account_update(pubkey: Pubkey, account: solana_account::Account, slot: u64) -> Update {
+    Update::Account(AccountUpdate { pubkey, account, slot, transaction_signature: None })
+}
+
 async fn pause(token: &CancellationToken, retry: Duration) -> bool {
     tokio::select! {
         _ = token.cancelled() => true,
@@ -240,13 +248,7 @@ impl Datasource for ProgramSnapshot {
                             log::error!("Error decoding account {}", account.pubkey);
                             continue;
                         };
-                        let update = AccountUpdate {
-                            pubkey,
-                            account: decoded,
-                            slot: response.context.slot,
-                            transaction_signature: None,
-                        }
-                        .into_update();
+                        let update = account_update(pubkey, decoded, response.context.slot);
                         if sender.send((update, id.clone())).await.is_err() {
                             return Ok(());
                         }
@@ -302,8 +304,18 @@ impl Datasource for ProgramSubscribe {
                 }
             };
 
+            // Without an encoding the RPC sends base58, which it refuses for accounts over 128
+            // bytes: every Battleground, Army and Battle arrived undecodable.
+            let config = RpcProgramAccountsConfig {
+                account_config: RpcAccountInfoConfig {
+                    encoding: Some(UiAccountEncoding::Base64),
+                    commitment: Some(CommitmentConfig::confirmed()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
             let (mut program_stream, _unsub) =
-                match client.program_subscribe(&self.program_id, None).await {
+                match client.program_subscribe(&self.program_id, Some(config)).await {
                     Ok(subscription) => subscription,
                     Err(err) => {
                         self.failures.fetch_add(1, Ordering::Relaxed);
@@ -334,13 +346,7 @@ impl Datasource for ProgramSubscribe {
                                     log::error!("Error parsing account pubkey. Value: {}", event.value.pubkey);
                                     continue;
                                 };
-                                let update = AccountUpdate {
-                                    pubkey,
-                                    account: decoded,
-                                    slot: event.context.slot,
-                                    transaction_signature: None,
-                                }
-                                .into_update();
+                                let update = account_update(pubkey, decoded, event.context.slot);
                                 if sender.try_send((update, id.clone())).is_err() {
                                     log::error!("Error sending account update");
                                     break;
@@ -372,6 +378,19 @@ impl Datasource for ProgramSubscribe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ephemeral_account_with_no_lamports_is_an_update_not_a_deletion() {
+        let account = solana_account::Account {
+            lamports: 0,
+            data: vec![1, 2, 3],
+            owner: Pubkey::new_unique(),
+            executable: false,
+            rent_epoch: 0,
+        };
+        let update = account_update(Pubkey::new_unique(), account, 7);
+        assert!(matches!(update, Update::Account(ref update) if update.slot == 7 && update.account.data == [1, 2, 3]));
+    }
 
     async fn stays_up_until_cancel<D>(source: D, name: &str)
     where
