@@ -2,6 +2,7 @@
 //
 //   node scripts/local-stack.mjs              build, boot, bootstrap, index, then keep running (Ctrl-C stops all)
 //   node scripts/local-stack.mjs --check      the same, then play, settle and cash out one battle and exit
+//   node scripts/local-stack.mjs --check --probe   also record what the rollup's RPC answers (slower)
 //   node scripts/local-stack.mjs --no-build   reuse target/deploy/horizon_zero.so
 //   node scripts/local-stack.mjs --no-indexer do not start the indexer
 //
@@ -134,7 +135,9 @@ async function main() {
   process.on("SIGTERM", () => stop(143));
   need("mb-stack", `Install it with: npm install -g ${MB_PACKAGE}`);
   need("vrf-oracle", `It ships with mb-stack: npm install -g ${MB_PACKAGE}`);
-  need("solana-test-validator", "Install the Anza CLI: https://docs.anza.xyz/cli/install");
+  for (const tool of ["solana-test-validator", "solana", "solana-keygen"]) need(tool, "Install the Anza CLI: https://docs.anza.xyz/cli/install");
+  if (!args.has("--no-build")) need("cargo-build-sbf", "It ships with the Anza CLI: https://docs.anza.xyz/cli/install");
+  if (!args.has("--no-indexer")) need("cargo", "The indexer is built with cargo: https://rustup.rs");
   fs.mkdirSync(work, { recursive: true });
 
   for (const [what, portNumber] of [["base", BASE], ["rollup", ER]]) {
@@ -215,7 +218,7 @@ async function main() {
 
   if (args.has("--check")) {
     log("playing, settling and cashing out one battle");
-    run("node", ["app/scripts/localnet-assert.mjs"], {
+    run("node", ["app/scripts/localnet-assert.mjs", ...(args.has("--probe") ? ["--probe"] : [])], {
       env: {
         ...process.env,
         RPC_URL: BASE_URL,

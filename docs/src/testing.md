@@ -54,20 +54,20 @@ Job `localnet` installs `@magicblock-labs/ephemeral-validator@0.14.10` globally 
 
 With `--check`, `app/scripts/localnet-assert.mjs` then runs against Solana (`8899`), the rollup (`7799`), the ephemeral test queue, the bootstrap admin `target/localnet/admin.json` and the stack's indexer. It imports the instruction builders and decoders from `app/src/codec.ts`. It sends every transaction the way the game does: a blockhash from the connection it sends to, then polling `isBlockhashValid` and `getSignatureStatuses` with `searchTransactionHistory`, and `getTransaction` for the logs. Any failed check stops it with a non-zero exit:
 
-1. The rollup's identity is the validator Config pins, and the keypair is Config's admin. A fresh blockhash is valid on both connections, and still valid 10 seconds later.
+1. The rollup returns its identity, Config exists, the identity is the validator Config pins, and the keypair is Config's admin. With `--probe`, a fresh blockhash must be valid on both connections, and still valid 10 seconds later.
 2. Two new wallets each send `register_player` (deposit 0), `delegate_player` and `delegate_outbox` in one Solana transaction, then wait until the rollup holds the Player and the Outbox as this program's.
 3. Each tops its Player up with 0.05 SOL through `lamportsDelegatedTransferIx`; the rollup must credit exactly 0.05 SOL. Each then sends `fund_budget` of 0.02 SOL in the rollup.
 4. Each creates a standard behavior (March, Charge) and a full Outpost army of race 0 on it, in the rollup. The behavior and the army are ephemeral: owned by the program, 0 lamports.
 5. The first wallet's `lock_army` queues, with the battle read-only. The second offers that army as its candidate, with the battle writable, and opens the match: the battle exists as an ephemeral account and the locker's Player paid its rent. The rollup's oracle seeds it within 60 seconds.
 6. The script replays the battle with `simulate_json` from `app/src/combat-node` on the stored grid, snapshots and seed, then sends `settle_match`. The outcome in `HZ_MATCH_RESOLVED` must match the replay, and the battle must be closed. On a win, the fee is `2 × stake × fee_bps / 10 000` (1 000 000 lamports at 500 bps), the winner's Player gained `stake − fee` lamports and its budget grew by as much, the loser's Player lost the stake and its budget too, and Config's lamports and `config.fees` grew by the fee. On a draw, nothing moved and both budgets are back at 0.02 SOL. Both Players have nothing locked or fighting.
 7. The first wallet closes its army (`close_army`): the army is gone and its Player got the rent back.
-8. `getProgramAccounts` on the rollup lists an ephemeral army and a delegated Player; `getMultipleAccounts` returns them; `logsSubscribe` and `programSubscribe` on the rollup's WebSocket have sent notifications.
+8. With `--probe` only: `getProgramAccounts` on the rollup lists an ephemeral army and a delegated Player; `getMultipleAccounts` returns them; `logsSubscribe` and `programSubscribe` on the rollup's WebSocket have sent notifications; `getTransaction`, `getSignatureStatuses` with history and `getBlockTime` are recorded.
 9. The winner (the first wallet on a draw) sends `fund_outbox` of 0.01 SOL and `withdraw` in one rollup transaction. Within 60 seconds the Outbox is the program's again on Solana with `amount` 0. The base transaction that logged `HZ_RELEASE` must be signed by the rollup's identity and also contain `ProcessUndelegation`: the post-undelegate action paid it, not a fallback. The wallet rose by at least 0.01 SOL, and the Player lost exactly 0.01 SOL in the rollup.
 10. If there were fees, the admin sends `fund_treasury_outbox` and `claim_fees`; the same checks apply to the treasury Outbox, the admin rose by at least the fees, and `config.fees` is 0.
 11. The wallet sends `delegate_outbox` and the admin `delegate_treasury_outbox`; the rollup holds both again.
 12. The indexer's `/matches/<battle>` shows the battle Resolved with the same outcome, fee and `feeBps`, and with both times set.
 
-Lines starting with `PROBE` record what the rollup's RPC answered, and lines starting with `FEE` record what each step cost a wallet. The evidence from the first run is in `docs/plans/2026-10-14-outbox-spike-result.md`. The script exits, and the stack stops, after the last check.
+Lines starting with `FEE` record what each step cost a wallet. `pnpm localnet:check --probe` (or `node scripts/local-stack.mjs --check --probe`) also prints, as `PROBE` lines, what the rollup's RPC answered and the account shapes; it is off by default because it adds about 40 seconds of waits, and CI runs without it. The evidence from the first run is in `docs/plans/2026-10-14-outbox-spike-result.md`. The script exits, and the stack stops, after the last check.
 
 ## Compute benchmark
 
@@ -93,10 +93,7 @@ Built with `--features "inline-mock-vrf inline-mock-magic cu-profile"` (the prog
 | no whole-fighter copies | 7 604 204 | -46.6% |
 | one PDA derivation in the settlement | 7 580 585 | -46.7% |
 | unchecked indexing in the walking-distance wave | 7 407 533 | -48.0% |
-| settlement moved to the Hydra crank | 7 616 315 | -46.5% |
 
-The last row is not an optimization: `settle_match` derives the vault and crank addresses, reads the instructions sysvar, and cancels the crank, about 9 000 CU per battle on top of the simulation. Every battle's outcome is unchanged.
-
-The rows above were measured on earlier benchmark armies, before the 10-unit cap and later catalog changes. On the current armies, the Hydra settlement totalled 10 419 963 CU with a worst battle of 897 971 CU. The permissionless settlement, which reads the battle by hand and closes it instead of deriving and cancelling a crank, totals about 9 891 000 CU (-5.1%) with a worst battle of about 879 800 CU, and every battle's outcome and round count is unchanged.
+These rows are history: they were measured on earlier benchmark armies, before the 10-unit cap and later catalog changes. On the current armies, `settle_match` (which reads the battle by hand and closes it) totals about 9 891 000 CU with a worst battle of about 879 800 CU.
 
 Tried and dropped, because they cost as much or more: 12 wave slots instead of 8 (-0.1%), three bit-mask versions of the rubble connectivity check (the depth-first fill reaches zone B after touching few tiles and was cheapest), sorting rubble candidates by a hash prefix, caching target tie keys per round, and unchecked indexing on every fighter access (-0.7%, not worth spreading `unsafe` through the engine).

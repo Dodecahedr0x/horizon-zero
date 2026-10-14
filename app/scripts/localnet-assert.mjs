@@ -10,8 +10,12 @@
  *  5. The admin claims the fee (fund_treasury_outbox + claim_fees) and receives it on Solana.
  *  6. Both Outboxes are delegated again, and the indexer (when INDEXER_URL is set) shows the settled battle.
  *
- * Lines starting with PROBE record what the rollup's RPC answered, and FEE lines what each step cost
- * the wallet: docs/plans/2026-10-14-outbox-spike-result.md keeps that evidence.
+ * FEE lines record what each step cost the wallet. With `--probe` (off by default, about 40 s
+ * longer) the script also checks and prints, as PROBE lines, what the rollup's RPC answers: blockhash
+ * validity, the WebSocket subscriptions, getProgramAccounts, getMultipleAccounts, getTransaction,
+ * getBlockTime and the account shapes. docs/plans/2026-10-14-outbox-spike-result.md keeps that evidence.
+ *
+ *   node app/scripts/localnet-assert.mjs [--probe]     (pnpm localnet --check runs it; pass --probe there too)
  *
  * Env: RPC_URL (Solana), ER_RPC_URL (rollup), ORACLE_QUEUE, ADMIN_KEYPAIR (the bootstrap admin), INDEXER_URL.
  */
@@ -52,7 +56,7 @@ import {
   outboxPda,
   playerPda,
   registerPlayerIx,
-  resolvedOutcome,
+  resolvedMatch,
   settleMatchIx,
   treasuryOutboxPda,
   withdrawIx,
@@ -78,7 +82,8 @@ const STAKE = BigInt(OUTPOST.stake);
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const sol = (lamports) => `${(Number(lamports) / LAMPORTS_PER_SOL).toFixed(9)} SOL`;
 const say = (...parts) => console.log("[check]", ...parts);
-const probe = (...parts) => console.log("PROBE", ...parts);
+const probing = process.argv.includes("--probe");
+const probe = (...parts) => probing && console.log("PROBE", ...parts);
 const fee = (...parts) => console.log("FEE", ...parts);
 
 function check(condition, message) {
@@ -173,19 +178,24 @@ async function awaitRelease(outbox, owner, label) {
 
 // ---------------------------------------------------------------------------------------------
 
-const identity = new PublicKey((await er._rpcRequest("getIdentity", [])).result.identity);
-const configOnBase = decodeConfig((await base.getAccountInfo(configPda())).data);
+const identityKey = (await er._rpcRequest("getIdentity", []).catch(() => null))?.result?.identity;
+check(identityKey, `the rollup at ${er.rpcEndpoint} returns its identity (getIdentity)`);
+const identity = new PublicKey(identityKey);
+const configInfo = await base.getAccountInfo(configPda());
+check(configInfo, "Config exists on Solana: run the bootstrap (scripts/local-stack.mjs does)");
+const configOnBase = decodeConfig(configInfo.data);
+check(configOnBase, "the account at the Config address is a Config");
 check(configOnBase.validator === identity.toBase58(), "Config pins the rollup's identity");
 check(configOnBase.admin === admin.publicKey.toBase58(), "ADMIN_KEYPAIR is Config's admin");
 say(`rollup identity ${identity.toBase58()}, admin ${admin.publicKey.toBase58()}`);
 
 // Subscriptions the indexer depends on, opened before anything happens in the rollup.
 const notified = { logs: 0, program: 0 };
-const logsSub = er.onLogs(PROGRAM_ID, () => (notified.logs += 1), "confirmed");
-const programSub = er.onProgramAccountChange(PROGRAM_ID, () => (notified.program += 1), "confirmed");
+const logsSub = probing ? er.onLogs(PROGRAM_ID, () => (notified.logs += 1), "confirmed") : null;
+const programSub = probing ? er.onProgramAccountChange(PROGRAM_ID, () => (notified.program += 1), "confirmed") : null;
 
 // The app's confirm() treats a blockhash the RPC calls invalid as a sign of expiry.
-for (const [name, connection] of [["base", base], ["rollup", er]]) {
+for (const [name, connection] of probing ? [["base", base], ["rollup", er]] : []) {
   const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
   const now = (await connection.isBlockhashValid(blockhash)).value;
   await sleep(10_000);
@@ -295,11 +305,12 @@ const expected = replay.winner === 0 ? 1 : replay.winner === 1 ? 2 : 3;
 
 const configBefore = await er.getAccountInfo(configPda());
 const { signature: settleSignature, logs: settleLogs } = await send(er, "settle_match", [second], computeBudgetIx(), settleMatchIx(seeded));
-const outcome = resolvedOutcome(settleLogs, battle.toBase58());
+const resolved = resolvedMatch(settleLogs, battle.toBase58());
+check(resolved, "settle_match logged HZ_MATCH_RESOLVED for the battle");
+const { outcome, fee: fees } = resolved;
 check(outcome === expected, `outcome ${outcome}, replay says ${expected}`);
-check((await er.getAccountInfo(battle)) === null || (await er.getAccountInfo(battle)).data.length === 0, "settle_match closed the battle");
-const resolvedLine = settleLogs.find((line) => line.includes("HZ_MATCH_RESOLVED"));
-const fees = BigInt(resolvedLine.split("HZ_MATCH_RESOLVED ")[1].split(" ")[2]);
+const afterClose = await er.getAccountInfo(battle);
+check(afterClose === null || afterClose.data.length === 0, "settle_match closed the battle");
 const afterSettle = await Promise.all(wallets.map((wallet) => erPlayer(wallet.publicKey)));
 const configAfter = await er.getAccountInfo(configPda());
 const configFees = BigInt(decodeConfig(configAfter.data).fees);
@@ -342,6 +353,7 @@ say(`settled; config.fees ${configFees}`);
 }
 
 // RPC calls the indexer depends on, against the rollup.
+if (probing) {
 const programAccounts = await er.getProgramAccounts(PROGRAM_ID);
 const sizes = {};
 for (const { account } of programAccounts) sizes[account.data.length] = (sizes[account.data.length] ?? 0) + 1;
@@ -371,6 +383,7 @@ const recent = await er.getSlot("confirmed");
 probe(`getBlockTime(${recent}) (current slot) on the rollup: ${await er.getBlockTime(recent).catch((err) => `error ${err.message}`)}`);
 probe(`logsSubscribe notifications ${notified.logs}, programSubscribe notifications ${notified.program}`);
 check(notified.logs > 0 && notified.program > 0, "the rollup's WebSocket sends logs and program notifications");
+}
 
 // 4. The winner (or the first wallet on a draw) withdraws 0.01 SOL.
 const cashing = outcome === 2 ? second : first;
@@ -435,7 +448,7 @@ if (indexerUrl) {
 }
 
 probe(`blockhash validity while a signature was still unknown: ${JSON.stringify(blockhashChecks)}`);
-await er.removeOnLogsListener(logsSub);
-await er.removeProgramAccountChangeListener(programSub);
+if (logsSub !== null) await er.removeOnLogsListener(logsSub);
+if (programSub !== null) await er.removeProgramAccountChangeListener(programSub);
 say(`passed: outcome ${outcome}, fee ${fees}, battle ${battle.toBase58()}`);
 process.exit(0);

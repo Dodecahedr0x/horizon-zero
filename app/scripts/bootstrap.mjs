@@ -67,6 +67,7 @@ async function waitFor(label, seconds, check) {
 }
 
 export async function bootstrap(base, er, admin, { validator, feeBps = FEE_BPS, esplRent = false, log = console.log } = {}) {
+  if (!Number.isInteger(feeBps) || feeBps < 0 || feeBps > 1000) throw new Error(`fee bps must be an integer from 0 to 1000, not ${feeBps}`);
   const program = await base.getAccountInfo(PROGRAM_ID);
   if (!program?.executable) throw new Error(`horizon_zero is not deployed at ${PROGRAM_ID.toBase58()} on this cluster`);
   const owned = async (key) => (await base.getAccountInfo(key))?.owner.equals(PROGRAM_ID) ?? false;
@@ -86,10 +87,19 @@ export async function bootstrap(base, er, admin, { validator, feeBps = FEE_BPS, 
   const config = configPda();
   const identity = validator ?? (await rollupIdentity(er));
   const existing = await base.getAccountInfo(config);
+  // Every later step is an admin instruction: say so plainly rather than let the program answer NotAdmin.
+  let storedAdmin = admin.publicKey.toBase58();
+  const asAdmin = (step) => {
+    if (storedAdmin !== admin.publicKey.toBase58()) {
+      throw new Error(`${step} needs Config's admin ${storedAdmin}; the keypair is ${admin.publicKey.toBase58()}`);
+    }
+  };
   if (existing) {
     const stored = decodeConfig(existing.data);
-    log(`config: already initialized, admin ${stored?.admin}`);
-    if (stored && stored.validator !== identity.toBase58()) {
+    if (!stored) throw new Error(`the account at ${config.toBase58()} is not a Config`);
+    storedAdmin = stored.admin;
+    log(`config: already initialized, admin ${stored.admin}`);
+    if (stored.validator !== identity.toBase58()) {
       throw new Error(`Config pins validator ${stored.validator}, but the rollup is ${identity.toBase58()}`);
     }
   } else {
@@ -102,6 +112,7 @@ export async function bootstrap(base, er, admin, { validator, feeBps = FEE_BPS, 
       log(`${ground.name}: already created`);
       continue;
     }
+    asAdmin(`creating ${ground.name}`);
     await send(base, admin, [createBattlegroundIx(admin.publicKey, ground)]);
     log(`${ground.name}: created (${ground.cols}x${ground.rows}, budget ${ground.budget}, stake ${ground.stake})`);
   }
@@ -110,23 +121,28 @@ export async function bootstrap(base, er, admin, { validator, feeBps = FEE_BPS, 
   if (await base.getAccountInfo(treasury)) {
     log("treasury Outbox: already created");
   } else {
+    asAdmin("creating the treasury Outbox");
     await send(base, admin, [initTreasuryOutboxIx(admin.publicKey)]);
     log("treasury Outbox: created");
   }
 
   if (await owned(config)) {
+    asAdmin("delegating Config");
     await send(base, admin, [delegateConfigIx(admin.publicKey)]);
     log("config: delegated");
   }
   for (const ground of BATTLEGROUNDS) {
     if (!(await owned(battlegroundPda(ground.id)))) continue;
+    asAdmin(`delegating ${ground.name}`);
     await send(base, admin, [delegateBattlegroundIx(admin.publicKey, ground.id)]);
     log(`${ground.name}: delegated`);
   }
   const treasuryInfo = await base.getAccountInfo(treasury);
+  if (!treasuryInfo) throw new Error(`the treasury Outbox ${treasury.toBase58()} is missing after its creation`);
   if (treasuryInfo.owner.equals(PROGRAM_ID)) {
     // An unpaid claim must be released first (OutboxBusy); the admin's wallet does that from the app.
     if (BigInt(decodeOutbox(treasuryInfo.data)?.amount ?? "0") === 0n) {
+      asAdmin("delegating the treasury Outbox");
       await send(base, admin, [delegateTreasuryOutboxIx(admin.publicKey)]);
       log("treasury Outbox: delegated");
     } else {
