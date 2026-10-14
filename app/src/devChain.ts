@@ -97,9 +97,10 @@ export interface ChainAdapter {
   withdraw(lamports: bigint): Promise<void>;
   /**
    * Pays out an amount an earlier withdrawal (or, with "treasury", an earlier fee claim) left
-   * behind. "paid" when it paid something, "none" when there was nothing to pay.
+   * behind. "paid" when it paid something, "none" when there was nothing to pay, "inFlight" while
+   * a withdrawal or delegation is still on its way. Throws when the Outbox does not exist.
    */
-  releasePending(which?: "player" | "treasury"): Promise<"none" | "paid">;
+  releasePending(which?: "player" | "treasury"): Promise<"none" | "paid" | "inFlight">;
   setSegregation(segregate: boolean): Promise<void>;
   /** Settles a Seeded battle. Anyone may. */
   settle(match: Match): Promise<void>;

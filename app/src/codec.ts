@@ -336,22 +336,15 @@ export function programError(code: number) {
 }
 
 /**
- * The custom error code in a failed transaction, only when this program raised it: the failing
- * top-level instruction's program for a status error or an RPC message, the innermost
- * `Program <id> failed: custom program error` line for logs. Null for anything else, such as a
- * code from the compute-budget, system or VRF program.
+ * The custom error code in a failed transaction's logs, only when this program raised it: the
+ * innermost `Program <id> failed: custom program error` line must name this program. Null for
+ * anything else, such as a code from the compute-budget, system or VRF program, or no such line.
  */
-export function horizonErrorCode(source: { err?: unknown; logs?: readonly string[]; message?: string; programIds: readonly PublicKey[] }) {
-  const ours = (index: number) => source.programIds[index]?.equals(PROGRAM_ID) ?? false;
-  const failed = (source.err as { InstructionError?: [number, unknown] } | undefined)?.InstructionError;
-  const custom = (failed?.[1] as { Custom?: number } | undefined)?.Custom;
-  if (failed && typeof custom === "number") return ours(failed[0]) ? custom : null;
-  for (const line of source.logs ?? []) {
+export function horizonErrorCode(logs: readonly string[]) {
+  for (const line of logs) {
     const match = /Program (\w+) failed: custom program error: 0x([0-9a-f]+)/i.exec(line);
     if (match) return match[1] === PROGRAM_ID.toBase58() ? Number.parseInt(match[2], 16) : null;
   }
-  const match = /Instruction (\d+): custom program error: 0x([0-9a-f]+)/i.exec(source.message ?? "");
-  if (match) return ours(Number(match[1])) ? Number.parseInt(match[2], 16) : null;
   return null;
 }
 

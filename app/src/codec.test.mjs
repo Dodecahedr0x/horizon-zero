@@ -353,21 +353,16 @@ test("the error map follows HorizonError in error.rs", () => {
   const allVariants = [...enumBody.matchAll(/^\s*(\w+),\s*$/gm)].map((match) => match[1]);
   assert.equal(PROGRAM_ERRORS.length, allVariants.length);
 
-  const budget = new PublicKey("ComputeBudget111111111111111111111111111111");
-  const programIds = [budget, PROGRAM_ID];
   const hex = outboxBusy.toString(16);
-  assert.equal(horizonErrorCode({ err: { InstructionError: [1, { Custom: outboxBusy }] }, programIds }), outboxBusy);
-  assert.equal(horizonErrorCode({ logs: [`Program ${PROGRAM_ID.toBase58()} invoke [1]`, `Program ${PROGRAM_ID.toBase58()} failed: custom program error: 0x${hex}`], programIds }), outboxBusy);
-  assert.equal(horizonErrorCode({ message: `Transaction simulation failed: Error processing Instruction 1: custom program error: 0x${hex}`, programIds }), outboxBusy);
-  assert.equal(horizonErrorCode({ message: "insufficient funds", programIds }), null);
+  assert.equal(horizonErrorCode([`Program ${PROGRAM_ID.toBase58()} invoke [1]`, `Program ${PROGRAM_ID.toBase58()} failed: custom program error: 0x${hex}`]), outboxBusy);
+  assert.equal(horizonErrorCode([]), null);
+  assert.equal(horizonErrorCode(["Program log: insufficient funds"]), null);
 });
 
 test("a custom code from another program is not read as a HorizonError", () => {
-  const budget = new PublicKey("ComputeBudget111111111111111111111111111111");
-  const programIds = [budget, PROGRAM_ID];
-  // The failing top-level instruction is the compute-budget one.
-  assert.equal(horizonErrorCode({ err: { InstructionError: [0, { Custom: 6000 }] }, programIds }), null);
-  assert.equal(horizonErrorCode({ message: "Error processing Instruction 0: custom program error: 0x1770", programIds }), null);
+  // A failing compute-budget instruction.
+  const budget = "ComputeBudget111111111111111111111111111111";
+  assert.equal(horizonErrorCode([`Program ${budget} invoke [1]`, `Program ${budget} failed: custom program error: 0x1770`]), null);
   // A CPI from this program failed in the system program: the innermost failure is not ours.
   const system = SystemProgram.programId.toBase58();
   const logs = [
@@ -376,5 +371,6 @@ test("a custom code from another program is not read as a HorizonError", () => {
     `Program ${system} failed: custom program error: 0x1`,
     `Program ${PROGRAM_ID.toBase58()} failed: custom program error: 0x1`,
   ];
-  assert.equal(horizonErrorCode({ logs, programIds }), null);
+  assert.equal(horizonErrorCode(logs), null);
 });
+

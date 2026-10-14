@@ -115,9 +115,9 @@ function lamports(value: string | undefined) {
   return BigInt(value ?? "0");
 }
 
-/** A ProgramError when the failure is one of this program's codes (see `horizonErrorCode`), else null. */
-function programFailure(source: { err?: unknown; logs?: readonly string[]; message?: string }, instructions: readonly TransactionInstruction[], signature?: string) {
-  const code = horizonErrorCode({ ...source, programIds: instructions.map((instruction) => instruction.programId) });
+/** A ProgramError when the logs show one of this program's codes (see `horizonErrorCode`), else null. */
+function programFailure(logs: readonly string[] | undefined, signature?: string) {
+  const code = horizonErrorCode(logs ?? []);
   const known = code === null ? null : programError(code);
   return known ? new ProgramError(known.code, known.name, known.message, signature) : null;
 }
@@ -205,19 +205,34 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
    * it is confirmed; throws the program error if it failed; throws PendingError if it is still
    * unknown at the deadline.
    */
-  async function confirm(connection: Connection, signature: string, blockhash: string, instructions: readonly TransactionInstruction[]) {
+  async function confirm(connection: Connection, signature: string, blockhash: string) {
+    // "Expired" needs two polls in a row where the blockhash was already invalid and a status read
+    // made after that check still found nothing, so a transaction that landed is never declared dead.
+    let expiredPolls = 0;
     const status = await until(CONFIRM_WAIT_MS, async () => {
-      const { value } = await connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
-      const found = value[0];
+      let valid: boolean | null = null;
+      try {
+        valid = (await connection.isBlockhashValid(blockhash)).value;
+      } catch {
+        valid = null; // unsupported or failed: keep polling
+      }
+      let found;
+      try {
+        found = (await connection.getSignatureStatuses([signature], { searchTransactionHistory: true })).value[0];
+      } catch (err) {
+        expiredPolls = 0;
+        throw err;
+      }
       if (found && (found.err || found.confirmationStatus === "confirmed" || found.confirmationStatus === "finalized")) return found;
-      // Not seen and its blockhash has expired: it can no longer land.
-      if (!found && !(await connection.isBlockhashValid(blockhash)).value) return "expired" as const;
-      return null;
+      expiredPolls = !found && valid === false ? expiredPolls + 1 : 0;
+      return expiredPolls >= 2 ? ("expired" as const) : null;
     });
     if (!status) throw new PendingError(`Transaction ${signature} was sent but is not confirmed yet; it may still land`, signature);
     if (status === "expired") throw new Error(`Transaction ${signature} expired before it landed; nothing changed`);
     if (status.err) {
-      throw programFailure({ err: status.err }, instructions, signature) ?? new Error(`Transaction ${signature} failed: ${JSON.stringify(status.err)}`);
+      // Attribute the code by the logs only; without them the error stays raw.
+      const tx = await connection.getTransaction(signature, { commitment: "confirmed", maxSupportedTransactionVersion: 0 }).catch(() => null);
+      throw programFailure(tx?.meta?.logMessages ?? undefined, signature) ?? new Error(`Transaction ${signature} failed: ${JSON.stringify(status.err)}`);
     }
   }
 
@@ -243,10 +258,10 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
       } catch (err) {
         // A rollup blockhash can expire while the wallet waits for approval: sign again once.
         if (attempt === 0 && /blockhash not found/i.test((err as Error)?.message ?? "")) continue;
-        const source = err as { logs?: string[]; transactionLogs?: string[]; message?: string };
-        throw programFailure({ logs: source.logs ?? source.transactionLogs, message: source.message }, tx.instructions) ?? err;
+        const source = err as { logs?: string[]; transactionLogs?: string[] };
+        throw programFailure(source.logs ?? source.transactionLogs) ?? err;
       }
-      await confirm(connection, signature, blockhash, tx.instructions);
+      await confirm(connection, signature, blockhash);
       return signature;
     }
   }
@@ -304,6 +319,8 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
 
   async function releasePending(target: OutboxTarget) {
     const state = await outboxState(target.outbox);
+    if (state.kind === "missing") throw new Error(target.missing);
+    if (state.kind === "inFlight" || state.kind === "unseen") return "inFlight" as const;
     return (await recover(target, state)) > 0n ? ("paid" as const) : ("none" as const);
   }
 
@@ -561,10 +578,15 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
       if (!playerOnBase) instructions.push(registerPlayerIx(owner, depositLamports));
       if (!playerOnBase || playerOnBase.owner.equals(PROGRAM_ID)) instructions.push(delegatePlayerIx(owner));
       const outboxState = outboxOnBase?.owner.equals(PROGRAM_ID) ? decodeOutbox(outboxOnBase.data) : null;
-      if (!outboxOnBase || (outboxState && lamports(outboxState.amount) === 0n)) instructions.push(delegateOutboxIx(owner));
+      const delegatingOutbox = !outboxOnBase || (outboxState !== null && lamports(outboxState.amount) === 0n);
+      if (delegatingOutbox) instructions.push(delegateOutboxIx(owner));
       const signature = instructions.length ? await send(base, ...instructions) : undefined;
+      // Wait for the Outbox too when it is, or now becomes, delegated. One left undelegated with an
+      // unpaid amount stays on Solana until releasePending or withdraw pays it.
       const outbox = outboxPda(owner);
-      const picked = await until(DELEGATION_WAIT_MS, async () => ((await ownedInRollup(player)) && (await ownedInRollup(outbox)) ? true : null));
+      const waitOutbox = delegatingOutbox || !!outboxOnBase?.owner.equals(DELEGATION_PROGRAM_ID);
+      const picked = await until(DELEGATION_WAIT_MS, async () =>
+        (await ownedInRollup(player)) && (!waitOutbox || (await ownedInRollup(outbox))) ? true : null);
       if (!picked) throw new PendingError("Registered on Solana; the rollup has not picked up the Player and Outbox yet", signature);
     },
     async topUp(amount) {
