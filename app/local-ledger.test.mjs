@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { BATTLEGROUNDS, STANDARDS, behaviorPda, unitSpec } from "./src/codec.ts";
-import { createLedger, createServer, resolveLedgerPath } from "./local-ledger.mjs";
+import { createLedger, createServer, resolveLedgerPath, winPayout } from "./local-ledger.mjs";
 
 function march() {
   return STANDARDS.find((item) => item.name === "March").elements;
@@ -510,6 +510,32 @@ test("a lock evicts a queued army whose owner's budget no longer covers the stak
     const practiceId = t.raw((db) => db.prepare("SELECT id FROM identities WHERE role = 'practice'").get().id);
     const evicted = t.api("GET", "/armies", {}, new URLSearchParams({ owner: practiceId })).find((item) => item.pubkey === stranded[0]);
     assert.equal(evicted.status, 0);
+  } finally {
+    t.close();
+  }
+});
+
+test("winPayout matches fees::win_payout", () => {
+  assert.deepEqual(winPayout(50_000_000n, 500), { fee: 5_000_000n, toWinner: 45_000_000n, credit: 95_000_000n });
+  assert.deepEqual(winPayout(10_000_000n, 0), { fee: 0n, toWinner: 10_000_000n, credit: 20_000_000n });
+  assert.equal(winPayout(3n, 333).fee, 0n);
+  assert.equal(winPayout(16n, 333).fee, 1n);
+  // Above the cap the rate is clamped to 1000 bps.
+  assert.deepEqual(winPayout(10_000_000n, 5000), winPayout(10_000_000n, 1000));
+  assert.equal(winPayout(10_000_000n, 5000).fee, 2_000_000n);
+});
+
+test("amounts must be whole lamports and a top-up cannot pass u64::MAX", () => {
+  const t = scripted();
+  try {
+    for (const bad of ["", "0x10", "-1", "1.5", true, -1, 1.5]) {
+      assert.throws(() => t.api("POST", "/player/register", { lamports: bad }), /amount must be a whole number of lamports/);
+    }
+    assert.throws(() => t.api("POST", "/player/register", {}), /amount must be a whole number of lamports/);
+    assert.equal(t.api("GET", "/player"), null);
+    t.api("POST", "/player/register", { lamports: 5 });
+    refused(() => t.api("POST", "/player/top-up", { lamports: String(2n ** 64n - 5n) }), "BalanceShort", "Player holds less than the amount asked for");
+    assert.equal(t.api("GET", "/player").free, "5");
   } finally {
     t.close();
   }

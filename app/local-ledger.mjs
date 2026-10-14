@@ -46,6 +46,7 @@ function programFail(name) {
 // The program's `fees.rs`.
 export const DEFAULT_FEE_BPS = 500;
 export const MAX_FEE_BPS = 1000;
+const U64_MAX = 2n ** 64n - 1n;
 
 /** `fees::win_payout`: the loser pays `stake`, `fee` of it to Config and `toWinner` to the winner, who is credited `2 * stake - fee`. */
 export function winPayout(stake, feeBps) {
@@ -129,6 +130,9 @@ export function createLedger(dbPath, options = {}) {
   const db = new DatabaseSync(dbPath);
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA busy_timeout = 3000");
+  if (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'pots'").get()) {
+    console.warn("local ledger: dropping the old pots table; pot balances are not carried over to Players");
+  }
   db.exec(`
     CREATE TABLE IF NOT EXISTS identities (
       role TEXT PRIMARY KEY,
@@ -597,14 +601,13 @@ export function createLedger(dbPath, options = {}) {
     };
   }
 
+  // A u64 of lamports: a decimal digit string, or a safe non-negative integer.
   function lamports(value) {
-    let amount;
-    try {
-      amount = BigInt(value);
-    } catch {
-      throw new LedgerError("amount must be a whole number of lamports");
-    }
-    if (amount < 0n || amount >= 2n ** 64n) throw new LedgerError("amount must be a whole number of lamports");
+    const digits = typeof value === "string" && /^\d+$/.test(value);
+    const safe = typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+    if (!digits && !safe) throw new LedgerError("amount must be a whole number of lamports");
+    const amount = BigInt(value);
+    if (amount > U64_MAX) throw new LedgerError("amount must be a whole number of lamports");
     return amount;
   }
 
@@ -620,6 +623,7 @@ export function createLedger(dbPath, options = {}) {
   function topUp(owner, amount) {
     const player = mustPlayer(owner);
     player.balance += lamports(amount);
+    if (player.balance > U64_MAX) throw programFail("BalanceShort");
     savePlayer(owner, player);
     return playerOut(player);
   }
@@ -694,6 +698,10 @@ export function createLedger(dbPath, options = {}) {
   function settle(ownerA, ownerB, stake, feeBps, outcome) {
     const a = playerOf(ownerA);
     const b = playerOf(ownerB);
+    // The program's checked_sub on `locked` and `fighting`.
+    for (const player of [a, b]) {
+      if (player.locked < stake || player.fighting < 1) throw programFail("NoStake");
+    }
     let fee = 0n;
     if (outcome === 3) {
       a.budget += stake;
@@ -887,7 +895,9 @@ export function createLedger(dbPath, options = {}) {
     const queue = JSON.parse(ground.queue);
     queue.push(pubkey);
     db.prepare("UPDATE battlegrounds SET queue = ? WHERE id = ?").run(JSON.stringify(queue), ground.id);
-    // The practice foe's budget is topped up to one stake, with the lamports to back it.
+    // The practice foe's budget is topped up to one stake, with the lamports to back it. Every
+    // practice army shares that one budget, as one owner's armies do on chain: once a match spends
+    // it, the next lock evicts the practice armies still queued until /practice tops it up again.
     const stake = BigInt(ground.stake);
     const foe = playerOf(opponent.id) || { balance: 0n, budget: 0n, winnings: 0n, locked: 0n, segregate: false, fighting: 0 };
     if (foe.budget < stake) {
