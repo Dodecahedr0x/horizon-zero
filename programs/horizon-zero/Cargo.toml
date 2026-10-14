@@ -18,6 +18,9 @@ no-log-ix-name = []
 idl-build = ["anchor-lang/idl-build", "ephemeral-vrf-sdk/anchor"]
 anchor-debug = ["anchor-lang/anchor-debug"]
 inline-mock-vrf = []
+# LiteSVM has no magic or delegation program: ephemeral accounts become ordinary PDAs funded
+# from the Player at Solana rent, and delegation and commit CPIs are skipped.
+inline-mock-magic = []
 # Checked by the code Anchor's #[program] macro generates.
 custom-heap = []
 custom-panic = []
@@ -27,6 +30,7 @@ cu-profile = ["combat/cu-profile"]
 [dependencies]
 anchor-lang = { version = "1.0.1", features = ["init-if-needed"] }
 ephemeral-vrf-sdk = { version = "0.17.3", features = ["anchor"] }
+ephemeral-rollups-sdk = { version = "0.17.3", features = ["anchor"] }
 combat = { path = "../../crates/combat" }
 solana-instructions-sysvar = "3.0.1"
 

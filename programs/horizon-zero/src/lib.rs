@@ -10,6 +10,7 @@ use horizon_combat::{
 };
 
 mod crank;
+mod eph;
 mod error;
 mod fees;
 mod state;
@@ -721,7 +722,7 @@ fn transfer_sol<'info>(from: &Signer<'info>, to: &AccountInfo<'info>, lamports: 
     )
 }
 
-fn move_lamports(from: &AccountInfo, to: &AccountInfo, lamports: u64) -> Result<()> {
+pub(crate) fn move_lamports(from: &AccountInfo, to: &AccountInfo, lamports: u64) -> Result<()> {
     require!(from.lamports() >= lamports, HorizonError::NoStake);
     **from.try_borrow_mut_lamports()? -= lamports;
     **to.try_borrow_mut_lamports()? += lamports;
