@@ -38,8 +38,13 @@ import {
   decodeConfig,
   decodeOutbox,
   decodePlayer,
+  createBattlegroundIx,
+  delegateBattlegroundIx,
+  delegateConfigIx,
   delegatePlayerIx,
   delegateTreasuryOutboxIx,
+  initTreasuryOutboxIx,
+  initializeIx,
   fundOutboxIx,
   fundTreasuryOutboxIx,
   identityPda,
@@ -106,6 +111,51 @@ test("register_player and delegate_player follow the program's account order", (
   const treasury = delegateTreasuryOutboxIx(owner);
   assert.equal(treasury.keys.length, 9);
   assert.equal(treasury.keys[5].pubkey.toBase58(), treasuryOutboxPda().toBase58());
+});
+
+test("the admin's Solana instructions follow the program's account order", () => {
+  const validator = key(9);
+  const fee = Buffer.alloc(2);
+  fee.writeUInt16LE(500);
+  expect(initializeIx(owner, 500, validator), "initialize", [
+    [owner, true, true],
+    [configPda(), false, true],
+    [identityPda(), false, true],
+    [SystemProgram.programId, false, false],
+  ], Buffer.concat([fee, validator.toBuffer()]));
+  const args = Buffer.alloc(13);
+  args[0] = 1;
+  args.writeUInt16LE(16, 1);
+  args.writeBigUInt64LE(50_000_000n, 3);
+  args[11] = 10;
+  args[12] = 8;
+  expect(createBattlegroundIx(owner, { id: 1, budget: 16, stake: 50_000_000, cols: 10, rows: 8 }), "create_battleground", [
+    [owner, true, true],
+    [configPda(), false, false],
+    [battlegroundPda(1), false, true],
+    [SystemProgram.programId, false, false],
+  ], args);
+  expect(initTreasuryOutboxIx(owner), "init_treasury_outbox", [
+    [owner, true, true],
+    [configPda(), false, false],
+    [treasuryOutboxPda(), false, true],
+    [SystemProgram.programId, false, false],
+  ]);
+  const delegatedKeys = (account) => [
+    [pda([Buffer.from("buffer"), account.toBuffer()], PROGRAM_ID), false, true],
+    [pda([Buffer.from("delegation"), account.toBuffer()], DELEGATION_PROGRAM_ID), false, true],
+    [pda([Buffer.from("delegation-metadata"), account.toBuffer()], DELEGATION_PROGRAM_ID), false, true],
+    [account, false, true],
+    [PROGRAM_ID, false, false],
+    [DELEGATION_PROGRAM_ID, false, false],
+    [SystemProgram.programId, false, false],
+  ];
+  expect(delegateConfigIx(owner), "delegate_config", [[owner, true, true], ...delegatedKeys(configPda())]);
+  expect(delegateBattlegroundIx(owner, 2), "delegate_battleground", [
+    [owner, true, true],
+    [configPda(), false, false],
+    ...delegatedKeys(battlegroundPda(2)),
+  ], Buffer.from([2]));
 });
 
 test("fund_outbox then withdraw, and the treasury pair", () => {

@@ -2,7 +2,8 @@
 //
 //   node scripts/deploy.mjs devnet  [--keypair ~/.config/solana/id.json] [--url <rpc>]
 //   node scripts/deploy.mjs mainnet --confirm-mainnet [--keypair <path>] [--url <rpc>] [--priority <micro-lamports>]
-//   extra flags: --skip-build (reuse target/deploy/horizon_zero.so), --skip-bootstrap
+//   extra flags: --skip-build (reuse target/deploy/horizon_zero.so), --skip-bootstrap,
+//                --er-url <rollup rpc> (required unless --skip-bootstrap), --validator <identity>
 //
 // The program id is the address of target/deploy/horizon_zero-keypair.json, which must be
 // Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c. The --keypair wallet pays, holds the upgrade
@@ -16,8 +17,9 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PROGRAM_ID = "Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c";
-// ephemeral_vrf_sdk::consts::DEFAULT_QUEUE, served by MagicBlock's oracles on devnet and mainnet.
-const ORACLE_QUEUE = "Cuj97ggrhhidhbu39TijNVqE74xvKJ69gDervRUXAxGh";
+// ephemeral_vrf_sdk::consts::DEFAULT_EPHEMERAL_QUEUE: lock_army runs in the rollup, so its oracle
+// must call back into the rollup.
+const ORACLE_QUEUE = "5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc";
 const CLUSTERS = {
   devnet: "https://api.devnet.solana.com",
   mainnet: "https://api.mainnet-beta.solana.com",
@@ -54,6 +56,9 @@ if (!CLUSTERS[cluster]) fail("usage: node scripts/deploy.mjs <devnet|mainnet> [-
 if (cluster === "mainnet" && !has("--confirm-mainnet")) fail("mainnet spends real SOL; pass --confirm-mainnet to go ahead");
 
 const url = value("--url", CLUSTERS[cluster]);
+// The rollup Config is pinned to: bootstrap delegates every account to its validator identity.
+const erUrl = value("--er-url", "");
+if (!erUrl && !has("--skip-bootstrap")) fail("--er-url <rollup rpc> is required: Config pins that rollup's validator for good");
 const keypair = value("--keypair", "~/.config/solana/id.json").replace(/^~(?=$|\/)/, os.homedir());
 if (!fs.existsSync(keypair)) fail(`wallet keypair not found: ${keypair}`);
 const programKeypair = path.join(root, "target/deploy/horizon_zero-keypair.json");
@@ -80,12 +85,17 @@ const priority = value("--priority", "");
 if (priority) deploy.push("--with-compute-unit-price", priority);
 run("solana", deploy);
 
-if (!has("--skip-bootstrap")) run("node", ["app/scripts/bootstrap.mjs", "--url", url, "--keypair", keypair]);
+if (!has("--skip-bootstrap")) {
+  const validator = value("--validator", "");
+  run("node", ["app/scripts/bootstrap.mjs", "--url", url, "--er-url", erUrl, "--keypair", keypair, ...(validator ? ["--validator", validator] : [])]);
+}
 
+const rollup = erUrl || "<rollup RPC>";
 process.stdout.write(`
 [deploy] done. Build the game for this cluster with:
   VITE_DEV_MODE=false
   VITE_RPC_URL=${url}
+  VITE_ER_RPC_URL=${rollup}
   VITE_ORACLE_QUEUE=${ORACLE_QUEUE}
-and point the indexer at the ephemeral rollup that serves this cluster (not ${url}) with SOLANA_RPC_URL=<rollup RPC>
+and point the indexer at the same rollup (not ${url}) with SOLANA_RPC_URL=${rollup}
 `);

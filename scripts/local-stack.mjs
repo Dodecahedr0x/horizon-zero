@@ -1,31 +1,32 @@
 // Local Solana + MagicBlock ephemeral rollup for Horizon Zero, as one foreground process.
 //
-//   node scripts/local-stack.mjs            build, boot, bootstrap, then keep running (Ctrl-C stops all)
-//   node scripts/local-stack.mjs --check    the same, then play one VRF-resolved battle and exit
-//   node scripts/local-stack.mjs --no-build reuse target/deploy/horizon_zero.so and mock_hydra.so
+//   node scripts/local-stack.mjs              build, boot, bootstrap, index, then keep running (Ctrl-C stops all)
+//   node scripts/local-stack.mjs --check      the same, then play, settle and cash out one battle and exit
+//   node scripts/local-stack.mjs --no-build   reuse target/deploy/horizon_zero.so
+//   node scripts/local-stack.mjs --no-indexer do not start the indexer
 //
-// mb-stack (npm @magicblock-labs/ephemeral-validator) runs the base validator with the delegation
-// and VRF programs and the VRF test queue preloaded, the ephemeral validator, and the
-// query-filtering front. horizon_zero is loaded into the base validator at its program id.
-// vrf-oracle from the same package fulfils requests on the test queue with its built-in local key.
-// mb-stack has no Hydra, so programs/mock-hydra is loaded at the Hydra id and
-// app/scripts/hydra-cranker.mjs runs the settlement cranks. HZ_HYDRA_SO=<hydra.so> loads a real
-// Hydra build instead, and HZ_HYDRA_CRANKER=<hydra-cranker binary> runs MagicBlock's cranker
-// (both from https://github.com/magicblock-labs/hydra).
+// mb-stack (npm @magicblock-labs/ephemeral-validator) runs the base validator with the delegation,
+// VRF and eSPL programs and the VRF queues preloaded, the ephemeral rollup, and the query-filtering
+// front. horizon_zero is loaded into the base validator at genesis (`solana program deploy` of a
+// default build is refused locally); the rollup clones it on first use. vrf-oracle from the same
+// package watches the rollup and answers the ephemeral test queue, where lock_army asks for its seed.
+// The bootstrap creates and funds the eSPL rent PDA top-ups need, initializes Config pinned to the
+// rollup's identity, and delegates Config, the battlegrounds and the treasury Outbox.
+// The ledger is reset on every start, so the indexer gets a fresh database under target/localnet.
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { indexerListenPort } from "./indexer-port.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const work = path.join(root, "target/localnet");
 const args = new Set(process.argv.slice(2));
 
 export const PROGRAM_ID = "Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c";
-// ephemeral_vrf_sdk::consts::DEFAULT_TEST_QUEUE, served by the local vrf-oracle.
-export const TEST_QUEUE = "GKE6d7iv8kCBrsxr78W3xVdjGLLLJnxsGiuzrsZCGEvb";
-export const HYDRA_ID = "Hydra17i1feui9deaxu6d1TzSQMRNHeBRkDR1Awy7zea";
+// ephemeral_vrf_sdk::consts::DEFAULT_EPHEMERAL_TEST_QUEUE, served by the vrf-oracle that watches the rollup.
+export const EPHEMERAL_TEST_QUEUE = "Sc9MJUngNbQXSXGP3F67KvKwVnhaYn6kcioxXNVowYT";
 const MB_PACKAGE = "@magicblock-labs/ephemeral-validator@0.14.10";
 
 const port = (name, fallback) => Number(process.env[name] || fallback);
@@ -37,6 +38,10 @@ const PUBLIC = port("MB_STACK_PUBLIC_PORT", 6699);
 const GOSSIP = port("HZ_LOCAL_GOSSIP_PORT", 18000);
 const DYNAMIC = process.env.HZ_LOCAL_DYNAMIC_PORTS || "18100-18200";
 const FAUCET = port("HZ_LOCAL_FAUCET_PORT", 19900);
+const BASE_URL = `http://127.0.0.1:${BASE}`;
+const ER_URL = `http://127.0.0.1:${ER}`;
+const INDEXER_PORT = indexerListenPort();
+const INDEXER_URL = `http://127.0.0.1:${INDEXER_PORT}`;
 
 const children = [];
 let stopping = false;
@@ -59,9 +64,9 @@ function run(command, commandArgs, options = {}) {
   return result;
 }
 
-function start(name, command, commandArgs, file) {
+function start(name, command, commandArgs, file, options = {}) {
   const out = fs.openSync(path.join(work, file), "w");
-  const child = spawn(command, commandArgs, { cwd: root, detached: true, stdio: ["ignore", out, out] });
+  const child = spawn(command, commandArgs, { cwd: root, detached: true, stdio: ["ignore", out, out], ...options });
   children.push({ name, child });
   child.on("exit", (code, signal) => {
     if (stopping) return;
@@ -86,21 +91,14 @@ function stop(code) {
   setTimeout(() => process.exit(code), 1500).unref();
 }
 
-function rpc(portNumber, method, params = []) {
+function request(portNumber, method, pathName, body) {
   return new Promise((resolve) => {
-    const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method, params });
     const req = http.request(
-      { host: "127.0.0.1", port: portNumber, method: "POST", headers: { "content-type": "application/json" }, timeout: 2000 },
+      { host: "127.0.0.1", port: portNumber, method, path: pathName, headers: { "content-type": "application/json" }, timeout: 2000 },
       (res) => {
         let text = "";
         res.on("data", (chunk) => (text += chunk));
-        res.on("end", () => {
-          try {
-            resolve(JSON.parse(text).result ?? null);
-          } catch {
-            resolve(null);
-          }
-        });
+        res.on("end", () => resolve({ status: res.statusCode, text }));
       },
     );
     req.on("error", () => resolve(null));
@@ -112,13 +110,22 @@ function rpc(portNumber, method, params = []) {
   });
 }
 
-async function waitFor(label, check, seconds = 180) {
+async function rpc(portNumber, method, params = []) {
+  const response = await request(portNumber, "POST", "/", JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }));
+  try {
+    return response ? (JSON.parse(response.text).result ?? null) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function waitFor(label, check, seconds = 180, file = "") {
   for (let i = 0; i < seconds * 2; i += 1) {
     if (stopping) return;
     if (await check()) return;
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
-  process.stderr.write(`[local] ${label} did not come up in ${seconds}s; see target/localnet/\n`);
+  process.stderr.write(`[local] ${label} did not come up in ${seconds}s; see target/localnet/${file}\n`);
   stop(1);
 }
 
@@ -130,27 +137,35 @@ async function main() {
   need("solana-test-validator", "Install the Anza CLI: https://docs.anza.xyz/cli/install");
   fs.mkdirSync(work, { recursive: true });
 
-  const busy = await rpc(BASE, "getHealth");
-  if (busy) {
-    process.stderr.write(`[local] something already answers on 127.0.0.1:${BASE}. Stop it or set MB_STACK_BASE_PORT.\n`);
+  for (const [what, portNumber] of [["base", BASE], ["rollup", ER]]) {
+    if (await rpc(portNumber, "getHealth")) {
+      process.stderr.write(`[local] something already answers on 127.0.0.1:${portNumber} (${what}). Stop it first.\n`);
+      process.exit(1);
+    }
+  }
+  const indexing = !args.has("--no-indexer");
+  if (indexing && (await request(Number(INDEXER_PORT), "GET", "/health"))) {
+    process.stderr.write(`[local] something already answers on 127.0.0.1:${INDEXER_PORT}. Stop it, set INDEXER_PORT, or pass --no-indexer.\n`);
     process.exit(1);
   }
 
   if (!args.has("--no-build")) {
-    // Default features: inline-mock-vrf is a LiteSVM-only build and must not reach a real cluster.
-    log("building programs/horizon-zero and programs/mock-hydra");
+    // Default features: inline-mock-vrf and inline-mock-magic are LiteSVM-only builds and must not
+    // reach a real validator.
+    log("building programs/horizon-zero");
     run("cargo-build-sbf", ["--manifest-path", "programs/horizon-zero/Cargo.toml"]);
-    run("cargo-build-sbf", ["--manifest-path", "programs/mock-hydra/Cargo.toml"]);
   }
   const so = path.join(root, "target/deploy/horizon_zero.so");
-  const hydraSo = process.env.HZ_HYDRA_SO ? path.resolve(process.env.HZ_HYDRA_SO) : path.join(root, "target/deploy/mock_hydra.so");
-  for (const file of [so, hydraSo]) {
-    if (!fs.existsSync(file)) {
-      process.stderr.write(`[local] ${path.relative(root, file)} is missing; run without --no-build\n`);
-      process.exit(1);
-    }
+  if (!fs.existsSync(so)) {
+    process.stderr.write(`[local] ${path.relative(root, so)} is missing; run without --no-build\n`);
+    process.exit(1);
   }
 
+  // `--reset` resets only the base ledger. The rollup keeps its accounts in
+  // magicblock-test-storage/ under its working directory, so it runs in target/localnet and that
+  // directory is removed here: otherwise ephemeral armies, behaviors and battles from the last run
+  // outlive the base ledger they were made on.
+  fs.rmSync(path.join(work, "magicblock-test-storage"), { recursive: true, force: true });
   log("starting mb-stack (base validator, ephemeral rollup, query front)");
   start("mb-stack", "mb-stack", [
     "--reset",
@@ -159,44 +174,58 @@ async function main() {
     "--dynamic-port-range", DYNAMIC,
     "--faucet-port", String(FAUCET),
     "--bpf-program", PROGRAM_ID, so,
-    "--bpf-program", HYDRA_ID, hydraSo,
-  ], "mb-stack.log");
-  await waitFor("mb-stack", async () => fs.readFileSync(path.join(work, "mb-stack.log"), "utf8").includes("stack is ready"));
+  ], "mb-stack.log", { cwd: work });
+  await waitFor("mb-stack", async () => fs.readFileSync(path.join(work, "mb-stack.log"), "utf8").includes("stack is ready"), 180, "mb-stack.log");
   if (stopping) return;
 
-  log("starting vrf-oracle on the test queue");
-  start("vrf-oracle", "vrf-oracle", ["--rpc-url", `http://127.0.0.1:${BASE}`, "--websocket-url", `ws://127.0.0.1:${BASE + 1}`], "vrf-oracle.log");
+  // The ephemeral test queue is delegated to the rollup, so its oracle watches the rollup.
+  log("starting vrf-oracle on the rollup's ephemeral test queue");
+  start("vrf-oracle", "vrf-oracle", ["--rpc-url", ER_URL, "--websocket-url", `ws://127.0.0.1:${ER + 1}`], "vrf-oracle.log", {
+    env: { ...process.env, RUST_LOG: process.env.RUST_LOG || "info" },
+  });
 
   const admin = path.join(work, "admin.json");
   if (!fs.existsSync(admin)) run("solana-keygen", ["new", "--no-bip39-passphrase", "--silent", "--force", "-o", admin], { stdio: "ignore" });
-  run("solana", ["airdrop", "100", "-k", admin, "-u", `http://127.0.0.1:${BASE}`], { stdio: "ignore" });
-  log("bootstrapping config, battlegrounds and standard behaviors");
-  run("node", ["app/scripts/bootstrap.mjs", "--url", `http://127.0.0.1:${BASE}`, "--keypair", admin]);
+  run("solana", ["airdrop", "100", "-k", admin, "-u", BASE_URL], { stdio: "ignore" });
+  log("bootstrapping: eSPL rent PDA, config, battlegrounds, treasury Outbox, delegations");
+  run("node", ["app/scripts/bootstrap.mjs", "--url", BASE_URL, "--er-url", ER_URL, "--keypair", admin, "--espl-rent"]);
 
-  const cranker = path.join(work, "cranker.json");
-  if (!fs.existsSync(cranker)) run("solana-keygen", ["new", "--no-bip39-passphrase", "--silent", "--force", "-o", cranker], { stdio: "ignore" });
-  run("solana", ["airdrop", "10", "-k", cranker, "-u", `http://127.0.0.1:${BASE}`], { stdio: "ignore" });
-  if (process.env.HZ_HYDRA_CRANKER) {
-    log(`starting ${process.env.HZ_HYDRA_CRANKER}`);
-    start("hydra-cranker", process.env.HZ_HYDRA_CRANKER, ["--rpc-url", `http://127.0.0.1:${BASE}`, "--ws-url", `ws://127.0.0.1:${BASE + 1}`, "--keypair", cranker], "hydra-cranker.log");
-  } else {
-    log("starting the Hydra cranker");
-    start("hydra-cranker", "node", ["app/scripts/hydra-cranker.mjs", "--url", `http://127.0.0.1:${BASE}`, "--keypair", cranker], "hydra-cranker.log");
+  if (indexing) {
+    // A fresh database: the ledger was just reset, and rows from the last run name accounts that
+    // no longer exist.
+    const database = path.join(work, "indexer.db");
+    for (const suffix of ["", "-wal", "-shm"]) fs.rmSync(database + suffix, { force: true });
+    log("starting the indexer on the rollup (first run compiles it)");
+    start("indexer", "node", ["scripts/run-indexer.mjs"], "indexer.log", {
+      env: { ...process.env, SOLANA_RPC_URL: ER_URL, DATABASE_PATH: database, INDEXER_PORT },
+    });
+    await waitFor("the indexer", async () => (await request(Number(INDEXER_PORT), "GET", "/battlegrounds"))?.status === 200, 900, "indexer.log");
+    if (stopping) return;
   }
 
   log("ready");
-  log(`  base (Solana) RPC   http://127.0.0.1:${BASE}   ws ws://127.0.0.1:${BASE + 1}`);
-  log(`  ephemeral rollup    http://127.0.0.1:${ER}   ws ws://127.0.0.1:${ER + 1}`);
+  log(`  base (Solana) RPC   ${BASE_URL}   ws ws://127.0.0.1:${BASE + 1}`);
+  log(`  ephemeral rollup    ${ER_URL}   ws ws://127.0.0.1:${ER + 1}`);
   log(`  public (routed)     http://127.0.0.1:${PUBLIC}   ws ws://127.0.0.1:${PUBLIC + 1}`);
-  log(`  VRF queue           ${TEST_QUEUE}`);
-  log(`  Hydra               ${HYDRA_ID} from ${path.relative(root, hydraSo)}`);
-  log(`  Hydra cranker       ${process.env.HZ_HYDRA_CRANKER || "app/scripts/hydra-cranker.mjs"}`);
+  log(`  VRF queue           ${EPHEMERAL_TEST_QUEUE} (ephemeral, oracle on the rollup)`);
+  log(`  admin keypair       ${path.relative(root, admin)}`);
+  if (indexing) log(`  indexer             ${INDEXER_URL}   db target/localnet/indexer.db`);
+  log(`  app env             VITE_DEV_MODE=false VITE_RPC_URL=${BASE_URL} VITE_ER_RPC_URL=${ER_URL} VITE_ORACLE_QUEUE=${EPHEMERAL_TEST_QUEUE}`);
   log(`  fund a wallet       pnpm localnet:fund <address>`);
 
   if (args.has("--check")) {
-    log("playing one VRF-resolved battle");
-    run("node", ["app/scripts/localnet-assert.mjs"], { env: { ...process.env, RPC_URL: `http://127.0.0.1:${BASE}`, ORACLE_QUEUE: TEST_QUEUE } });
-    log("localnet battle resolved");
+    log("playing, settling and cashing out one battle");
+    run("node", ["app/scripts/localnet-assert.mjs"], {
+      env: {
+        ...process.env,
+        RPC_URL: BASE_URL,
+        ER_RPC_URL: ER_URL,
+        ORACLE_QUEUE: EPHEMERAL_TEST_QUEUE,
+        ADMIN_KEYPAIR: admin,
+        ...(indexing ? { INDEXER_URL } : { INDEXER_URL: "" }),
+      },
+    });
+    log("localnet check passed");
     stop(0);
     return;
   }

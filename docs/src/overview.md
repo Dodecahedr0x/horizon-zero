@@ -58,7 +58,7 @@ flowchart TB
 
 The catalog has three races: Ashborn is race `0`, Rootborn is race `1`, and Deeplings is race `2`. Kind ids start again at `0` for each race, so kind `0` is a Guard in an Ashborn army, a Thornling in a Rootborn one, and a Clawling in a Deeplings one. `create_army` and `update_army` reject a race with no catalog arm and a kind that race does not have. Each race is one arm of `stats_for`, with its own kind enum (`AshbornKind`, `RootbornKind`, `DeeplingsKind`). The interpreter does not know race names. It reads the stats and the cast copied onto each unit.
 
-The program does not hardcode battleground names, budgets, stakes, or grid sizes. `create_battleground` stores the admin's `battleground_id`, `budget`, `stake_lamports`, `cols`, and `rows`. Zone depth is always 2: zone A is rows `0..2`, zone B is the last two rows, and both span every column. The `battlegrounds` list in `content/catalog.json` is the set an admin is expected to create; `app/scripts/bootstrap.mjs` creates it, and the game, the studio and the local ledger read the same list:
+The program does not hardcode battleground names, budgets, stakes, or grid sizes. `create_battleground` stores the admin's `battleground_id`, `budget`, `stake_lamports`, `cols`, and `rows`. Zone depth is always 2: zone A is rows `0..2`, zone B is the last two rows, and both span every column. The `battlegrounds` list in `content/catalog.json` is the set an admin is expected to create; `app/scripts/bootstrap.mjs` creates and delegates it, and the game, the studio and the local ledger read the same list:
 
 | id | name | budget | stake (lamports) | SOL | grid |
 | --- | --- | --- | --- | --- | --- |

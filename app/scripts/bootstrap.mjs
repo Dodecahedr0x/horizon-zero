@@ -1,112 +1,148 @@
 /**
- * Brings a cluster where horizon_zero is deployed to a playable state: the config and VRF identity,
- * the three battlegrounds, and the standard behaviors from content/catalog.json.
- * Every step is skipped when its account already exists, so this is safe to run after each deploy.
+ * Brings a cluster where horizon_zero is deployed to a playable state on its ephemeral rollup:
+ * Config (fee 500 bps, pinned to the rollup's validator), the battlegrounds in content/catalog.json,
+ * the treasury Outbox, then the delegation of Config, every battleground and the treasury Outbox.
+ * It waits until the rollup returns Config. Every step is skipped when it is already done, so this
+ * is safe to run after each deploy.
  *
- *   node app/scripts/bootstrap.mjs --url http://127.0.0.1:8899 --keypair ~/.config/solana/id.json
+ *   node app/scripts/bootstrap.mjs --url <solana rpc> --er-url <rollup rpc> --keypair <file>
+ *     [--validator <identity>]   default: the rollup's getIdentity
+ *     [--fee-bps 500]            used by initialize only
+ *     [--espl-rent]              local stack only: create and fund the eSPL rent PDA top-ups need
  *
- * The keypair pays and becomes the admin on the first run. Later runs must use that same admin
- * to add a missing battleground.
+ * The keypair pays and becomes the admin on the first run. Later runs must use that same admin.
+ * Standard behaviors are not created here: behaviors live in the rollup and a Player pays their rent.
  */
-import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import { pathToFileURL } from "node:url";
-import { Connection, Keypair, PublicKey, SystemProgram, Transaction, TransactionInstruction } from "@solana/web3.js";
-import { loadCatalog } from "../../content/load.mjs";
+import { initRentPdaIx } from "@magicblock-labs/ephemeral-rollups-sdk";
+import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
+import {
+  BATTLEGROUNDS,
+  DELEGATION_PROGRAM_ID,
+  PROGRAM_ID,
+  battlegroundPda,
+  configPda,
+  createBattlegroundIx,
+  decodeConfig,
+  decodeOutbox,
+  delegateBattlegroundIx,
+  delegateConfigIx,
+  delegateTreasuryOutboxIx,
+  initTreasuryOutboxIx,
+  initializeIx,
+  treasuryOutboxPda,
+} from "../src/codec.ts";
 
-export const PROGRAM_ID = new PublicKey("Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c");
-
-export const BATTLEGROUNDS = loadCatalog().battlegrounds;
-
-export function sighash(name) {
-  return createHash("sha256").update(`global:${name}`).digest().subarray(0, 8);
-}
-
-export function pda(seeds) {
-  return PublicKey.findProgramAddressSync(seeds, PROGRAM_ID)[0];
-}
-
-export function ix(name, keys, rest = Buffer.alloc(0)) {
-  return new TransactionInstruction({ programId: PROGRAM_ID, keys, data: Buffer.concat([sighash(name), rest]) });
-}
+export const FEE_BPS = 500;
+// The eSPL program's [b"rent"] PDA funds the temporary account behind each lamportsDelegatedTransferIx
+// top-up. MagicBlock runs it on devnet and mainnet; mb-stack ships the program but not the PDA.
+const ESPL_PROGRAM_ID = new PublicKey("SPLxh1LVZzEkX99H6rqYizhytLWPZVV296zyYDPagv2");
+export const ESPL_RENT_PDA = PublicKey.findProgramAddressSync([Buffer.from("rent")], ESPL_PROGRAM_ID)[0];
 
 export async function send(connection, payer, instructions) {
   const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
   const tx = new Transaction({ feePayer: payer.publicKey, recentBlockhash: blockhash }).add(...instructions);
   tx.sign(payer);
   const signature = await connection.sendRawTransaction(tx.serialize());
-  await connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, "confirmed");
+  const { value } = await connection.confirmTransaction({ signature, blockhash, lastValidBlockHeight }, "confirmed");
+  if (value.err) throw new Error(`${signature} failed: ${JSON.stringify(value.err)}`);
   return signature;
 }
 
-export function battlegroundKey(id) {
-  return pda([Buffer.from("battleground"), Buffer.from([id])]);
+/** The identity a rollup signs with: the validator Config pins and every delegation names. */
+export async function rollupIdentity(er) {
+  const response = await er._rpcRequest("getIdentity", []);
+  if (!response.result?.identity) throw new Error(`the rollup at ${er.rpcEndpoint} did not return its identity`);
+  return new PublicKey(response.result.identity);
 }
 
-export function behaviorKey(body) {
-  const hash = createHash("sha256").update(Buffer.from(body)).digest();
-  return { key: pda([Buffer.from("behavior"), hash]), hash };
+async function waitFor(label, seconds, check) {
+  for (const end = Date.now() + seconds * 1000; Date.now() < end;) {
+    if (await check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error(`${label} after ${seconds}s`);
 }
 
-export async function bootstrap(connection, admin, { log = console.log } = {}) {
-  const exists = async (key) => (await connection.getAccountInfo(key)) !== null;
-  const program = await connection.getAccountInfo(PROGRAM_ID);
+export async function bootstrap(base, er, admin, { validator, feeBps = FEE_BPS, esplRent = false, log = console.log } = {}) {
+  const program = await base.getAccountInfo(PROGRAM_ID);
   if (!program?.executable) throw new Error(`horizon_zero is not deployed at ${PROGRAM_ID.toBase58()} on this cluster`);
+  const owned = async (key) => (await base.getAccountInfo(key))?.owner.equals(PROGRAM_ID) ?? false;
 
-  const config = pda([Buffer.from("config")]);
-  if (await exists(config)) {
-    log("config: already initialized");
+  if (esplRent) {
+    if (await base.getAccountInfo(ESPL_RENT_PDA)) {
+      log("eSPL rent PDA: already created");
+    } else {
+      await send(base, admin, [
+        initRentPdaIx(admin.publicKey, ESPL_RENT_PDA),
+        SystemProgram.transfer({ fromPubkey: admin.publicKey, toPubkey: ESPL_RENT_PDA, lamports: LAMPORTS_PER_SOL }),
+      ]);
+      log(`eSPL rent PDA: created and funded with 1 SOL (${ESPL_RENT_PDA.toBase58()})`);
+    }
+  }
+
+  const config = configPda();
+  const identity = validator ?? (await rollupIdentity(er));
+  const existing = await base.getAccountInfo(config);
+  if (existing) {
+    const stored = decodeConfig(existing.data);
+    log(`config: already initialized, admin ${stored?.admin}`);
+    if (stored && stored.validator !== identity.toBase58()) {
+      throw new Error(`Config pins validator ${stored.validator}, but the rollup is ${identity.toBase58()}`);
+    }
   } else {
-    await send(connection, admin, [
-      ix("initialize", [
-        { pubkey: admin.publicKey, isSigner: true, isWritable: true },
-        { pubkey: config, isSigner: false, isWritable: true },
-        { pubkey: pda([Buffer.from("identity")]), isSigner: false, isWritable: true },
-        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-      ]),
-    ]);
-    log(`config: initialized, admin ${admin.publicKey.toBase58()}`);
+    await send(base, admin, [initializeIx(admin.publicKey, feeBps, identity)]);
+    log(`config: initialized, admin ${admin.publicKey.toBase58()}, fee ${feeBps} bps, validator ${identity.toBase58()}`);
   }
 
   for (const ground of BATTLEGROUNDS) {
-    const key = battlegroundKey(ground.id);
-    if (await exists(key)) {
+    if (await base.getAccountInfo(battlegroundPda(ground.id))) {
       log(`${ground.name}: already created`);
       continue;
     }
-    const args = Buffer.alloc(13);
-    args[0] = ground.id;
-    args.writeUInt16LE(ground.budget, 1);
-    args.writeBigUInt64LE(BigInt(ground.stake), 3);
-    args[11] = ground.cols;
-    args[12] = ground.rows;
-    await send(connection, admin, [
-      ix("create_battleground", [
-        { pubkey: admin.publicKey, isSigner: true, isWritable: true },
-        { pubkey: config, isSigner: false, isWritable: false },
-        { pubkey: key, isSigner: false, isWritable: true },
-        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-      ], args),
-    ]);
-    log(`${ground.name}: created (${ground.cols}x${ground.rows}, budget ${ground.budget})`);
+    await send(base, admin, [createBattlegroundIx(admin.publicKey, ground)]);
+    log(`${ground.name}: created (${ground.cols}x${ground.rows}, budget ${ground.budget}, stake ${ground.stake})`);
   }
 
-  for (const behavior of loadCatalog().behaviors) {
-    const { key, hash } = behaviorKey(behavior.body);
-    if (await exists(key)) continue;
-    const bytes = Buffer.from(behavior.body);
-    const len = Buffer.alloc(4);
-    len.writeUInt32LE(bytes.length);
-    await send(connection, admin, [
-      ix("create_behavior", [
-        { pubkey: admin.publicKey, isSigner: true, isWritable: true },
-        { pubkey: key, isSigner: false, isWritable: true },
-        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-      ], Buffer.concat([hash, len, bytes])),
-    ]);
-    log(`behavior ${behavior.name}: created`);
+  const treasury = treasuryOutboxPda();
+  if (await base.getAccountInfo(treasury)) {
+    log("treasury Outbox: already created");
+  } else {
+    await send(base, admin, [initTreasuryOutboxIx(admin.publicKey)]);
+    log("treasury Outbox: created");
   }
+
+  if (await owned(config)) {
+    await send(base, admin, [delegateConfigIx(admin.publicKey)]);
+    log("config: delegated");
+  }
+  for (const ground of BATTLEGROUNDS) {
+    if (!(await owned(battlegroundPda(ground.id)))) continue;
+    await send(base, admin, [delegateBattlegroundIx(admin.publicKey, ground.id)]);
+    log(`${ground.name}: delegated`);
+  }
+  const treasuryInfo = await base.getAccountInfo(treasury);
+  if (treasuryInfo.owner.equals(PROGRAM_ID)) {
+    // An unpaid claim must be released first (OutboxBusy); the admin's wallet does that from the app.
+    if (BigInt(decodeOutbox(treasuryInfo.data)?.amount ?? "0") === 0n) {
+      await send(base, admin, [delegateTreasuryOutboxIx(admin.publicKey)]);
+      log("treasury Outbox: delegated");
+    } else {
+      log("treasury Outbox: holds an unreleased claim, not delegated");
+    }
+  } else if (!treasuryInfo.owner.equals(DELEGATION_PROGRAM_ID)) {
+    throw new Error(`treasury Outbox has an unexpected owner ${treasuryInfo.owner.toBase58()}`);
+  }
+
+  // The rollup clones a delegated account on first read; ask until Config is there as the program's.
+  const inRollup = async (key) => (await er.getAccountInfo(key))?.owner.equals(PROGRAM_ID) ?? false;
+  await waitFor("the rollup did not return Config", 60, () => inRollup(config));
+  for (const ground of BATTLEGROUNDS) {
+    await waitFor(`the rollup did not return ${ground.name}`, 60, () => inRollup(battlegroundPda(ground.id)));
+  }
+  log(`rollup ${er.rpcEndpoint}: Config and ${BATTLEGROUNDS.length} battlegrounds are live`);
 }
 
 export function readKeypair(file) {
@@ -125,6 +161,12 @@ function flag(name, fallback) {
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   const url = flag("--url", process.env.RPC_URL || "http://127.0.0.1:8899");
+  const erUrl = flag("--er-url", process.env.ER_RPC_URL || "http://127.0.0.1:7799");
   const admin = readKeypair(flag("--keypair", "~/.config/solana/id.json"));
-  await bootstrap(new Connection(url, "confirmed"), admin);
+  const validator = flag("--validator", "");
+  await bootstrap(new Connection(url, "confirmed"), new Connection(erUrl, "confirmed"), admin, {
+    validator: validator ? new PublicKey(validator) : undefined,
+    feeBps: Number(flag("--fee-bps", String(FEE_BPS))),
+    esplRent: process.argv.includes("--espl-rent"),
+  });
 }

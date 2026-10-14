@@ -152,7 +152,7 @@ The CPI is signed by the program identity `[b"identity"]`. The accounts on that 
 
 The oracle later invokes `seed_match`. The signer it supplies is the scoped identity `[b"identity", horizon_program_id]` on the VRF program. `randomness` becomes the battle seed and later the `simulate` seed. Deployment does not read it. The seed does choose the blocked tiles between the two starting zones. `settle_match` passes the `cols` and `rows` copied onto the battle at `lock_army`.
 
-The web client sends `lock_army` to the rollup, so it asks an ephemeral queue, whose oracle calls back into the rollup. The queue is `VITE_ORACLE_QUEUE` when set. Otherwise a production build uses the SDK's `DEFAULT_EPHEMERAL_QUEUE` `5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc`, and `vite dev` uses the ephemeral test queue `Sc9MJUngNbQXSXGP3F67KvKwVnhaYn6kcioxXNVowYT`, which the local stack serves with a second `vrf-oracle` pointed at the rollup (spike finding; `scripts/local-stack.mjs` does not start it yet). The program accepts any queue the VRF program owns. See [Networks and deployment](deployment.md).
+The web client sends `lock_army` to the rollup, so it asks an ephemeral queue, whose oracle calls back into the rollup. The queue is `VITE_ORACLE_QUEUE` when set. Otherwise a production build uses the SDK's `DEFAULT_EPHEMERAL_QUEUE` `5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc`, and `vite dev` uses the ephemeral test queue `Sc9MJUngNbQXSXGP3F67KvKwVnhaYn6kcioxXNVowYT`, which the local stack serves with a `vrf-oracle` pointed at the rollup. The program accepts any queue the VRF program owns. See [Networks and deployment](deployment.md).
 
 ## Settlement and fee
 

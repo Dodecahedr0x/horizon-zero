@@ -410,6 +410,49 @@ function delegateIx(name: string, signerKey: PublicKey, account: PublicKey) {
   return ix(name, [signer(signerKey), readonly(configPda()), ...head, ...tail]);
 }
 
+/** Solana, once. The signer becomes the admin; `validator` is the rollup every delegation goes to. */
+export function initializeIx(admin: PublicKey, feeBps: number, validator: PublicKey) {
+  const rest = new Uint8Array(34);
+  new DataView(rest.buffer).setUint16(0, feeBps, true);
+  rest.set(validator.toBytes(), 2);
+  return ix("initialize", [signer(admin), writable(configPda()), writable(identityPda()), readonly(SystemProgram.programId)], rest);
+}
+
+/** Solana, admin. */
+export function createBattlegroundIx(
+  admin: PublicKey,
+  ground: { id: number; budget: number; stake: number | bigint; cols: number; rows: number },
+) {
+  const rest = Buffer.alloc(13);
+  rest[0] = ground.id;
+  rest.writeUInt16LE(ground.budget, 1);
+  rest.writeBigUInt64LE(BigInt(ground.stake), 3);
+  rest[11] = ground.cols;
+  rest[12] = ground.rows;
+  return ix(
+    "create_battleground",
+    [signer(admin), readonly(configPda()), writable(battlegroundPda(ground.id)), readonly(SystemProgram.programId)],
+    rest,
+  );
+}
+
+/** Solana, admin, once. Creates the treasury Outbox `[b"outbox", config]`. */
+export function initTreasuryOutboxIx(admin: PublicKey) {
+  return ix("init_treasury_outbox", [signer(admin), readonly(configPda()), writable(treasuryOutboxPda()), readonly(SystemProgram.programId)]);
+}
+
+/** Solana, admin. Delegates Config to its own validator. */
+export function delegateConfigIx(admin: PublicKey) {
+  const { head, tail } = delegated(configPda());
+  return ix("delegate_config", [signer(admin), ...head, ...tail]);
+}
+
+/** Solana, admin. */
+export function delegateBattlegroundIx(admin: PublicKey, battlegroundId: number) {
+  const { head, tail } = delegated(battlegroundPda(battlegroundId));
+  return ix("delegate_battleground", [signer(admin), readonly(configPda()), ...head, ...tail], Uint8Array.of(battlegroundId));
+}
+
 /** Solana. Creates the wallet's Player and Outbox and moves `deposit` into the Player's free lamports. */
 export function registerPlayerIx(owner: PublicKey, deposit: bigint) {
   return ix(

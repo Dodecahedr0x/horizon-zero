@@ -20,7 +20,14 @@ const jobs = [
       HORIZON_VITE_STRICT_PORT: "1",
       HORIZON_VITE_CLEAR_SCREEN: "0",
       VITE_DEV_MODE: chain ? "false" : "true",
-      ...(chain ? { VITE_RPC_URL: "http://127.0.0.1:8899", VITE_ORACLE_QUEUE: "GKE6d7iv8kCBrsxr78W3xVdjGLLLJnxsGiuzrsZCGEvb" } : {}),
+      // Solana, the rollup, and the ephemeral test queue whose oracle the stack runs on the rollup.
+      ...(chain
+        ? {
+            VITE_RPC_URL: "http://127.0.0.1:8899",
+            VITE_ER_RPC_URL: "http://127.0.0.1:7799",
+            VITE_ORACLE_QUEUE: "Sc9MJUngNbQXSXGP3F67KvKwVnhaYn6kcioxXNVowYT",
+          }
+        : {}),
     },
   },
   {
@@ -34,13 +41,9 @@ const jobs = [
     command: "pnpm",
     args: ["--filter", "asset-studio", "start"],
   },
-  // The indexer reads the local stack; the no-wallet game uses the local ledger instead.
-  ...(chain
-    ? [
-        { name: "indexer", command: "pnpm", args: ["--filter", "indexer", "start"], env: { INDEXER_PORT: indexerListenPort() } },
-        { name: "localnet", command: "node", args: ["scripts/local-stack.mjs"] },
-      ]
-    : []),
+  // The stack starts the indexer on the rollup once it is bootstrapped; the no-wallet game uses
+  // the local ledger instead.
+  ...(chain ? [{ name: "localnet", command: "node", args: ["scripts/local-stack.mjs"], env: { INDEXER_PORT: indexerListenPort() } }] : []),
 ];
 
 const children = [];
