@@ -6,18 +6,32 @@ The program is Anchor. Every account begins with the 8-byte discriminator `SHA-2
 
 | account | seeds | notes |
 | --- | --- | --- |
-| Config | `[b"config"]` | one per program |
+| Config | `[b"config"]` | one per program; also holds the claimable fees |
 | program identity | `[b"identity"]` | space 0; signs the VRF request |
 | Battleground | `[b"battleground", &[battleground_id]]` | `battleground_id` is one byte |
-| Behavior | `[b"behavior", hash]` | `hash = SHA-256(canonical body)` |
-| Army | `[b"army", owner, index_le]` | `index` is `u32` |
-| Pot | `[b"pot", battleground_pubkey, owner]` | one per player and battleground; every army the owner locks there stakes from it |
-| Battle | `[b"match", battleground_pubkey, seq_le]` | `seq` is `u64`, the battleground's `match_seq` at creation |
-| crank vault | `[b"crank-fund", battle_pubkey]` | system account; pays for the battle's settlement crank, empty after `seed_match` |
+| Player | `[b"player", owner]` | one per wallet; its lamports are the owner's balance on every battleground |
+| Outbox | `[b"outbox", owner]` | one per wallet, created with the Player |
+| Behavior | `[b"behavior", hash]` | ephemeral; `hash = SHA-256(canonical body)` |
+| Army | `[b"army", owner, index_le]` | ephemeral; `index` is `u32` |
+| Battle | `[b"match", battleground_pubkey, seq_le]` | ephemeral; `seq` is `u64`, the battleground's `match_seq` at creation |
 
 The scoped VRF identity is a different account, owned by the derivation under the VRF program: `[b"identity", horizon_program_id]`. It signs `seed_match`. It is not the program identity above.
 
-The battle's settlement crank is a Hydra account, `[b"crank", crank_vault, battle_pubkey]` under `Hydra17i1feui9deaxu6d1TzSQMRNHeBRkDR1Awy7zea`. See [Settlement crank](matchmaking.md#settlement-crank).
+## Ephemeral accounts
+
+Behavior, Army and Battle are ephemeral accounts: they exist only in the MagicBlock rollup, hold 0 lamports, and are owned by this program. The program creates one with the magic program's `CreateEphemeralAccount`, through `ephemeral_rollups_sdk::ephemeral_accounts::EphemeralAccount`. The sponsor is a Player PDA, which signs with its seeds `[b"player", owner, bump]`. The new account signs with its own PDA seeds. The sponsor pays `(len + 60) * 32` lamports of rent to the ephemeral vault. Closing refunds that rent to the sponsor.
+
+| account | sponsor | length | rent (lamports) | closed by |
+| --- | --- | --- | --- | --- |
+| Behavior | creator's Player | 119 | 5 728 | never |
+| Army | owner's Player | 1360 | 45 440 | `close_army` |
+| Battle | locker's (player B's) Player | 2147 | 70 624 | `settle_match` |
+
+The rent comes only from the sponsor's free lamports (see [Player](#player--68-bytes)). If they do not cover it, the create fails with `RentShort`, so storage never spends a budget, winnings, or a locked stake.
+
+Every instruction that creates or closes an ephemeral account takes two more accounts: the vault `MagicVau1t999999999999999999999999999999999` (writable) and the magic program `Magic11111111111111111111111111111111111111`. The program checks both addresses.
+
+The `inline-mock-magic` feature is for LiteSVM, which has no magic program. Under it, an ephemeral account is an ordinary PDA. Its rent is the Solana rent-exempt minimum, moved from the sponsor after the system program allocates the account and assigns it to this program. Closing moves the account's lamports back to the sponsor, empties it, and assigns it back to the system program. The vault and magic program accounts are not checked.
 
 ## Status bytes
 
@@ -29,7 +43,7 @@ Army `status`:
 | 1 | Queued |
 | 2 | Fighting |
 
-Battle `status`: `0` Awaiting (the VRF request is out), `2` Seeded (the seed is stored and the settlement crank is scheduled), `1` Resolved. The values keep `1` for Resolved so readers that test for it did not change.
+Battle `status`: `0` Awaiting (the VRF request is out), `2` Seeded (the seed is stored; anyone may settle), `1` Resolved. No account stores `1`: `settle_match` closes the battle. The value stays reserved for readers that record the outcome from the `HZ_MATCH_RESOLVED` log.
 
 Battle `outcome`: `0` pending, `1` side A, `2` side B, `3` draw.
 
@@ -38,7 +52,7 @@ In the program these are the enums `ArmyStatus`, `BattleStatus`, and `Outcome` (
 ```mermaid
 stateDiagram-v2
   [*] --> Idle: create_army
-  Idle --> Queued: lock_army with no opponent (pot covers one stake)
+  Idle --> Queued: lock_army with no opponent (budget covers one stake)
   Queued --> Idle: unlock_army
   Queued --> Fighting: chosen as opponent
   Idle --> Fighting: lock_army finds an opponent
@@ -51,22 +65,54 @@ stateDiagram-v2
 ```mermaid
 stateDiagram-v2
   [*] --> Awaiting: lock_army finds an opponent
-  Awaiting --> Seeded: seed_match (VRF callback) creates the crank
-  Seeded --> Resolved: settle_match (Hydra crank)
+  Awaiting --> Seeded: seed_match (VRF callback) stores the seed
+  Seeded --> [*]: settle_match (anyone) pays out and closes it
 ```
 
 ## Layouts
 
 Sizes include the 8-byte discriminator. The indexer decodes an account only when the discriminator and the length both match.
 
-### Config — 41 bytes
+### Config — 51 bytes
 
 | offset | field |
 | --- | --- |
 | 8 | `admin` pubkey |
-| 40 | `bump` |
+| 40 | `fee_bps` u16, the protocol fee rate in basis points |
+| 42 | `fees` u64, claimable fee lamports |
+| 50 | `bump` |
 
-The indexer does not store Config.
+The account's lamports are its rent plus `fees`. `fee_bps` is at most `1000` (`MAX_FEE_BPS`); `DEFAULT_FEE_BPS` in `programs/horizon-zero/src/fees.rs` is `500`. The indexer does not store Config.
+
+### Player — 68 bytes
+
+| offset | field |
+| --- | --- |
+| 8 | `owner` pubkey |
+| 40 | `budget` u64, lamports a match may stake |
+| 48 | `winnings` u64, payouts set aside while `segregate` is on |
+| 56 | `locked` u64, stakes in battles that have not settled |
+| 64 | `segregate`, `0` or `1` |
+| 65 | `fighting` u16, the owner's armies in battles that have not settled |
+| 67 | `bump` |
+
+The Player's lamports are the owner's money. The counters split them:
+
+```text
+free = lamports - rent_exempt_min(68) - budget - winnings - locked
+```
+
+Free lamports pay ephemeral rent and are what `fund_budget` can move into the budget. The program keeps `lamports >= rent_exempt_min + budget + winnings + locked`: stakes move as counters until `settle_match`, and an ephemeral create fails with `RentShort` rather than dip below the free balance. A lamport transfer into the Player lands in free lamports.
+
+### Outbox — 49 bytes
+
+| offset | field |
+| --- | --- |
+| 8 | `owner` pubkey |
+| 40 | `amount` u64 |
+| 48 | `bump` |
+
+`register_player` creates it with `amount` 0. No instruction in this version reads or writes it after that.
 
 ### Behavior — 119 bytes
 
@@ -150,7 +196,7 @@ Each `ArmyUnit` is 128 bytes:
 
 `col` and `row` are zone-local. The body is the canonical sequence copied from the behavior account. Cost, hp, atk, attack range, speed, the eight cast bytes, and `actions` are copied from `stats_for(race, kind)` when the army is saved. The cast bytes follow the battle rules chapter. Unused slots are zero. `status` is at offset 1358 because the unit array is fixed. `race` is the catalog id. Kind ids belong to that race.
 
-### Battle — 2145 bytes
+### Battle — 2147 bytes
 
 | offset | field |
 | --- | --- |
@@ -172,31 +218,26 @@ Each `ArmyUnit` is 128 bytes:
 | 2141 | `outcome` |
 | 2142 | `race_a` |
 | 2143 | `race_b` |
-| 2144 | `bump` |
+| 2144 | `fee_bps` u16, Config's rate when the battle opened |
+| 2146 | `bump` |
 
-Each snapshot unit is 96 bytes: `kind`, `len`, `body` (77 bytes), `col`, `row`, `cost` u16, `hp`, `atk`, `range`, `speed`, then cast `damage`, `range`, `aoe`, `effect`, `aim`, `power`, `rounds`, and `cooldown`, then `actions`. `col` and `row` are the zone-local position copied from the army, and `body` is that unit's canonical behavior. The stats and the cast are the same bytes the army stored. Side A is the army that was already queued. Side B is the army that called `lock_army` and opened the match. `race_a` and `race_b` are those armies' race ids. `cols` and `rows` are copied from the battleground so `settle_match` can call `simulate` without another account. `seed` is zero until `seed_match`. `simulate` reads the stored stats and cast. It does not look the kind up in the catalog.
-
-### Pot — 92 bytes
-
-| offset | field |
-| --- | --- |
-| 8 | `owner` pubkey |
-| 40 | `battleground` pubkey |
-| 72 | `budget` u64, lamports a match may stake |
-| 80 | `winnings` u64, payouts set aside while `segregate` is on |
-| 88 | `segregate`, `0` or `1` |
-| 89 | `fighting` u16, the owner's armies in battles that have not settled |
-| 91 | `bump` |
-
-The account's lamports are its rent plus at least `budget + winnings`. Queuing an army reserves nothing: a stake leaves the budget only when a match opens. One pot therefore backs any number of queued armies, and the armies after the budget runs under one stake stay queued but cannot be met (see [Pots](matchmaking.md#pots)).
+Each snapshot unit is 96 bytes: `kind`, `len`, `body` (77 bytes), `col`, `row`, `cost` u16, `hp`, `atk`, `range`, `speed`, then cast `damage`, `range`, `aoe`, `effect`, `aim`, `power`, `rounds`, and `cooldown`, then `actions`. `col` and `row` are the zone-local position copied from the army, and `body` is that unit's canonical behavior. The stats and the cast are the same bytes the army stored. Side A is the army that was already queued. Side B is the army that called `lock_army` and opened the match. `race_a` and `race_b` are those armies' race ids. `cols` and `rows` are copied from the battleground so `settle_match` can call `simulate` without another account. `seed` is zero until `seed_match`. `simulate` reads the stored stats and cast. It does not look the kind up in the catalog. `fee_bps` is what `settle_match` charges, so a `set_fee` after the lock does not change an open battle.
 
 ## Instructions
 
-### `initialize`
+### `initialize(fee_bps: u16)`
 
 Accounts: admin signer writable, config init, identity writable, system program.
 
-Sets `config.admin` to the signer and creates the program identity PDA with space 0. The first successful caller is the admin. There is no admin transfer.
+`fee_bps` above `1000` fails with `FeeTooHigh`. Sets `config.admin` to the signer, stores `fee_bps` with `fees` 0, and creates the program identity PDA with space 0. The first successful caller is the admin. There is no admin transfer.
+
+### `set_fee(fee_bps: u16)`
+
+Accounts: admin signer, config writable.
+
+The signer must be `config.admin` (`NotAdmin`), and `fee_bps` must be at most `1000` (`FeeTooHigh`). Battles already open keep the rate they copied at `lock_army`.
+
+Log: `HZ_FEE <fee_bps>`.
 
 ### `create_battleground(battleground_id: u8, budget: u16, stake_lamports: u64, cols: u8, rows: u8)`
 
@@ -206,11 +247,31 @@ The signer must be `config.admin`. The battleground stores that admin, the five 
 
 Log: `HZ_BATTLEGROUND <battleground> <id> <budget> <stake> <cols> <rows>`.
 
+### `register_player(deposit: u64)`
+
+Accounts: owner signer writable, player init `[b"player", owner]`, outbox init `[b"outbox", owner]`, system program.
+
+Creates the wallet's Player and Outbox, both paid by the owner, then transfers `deposit` from the owner into the Player, where it is free lamports. A second call fails because the accounts exist.
+
+Log: `HZ_PLAYER <player> <owner> <budget> <winnings> <locked> <segregate> <fighting>`, also sent by every instruction below that changes a Player, and by `lock_army` and `settle_match` for both Players.
+
+### `fund_budget(amount: u64)`
+
+Accounts: owner signer, player writable `[b"player", owner]`.
+
+Moves `amount` from free lamports into `budget`. No lamports move. More than the free balance fails with `BalanceShort`.
+
+### `set_segregation(segregate: bool)`
+
+Accounts: owner signer, player writable `[b"player", owner]`.
+
+Off, a won payout goes into `budget` and can be staked again. On, it goes to `winnings`, which no match stakes. Switching does not move what either balance holds. A draw always returns the stake to `budget`.
+
 ### `create_behavior(hash: [u8; 32], body: Vec<u8>)`
 
-Accounts: creator signer writable, behavior init, system program.
+Accounts: creator signer, the creator's player writable `[b"player", creator]`, behavior writable, vault writable, magic program, system program.
 
-Any signer may create one. `body` is the canonical byte string. It must parse, and `SHA-256(body)` must equal `hash`. The init address is the PDA of that hash, so a second create of the same body fails because the account exists. Nothing updates or closes a behavior.
+Any registered wallet may create one. `body` is the canonical byte string. It must parse (`InvalidBehavior`), and `SHA-256(body)` must equal `hash` (`HashMismatch`). The behavior address must be `[b"behavior", hash]` (`BadPda`) and must hold no data yet (`AlreadyExists`), so a second create of the same body fails. The behavior is an ephemeral account sponsored by the creator's Player. Nothing updates or closes a behavior.
 
 The instruction data after the discriminator is the 32-byte hash, then a little-endian `u32` length, then the body bytes.
 
@@ -218,11 +279,13 @@ Log: `HZ_BEHAVIOR <behavior> <creator> <len>`.
 
 ### `create_army(index: u32, race: u8, units: Vec<UnitInput>)`
 
-Accounts: owner signer writable, battleground, army init, system program, then one readonly behavior account per unit, in order.
+Accounts: owner signer, the owner's player writable `[b"player", owner]`, battleground, army writable, vault writable, magic program, system program, then one readonly behavior account per unit, in order.
+
+The army address must be `[b"army", owner, index_le]` (`BadPda`) and must hold no data yet (`AlreadyExists`). The army is an ephemeral account sponsored by the owner's Player.
 
 `UnitInput` is `kind` u8, `behavior` pubkey, `col` u8, `row` u8. The vector is a `u32` length followed by 35-byte elements. `race` must be a catalog race: Ashborn is `0`, Rootborn is `1`, and Deeplings is `2`; any other byte fails with `BadRace`. The vector must be non-empty and at most 10. Each kind must be in that race's catalog, or the instruction fails with `BadUnit`: Rootborn has kinds `0` to `2`, so kind `3` is an Ashborn Vanguard but no Rootborn unit. `col` must be less than `cols` and `row` must be `0` or `1`. Two units cannot share that zone-local tile. The sum of catalog costs must be less than or equal to `battleground.budget`. Each behavior account must deserialize, its body must be valid, and its address must be `[b"behavior", sha256(body)]` under this program. The army copies `kind`, the behavior pubkey, the canonical body, the zone-local position, and the catalog cost, hp, atk, attack range, speed, and cast, then sets Idle. The catalog lookup is a `match`. The client does not send the numbers.
 
-An empty roster and a roster longer than 6 both return `TooManyUnits`. A position outside the zone returns `BadPosition`. A repeated tile returns `DuplicatePosition`.
+An empty roster and a roster longer than 10 both return `TooManyUnits`. A position outside the zone returns `BadPosition`. A repeated tile returns `DuplicatePosition`.
 
 Log: `HZ_ARMY <army> <owner> <battleground>`.
 
@@ -234,61 +297,36 @@ The signer must own the army, the army's battleground must be the passed battleg
 
 Log: `HZ_ARMY_UPDATE <army>`.
 
-### `fund_pot(amount: u64)`
-
-Accounts: owner signer writable, battleground, pot (created if needed), system program.
-
-Creates the owner's pot on that battleground the first time, with `segregate` off, then transfers `amount` from the owner into it and adds it to `budget`. The owner pays the pot's rent on creation.
-
-Log: `HZ_POT <pot> <owner> <budget> <winnings> <segregate> <fighting>`, also sent by every instruction below that changes a pot, and by `lock_army` and `settle_match` for both pots.
-
-### `withdraw_pot(amount: u64)`
-
-Accounts: owner signer writable, pot writable. The signer must be the pot's owner (`NotOwner`).
-
-Takes `amount` from `winnings` first, then from `budget`, and moves it to the owner. More than `winnings + budget` fails with `PotShort`. A withdrawal may leave the budget under one stake while armies are queued; they stay queued, and no locker can meet them until the pot is funded again.
-
-### `set_segregation(segregate: bool)`
-
-Accounts: owner signer writable, pot writable. The signer must be the pot's owner.
-
-Off, a payout goes back into `budget` and can be staked again. On, it goes to `winnings`, which no match stakes. Switching does not move what either balance holds.
-
-### `close_pot`
-
-Accounts: owner signer writable, pot writable. The signer must be the pot's owner.
-
-`fighting` must be zero (`PotBusy`), so every battle that staked from the pot has settled. The account closes onto the owner, who gets the rent, the budget and the winnings.
-
-Log: `HZ_POT_CLOSE <pot>`.
-
 ### `lock_army`
 
 No instruction arguments. Account order after the `#[vrf]` macro expands `LockArmy`:
 
 1. player, signer, writable
-2. battleground, writable
-3. army, writable
-4. the player's pot `[b"pot", battleground, player]`, writable
-5. battle, writable (created in this instruction when a match opens; uninitialized when the army only queues)
-6. oracle queue, writable, owned by the VRF program
-7. program identity `[b"identity"]`
-8. VRF program
-9. `SysvarS1otHashes111111111111111111111111111`
-10. system program
-11. remaining: each distinct behavior on the army, readonly
+2. the player's Player `[b"player", player]`, writable
+3. config `[b"config"]`
+4. battleground, writable
+5. army, writable
+6. battle, writable (created in this instruction when a match opens; untouched when the army only queues)
+7. vault, writable
+8. magic program
+9. oracle queue, writable, owned by the VRF program
+10. program identity `[b"identity"]`
+11. VRF program
+12. `SysvarS1otHashes111111111111111111111111111`
+13. system program
+14. remaining: each distinct behavior on the army, readonly
 
-To open a match the client then passes, in any order, each queued army it offers as a candidate (writable), each of their owners' pots once (writable), and the battle's crank vault `[b"crank-fund", battle]` (writable). With no candidates it passes nothing more.
+To open a match the client then passes, in any order, each queued army it offers as a candidate (writable) and each of their owners' Players once (writable). With no candidates it passes nothing more.
 
-The player must own the army. The army must belong to this battleground, be Idle, and have `unit_count > 0`. Each stored behavior is loaded again and its canonical bytes must still match the army. The lock copies each unit's kind, behavior body, zone-local position, stats, and cast into the battle snapshot, copies `cols` and `rows` onto the battle, and stores each army's race as `race_a` and `race_b`. The program writes the new battle into its account field by field, in `Battle`'s order, and reads the opponent's army onto the heap: a `Battle` value with two 10-slot snapshots would not fit the 4 KB SBF stack frame.
+The player must own the army. The army must belong to this battleground, be Idle, and have `unit_count > 0`. Each stored behavior is loaded again and its canonical bytes must still match the army. The lock copies each unit's kind, behavior body, zone-local position, stats, and cast into the battle snapshot, copies `cols` and `rows` onto the battle, stores each army's race as `race_a` and `race_b`, and copies `config.fee_bps`. The program writes the new battle into its account field by field, in `Battle`'s order, and reads the opponent's army onto the heap: a `Battle` value with two 10-slot snapshots would not fit the 4 KB SBF stack frame.
 
-The player's pot must exist (Anchor's `AccountNotInitialized` otherwise) and its `budget` must be at least `stake_lamports` (`PotTooLow`), whether the army queues or matches.
+The player's Player must have a `budget` of at least `stake_lamports` (`BudgetTooLow`), whether the army queues or matches.
 
-Candidates are queue entries whose account was passed, whose status is Queued, whose owner is not the player, and whose owner's pot was passed with a `budget` of at least `stake_lamports`. A passed account counts as a pot when this program owns it, it is 92 bytes, it deserializes as `Pot`, and its `battleground` is this one; pots exist only at their PDA, so no derivation is needed. A player therefore queues behind their own waiting armies instead of matching them, and an army whose pot ran dry is skipped.
+Candidates are queue entries whose account was passed, whose status is Queued, whose owner is not the player, and whose owner's Player was passed with a `budget` of at least `stake_lamports`. A passed account counts as a Player when this program owns it, it is 68 bytes, and it deserializes as `Player`; Players exist only at their PDA, so no derivation is needed. A player therefore queues behind their own waiting armies instead of matching them, and an army whose owner's budget ran dry is skipped.
 
-When the candidate list is empty the instruction appends the army to the battleground queue and sets Queued. No lamports move. Log: `HZ_QUEUED <army> <battleground>`.
+When the candidate list is empty the instruction appends the army to the battleground queue and sets Queued. No lamports move and no counter changes. Log: `HZ_QUEUED <army> <battleground>`.
 
-When the list is not empty, opponent choice, the stakes, and the VRF request are specified in [Matchmaking, pots, and VRF](matchmaking.md).
+When the list is not empty, opponent choice, the stakes, and the VRF request are specified in [Matchmaking, stakes, and VRF](matchmaking.md). The battle is an ephemeral account sponsored by the player's Player, so its free lamports must cover the battle's rent (`RentShort`).
 
 The client and the tests prepend a compute-budget instruction that sets the unit limit to `1_400_000`. That limit is not a program constant.
 
@@ -302,36 +340,34 @@ Log: `HZ_UNLOCK <army>`.
 
 ### `close_army`
 
-Accounts: owner signer writable, army writable.
+Accounts: owner signer, the owner's player writable `[b"player", owner]`, army writable, vault writable, magic program.
 
-The signer must own the army (`NotOwner`) and status must be Idle (`BadStatus`). A queued army unlocks first. The army account is closed onto the owner, who gets its rent back. Battles keep their own unit snapshots, so a closed army's past battles still replay. The index is free again: `create_army` with the same index makes a new account at the same address. The web client sends this instruction from the Delete button.
+The army must be owned by this program and sit at `[b"army", owner, index_le]` (`BadPda`). The signer must own it (`NotOwner`) and status must be Idle (`BadStatus`). A queued army unlocks first. The army is closed and its rent goes back to the owner's Player, which sponsored it. Battles keep their own unit snapshots, so a closed army's past battles still replay. The index is free again: `create_army` with the same index makes a new account at the same address. The web client sends this instruction from the Delete button.
 
 Log: `HZ_ARMY_CLOSE <army>`.
 
 ### `seed_match(randomness: [u8; 32])`
 
-The VRF callback. `#[vrf_callback]` inserts the scoped VRF identity as the first account. It must be a signer and must equal `[b"identity", program_id]` derived under the VRF program. The remaining accounts, in order, are battle, crank vault and crank (writable), the Hydra program, and the system program.
+The VRF callback. `#[vrf_callback]` inserts the scoped VRF identity as the first account. It must be a signer and must equal `[b"identity", program_id]` derived under the VRF program. The only other account is the battle, writable.
 
-The battle must be Awaiting, and its address must be `[b"match", battleground, seq]` with the stored bump. The vault and the crank must be the battle's (see [PDA seeds](#pda-seeds)).
+The battle must be Awaiting, and its address must be `[b"match", battleground, seq]` with the stored bump. The instruction stores `randomness` in `seed` and sets the battle Seeded. A second call fails with `AlreadyResolved`.
 
-The instruction stores `randomness` in `seed`, sets the battle Seeded, and creates the one-shot settlement crank through Hydra `Create`, paid by the vault, then moves the rest of the vault onto the crank. [Settlement crank](matchmaking.md#settlement-crank) has the crank's parameters. A second call fails with `AlreadyResolved`.
-
-Log: `HZ_MATCH_SEEDED <battle> <crank> <seed hex>`.
+Log: `HZ_MATCH_SEEDED <battle> <seed hex>`.
 
 ### `settle_match`
 
-Accounts, in order, which are also the crank's stored template: battle, army A, army B, pot A, pot B, player B, crank (all writable), the Hydra program, and the instructions sysvar. Each army and player B must match the battle's stored keys. Pot A must be `[b"pot", battleground, player_a]` and pot B `[b"pot", battleground, player_b]`, each checked with its stored bump.
+Permissionless. No instruction arguments. Accounts, in order: battle, army A, army B, player A's Player, player B's Player, config (all writable), vault (writable), magic program.
 
-The battle must be Seeded. Both armies must be Fighting. The battle address must be `[b"match", battleground, seq]`, and the crank must be the battle's. The instruction must run at the top level, directly after Hydra `Trigger` on that crank, as the instructions sysvar shows; otherwise it fails with `NotCranked`.
+The battle account is read by hand, because the instruction closes it. It must be owned by this program and hold data, and its status must be Seeded; otherwise the instruction fails with `AlreadyResolved`, which is also what a second settlement gets. Its address must be `[b"match", battleground, seq]` with the stored bump. Each army must be the battle's, and each Player must be `[b"player", player_a]` and `[b"player", player_b]` with its stored bump (`BadPda` otherwise). Both armies must be Fighting.
 
-The instruction first cancels the crank through Hydra `Cancel`, signed by the battle as the crank's authority, which sends the crank's balance to player B. `simulate` then runs on the stored snapshots, the stored seed, and the stored `cols` and `rows`. The battle's balance above rent must be at least `2 * stake`.
+`simulate` runs on the stored snapshots, the stored seed, and the stored `cols` and `rows`. The battle is then closed and its rent goes back to player B's Player, which sponsored it. The close comes before the payout: in the rollup it is a CPI, and the runtime checks at a CPI that lamports moved only between the accounts it is given. With `pot = 2 * stake` and `fee = pot * fee_bps / 10_000` rounded down, using the battle's `fee_bps`:
 
-| outcome | payment from the battle account |
-| --- | --- |
-| A wins (`Some(0)` → outcome 1) | `2 * stake` to pot A |
-| B wins (`Some(1)` → outcome 2) | `2 * stake` to pot B |
-| draw (outcome 3) | `stake` to pot A and `stake` to pot B |
+| outcome | lamports | counters |
+| --- | --- | --- |
+| A wins (`Some(0)` → outcome 1) | Player B sends `stake - fee` to Player A and `fee` to Config | Player A credits `pot - fee`; `config.fees += fee` |
+| B wins (`Some(1)` → outcome 2) | Player A sends `stake - fee` to Player B and `fee` to Config | Player B credits `pot - fee`; `config.fees += fee` |
+| draw (outcome 3) | none | each `budget += stake`; no fee |
 
-Each payment is added to the pot's `budget`, or to its `winnings` when `segregate` is on, and each pot's `fighting` drops by one. The instruction then sets the battle Resolved, stores the outcome, and sets both armies to Idle. Rent remains on the battle account.
+A credit goes to `budget`, or to `winnings` when the winner's `segregate` is on. For both Players, `locked -= stake` and `fighting` drops by one. Both armies return to Idle. `programs/horizon-zero/src/fees.rs` (`win_payout`) holds the arithmetic.
 
-Log: `HZ_MATCH_RESOLVED <battle> <outcome> <seed hex>`.
+Log: `HZ_MATCH_RESOLVED <battle> <outcome> <fee> <seed hex> <player_b>`. The outcome byte is the `Outcome` id. `player_b` is the locker's wallet, whose Player got the battle rent back.

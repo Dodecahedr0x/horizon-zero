@@ -1792,7 +1792,6 @@ dependencies = [
  "combat",
  "ephemeral-rollups-sdk",
  "ephemeral-vrf-sdk",
- "solana-instructions-sysvar 3.0.1",
 ]
 
 [[package]]
@@ -2188,13 +2187,6 @@ dependencies = [
  "keccak",
  "rand_core 0.6.4",
  "zeroize",
-]
-
-[[package]]
-name = "mock-hydra"
-version = "0.1.0"
-dependencies = [
- "solana-program 3.0.0",
 ]
 
 [[package]]

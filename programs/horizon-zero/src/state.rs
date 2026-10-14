@@ -27,7 +27,7 @@ pub enum BattleStatus {
     Awaiting = 0,
     /// Settled and paid out.
     Resolved = 1,
-    /// The VRF seed is stored and a Hydra crank is scheduled to settle the battle.
+    /// The VRF seed is stored; anyone may settle.
     Seeded = 2,
 }
 
@@ -47,6 +47,10 @@ pub enum Outcome {
 #[derive(InitSpace)]
 pub struct Config {
     pub admin: Pubkey,
+    /// The protocol fee on a won battle's pot, in basis points (see `fees`).
+    pub fee_bps: u16,
+    /// Claimable fee lamports, held on Config on top of its rent.
+    pub fees: u64,
     pub bump: u8,
 }
 
@@ -76,25 +80,27 @@ pub struct Battleground {
     pub bump: u8,
 }
 
-/// A player's stake budget on one battleground: `[b"pot", battleground, owner]`. Every army the
-/// owner locks there stakes from it, so one budget covers any number of queued armies.
+/// A wallet's one delegated account: `[b"player", owner]`. Its lamports above rent are the
+/// player's money; the counters say how much of it is staked, locked or set aside, and the rest
+/// (free) pays ephemeral rent for the player's armies, behaviors and battles.
 #[account]
 #[derive(InitSpace)]
-pub struct Pot {
+pub struct Player {
     pub owner: Pubkey,
-    pub battleground: Pubkey,
     /// Lamports a match may stake.
     pub budget: u64,
     /// Payouts set aside while `segregate` is on. A match never stakes them.
     pub winnings: u64,
+    /// Stakes in battles that have not settled.
+    pub locked: u64,
     /// Off: payouts go back into `budget`. On: they go to `winnings`.
     pub segregate: bool,
-    /// The owner's armies in battles that have not settled. The pot cannot close while any are.
+    /// The owner's armies in battles that have not settled.
     pub fighting: u16,
     pub bump: u8,
 }
 
-impl Pot {
+impl Player {
     /// Adds a payout to the balance `segregate` picks.
     pub fn credit(&mut self, lamports: u64) {
         if self.segregate {
@@ -103,6 +109,21 @@ impl Pot {
             self.budget += lamports;
         }
     }
+
+    /// Lamports the counters do not claim: `lamports - rent - budget - winnings - locked`.
+    pub fn free(&self, lamports: u64, rent: u64) -> u64 {
+        lamports.saturating_sub(rent).saturating_sub(self.budget + self.winnings + self.locked)
+    }
+}
+
+/// A one-shot cash-out account: `[b"outbox", owner]` per player, `[b"outbox", config]` for fees.
+/// `release_outbox` pays `amount` to `owner` on Solana once the outbox is undelegated.
+#[account]
+#[derive(InitSpace)]
+pub struct Outbox {
+    pub owner: Pubkey,
+    pub amount: u64,
+    pub bump: u8,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, InitSpace, Default)]
@@ -225,6 +246,8 @@ pub struct Battle {
     pub outcome: Outcome,
     pub race_a: u8,
     pub race_b: u8,
+    /// Config's fee rate when the battle opened; `settle_match` charges it.
+    pub fee_bps: u16,
     pub bump: u8,
 }
 
@@ -279,6 +302,24 @@ mod layout_tests {
         assert_eq!(8 + Behavior::INIT_SPACE, 119);
         assert_eq!(8 + Battleground::INIT_SPACE, 576);
         assert_eq!(8 + Army::INIT_SPACE, 1360);
-        assert_eq!(8 + Battle::INIT_SPACE, 2145);
+        assert_eq!(8 + Battle::INIT_SPACE, 2147); // + fee_bps 2
+        assert_eq!(8 + Config::INIT_SPACE, 51); // admin 32, fee_bps 2, fees 8, bump 1
+        assert_eq!(8 + Player::INIT_SPACE, 68); // owner 32, budget 8, winnings 8, locked 8, segregate 1, fighting 2, bump 1
+        assert_eq!(8 + Outbox::INIT_SPACE, 49); // owner 32, amount 8, bump 1
+    }
+
+    #[test]
+    fn free_is_what_the_counters_leave() {
+        let player = Player {
+            owner: Pubkey::default(),
+            budget: 30,
+            winnings: 5,
+            locked: 10,
+            segregate: false,
+            fighting: 1,
+            bump: 0,
+        };
+        assert_eq!(player.free(100, 20), 35);
+        assert_eq!(player.free(40, 20), 0);
     }
 }

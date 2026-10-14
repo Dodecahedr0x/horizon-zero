@@ -48,14 +48,18 @@ pub enum HorizonError {
     BadPosition,
     #[msg("Two units in one army cannot share a tile")]
     DuplicatePosition,
-    #[msg("Settlement must directly follow the Hydra trigger for this battle's crank")]
-    NotCranked,
-    #[msg("Crank account is not this battle's Hydra crank")]
-    BadCrank,
-    #[msg("Pot budget does not cover the battleground stake")]
-    PotTooLow,
-    #[msg("Pot still has armies in unsettled battles")]
-    PotBusy,
-    #[msg("Pot holds less than the amount asked for")]
-    PotShort,
+    #[msg("Fee rate is above the cap")]
+    FeeTooHigh,
+    #[msg("Player budget does not cover the battleground stake")]
+    BudgetTooLow,
+    #[msg("Player has battles that have not settled")]
+    PlayerBusy,
+    #[msg("Player holds less than the amount asked for")]
+    BalanceShort,
+    #[msg("Player free balance does not cover the account rent")]
+    RentShort,
+    #[msg("Outbox still holds an unreleased withdrawal")]
+    OutboxBusy,
+    #[msg("Account already exists")]
+    AlreadyExists,
 }

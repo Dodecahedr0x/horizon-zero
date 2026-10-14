@@ -9,16 +9,22 @@ use horizon_combat::{
     MAX_BEHAVIOR_LEN, ZONE_DEPTH,
 };
 
-mod crank;
 mod eph;
 mod error;
-mod fees;
+pub mod fees;
 mod state;
 
 use error::HorizonError;
 use state::*;
 
 declare_id!("Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c");
+
+/// Collects ephemeral rent in the rollup. Unchecked under LiteSVM, where nothing reads it.
+#[cfg(not(feature = "inline-mock-magic"))]
+pub const EPH_VAULT: Pubkey = Pubkey::new_from_array(ephemeral_rollups_sdk::consts::EPHEMERAL_VAULT_ID.to_bytes());
+/// Creates and closes ephemeral accounts in the rollup. Unchecked under LiteSVM.
+#[cfg(not(feature = "inline-mock-magic"))]
+pub const MAGIC_PROGRAM: Pubkey = Pubkey::new_from_array(ephemeral_rollups_sdk::consts::MAGIC_PROGRAM_ID.to_bytes());
 
 #[cfg(feature = "inline-mock-vrf")]
 fn program_identity_bump() -> u8 {
@@ -29,8 +35,11 @@ fn program_identity_bump() -> u8 {
 pub mod horizon_zero {
     use super::*;
 
-    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
+    pub fn initialize(ctx: Context<Initialize>, fee_bps: u16) -> Result<()> {
+        require!(fee_bps <= fees::MAX_FEE_BPS, HorizonError::FeeTooHigh);
         ctx.accounts.config.admin = ctx.accounts.admin.key();
+        ctx.accounts.config.fee_bps = fee_bps;
+        ctx.accounts.config.fees = 0;
         ctx.accounts.config.bump = ctx.bumps.config;
         let (identity, bump) = Pubkey::find_program_address(&[b"identity"], &ID);
         require_keys_eq!(identity, ctx.accounts.identity.key(), HorizonError::BadPda);
@@ -40,6 +49,14 @@ pub mod horizon_zero {
             0,
             &[b"identity", &[bump]],
         )?;
+        Ok(())
+    }
+
+    /// Admin only: the fee rate battles opened from now on charge. Open battles keep their own.
+    pub fn set_fee(ctx: Context<AdminConfig>, fee_bps: u16) -> Result<()> {
+        require!(fee_bps <= fees::MAX_FEE_BPS, HorizonError::FeeTooHigh);
+        ctx.accounts.config.fee_bps = fee_bps;
+        msg!("HZ_FEE {}", fee_bps);
         Ok(())
     }
 
@@ -70,20 +87,69 @@ pub mod horizon_zero {
         Ok(())
     }
 
-    pub fn create_behavior(ctx: Context<CreateBehavior>, hash: [u8; 32], body: Vec<u8>) -> Result<()> {
-        require!(BehaviorBody::parse(&body).is_some(), HorizonError::InvalidBehavior);
-        require!(behavior_hash(&body) == hash, HorizonError::HashMismatch);
-        let behavior = &mut ctx.accounts.behavior;
-        behavior.creator = ctx.accounts.creator.key();
-        behavior.len = body.len() as u8;
-        behavior.body = [0u8; MAX_BEHAVIOR_LEN];
-        behavior.body[..body.len()].copy_from_slice(&body);
-        behavior.bump = ctx.bumps.behavior;
-        msg!("HZ_BEHAVIOR {} {} {}", behavior.key(), behavior.creator, behavior.len);
+    /// Creates the wallet's Player and Outbox on Solana and moves `deposit` into the Player, where
+    /// it is free lamports.
+    pub fn register_player(ctx: Context<RegisterPlayer>, deposit: u64) -> Result<()> {
+        let player = &mut ctx.accounts.player;
+        player.owner = ctx.accounts.owner.key();
+        player.bump = ctx.bumps.player;
+        ctx.accounts.outbox.owner = ctx.accounts.owner.key();
+        ctx.accounts.outbox.bump = ctx.bumps.outbox;
+        transfer_sol(&ctx.accounts.owner, &ctx.accounts.player.to_account_info(), deposit)?;
+        log_player(&ctx.accounts.player.key(), &ctx.accounts.player);
         Ok(())
     }
 
+    /// Moves `amount` of the Player's free lamports into its budget. No lamports move.
+    pub fn fund_budget(ctx: Context<OwnPlayer>, amount: u64) -> Result<()> {
+        let info = ctx.accounts.player.to_account_info();
+        let rent = Rent::get()?.minimum_balance(info.data_len());
+        let player = &mut ctx.accounts.player;
+        require!(amount <= player.free(info.lamports(), rent), HorizonError::BalanceShort);
+        player.budget += amount;
+        log_player(&player.key(), player);
+        Ok(())
+    }
+
+    /// On, payouts go to the winnings and are never staked again. Off, they refill the budget.
+    /// Switching does not move what either balance already holds.
+    pub fn set_segregation(ctx: Context<OwnPlayer>, segregate: bool) -> Result<()> {
+        ctx.accounts.player.segregate = segregate;
+        log_player(&ctx.accounts.player.key(), &ctx.accounts.player);
+        Ok(())
+    }
+
+    /// Creates the ephemeral behavior account for `body`, its rent paid by the creator's Player.
+    pub fn create_behavior(ctx: Context<CreateBehavior>, hash: [u8; 32], body: Vec<u8>) -> Result<()> {
+        require!(BehaviorBody::parse(&body).is_some(), HorizonError::InvalidBehavior);
+        require!(behavior_hash(&body) == hash, HorizonError::HashMismatch);
+        let info = ctx.accounts.behavior.to_account_info();
+        let (key, bump) = Pubkey::find_program_address(&[b"behavior", &hash], &ID);
+        require_keys_eq!(key, info.key(), HorizonError::BadPda);
+        require!(info.data_is_empty(), HorizonError::AlreadyExists);
+        create_sponsored(
+            &ctx.accounts.player,
+            &info,
+            &[b"behavior", &hash, &[bump]],
+            &ctx.accounts.vault,
+            8 + Behavior::INIT_SPACE,
+        )?;
+        let mut stored = [0u8; MAX_BEHAVIOR_LEN];
+        stored[..body.len()].copy_from_slice(&body);
+        let behavior = Behavior { creator: ctx.accounts.creator.key(), len: body.len() as u8, body: stored, bump };
+        eph::write(&info, &behavior)?;
+        msg!("HZ_BEHAVIOR {} {} {}", key, behavior.creator, behavior.len);
+        Ok(())
+    }
+
+    /// Creates the ephemeral army account, its rent paid by the owner's Player.
     pub fn create_army(ctx: Context<CreateArmy>, index: u32, race: u8, units: Vec<UnitInput>) -> Result<()> {
+        let owner = ctx.accounts.owner.key();
+        let info = ctx.accounts.army.to_account_info();
+        let index_bytes = index.to_le_bytes();
+        let (key, bump) = Pubkey::find_program_address(&[b"army", owner.as_ref(), &index_bytes], &ID);
+        require_keys_eq!(key, info.key(), HorizonError::BadPda);
+        require!(info.data_is_empty(), HorizonError::AlreadyExists);
         let stored = load_units(
             race,
             &units,
@@ -91,17 +157,26 @@ pub mod horizon_zero {
             ctx.accounts.battleground.budget,
             ctx.accounts.battleground.cols,
         )?;
-        let army = &mut ctx.accounts.army;
-        army.owner = ctx.accounts.owner.key();
-        army.battleground = ctx.accounts.battleground.key();
-        army.race = race;
-        army.index = index;
-        army.unit_count = stored.len() as u8;
-        army.units = [ArmyUnit::default(); MAX_UNITS];
+        create_sponsored(
+            &ctx.accounts.player,
+            &info,
+            &[b"army", owner.as_ref(), &index_bytes, &[bump]],
+            &ctx.accounts.vault,
+            8 + Army::INIT_SPACE,
+        )?;
+        let mut army = Box::new(Army {
+            owner,
+            battleground: ctx.accounts.battleground.key(),
+            race,
+            index,
+            unit_count: stored.len() as u8,
+            units: [ArmyUnit::default(); MAX_UNITS],
+            status: ArmyStatus::Idle,
+            bump,
+        });
         army.units[..stored.len()].copy_from_slice(&stored);
-        army.status = ArmyStatus::Idle;
-        army.bump = ctx.bumps.army;
-        msg!("HZ_ARMY {} {} {}", army.key(), army.owner, army.battleground);
+        eph::write(&info, army.as_ref())?;
+        msg!("HZ_ARMY {} {} {}", key, army.owner, army.battleground);
         Ok(())
     }
 
@@ -123,53 +198,24 @@ pub mod horizon_zero {
         Ok(())
     }
 
-    /// Moves `amount` from the owner into their pot for this battleground, creating the pot first.
-    pub fn fund_pot(ctx: Context<FundPot>, amount: u64) -> Result<()> {
-        let pot = &mut ctx.accounts.pot;
-        if pot.owner == Pubkey::default() {
-            pot.owner = ctx.accounts.owner.key();
-            pot.battleground = ctx.accounts.battleground.key();
-            pot.bump = ctx.bumps.pot;
-        }
-        transfer_sol(&ctx.accounts.owner, &pot.to_account_info(), amount)?;
-        pot.budget = pot.budget.checked_add(amount).ok_or(HorizonError::PotShort)?;
-        log_pot(&pot.key(), pot);
-        Ok(())
-    }
-
-    /// Returns `amount` to the owner, taken from the winnings first, then from the budget. Queued
-    /// armies stay queued; while the budget is under one stake, no locker can match them.
-    pub fn withdraw_pot(ctx: Context<OwnPot>, amount: u64) -> Result<()> {
-        let pot = &mut ctx.accounts.pot;
-        require!(amount <= pot.winnings.saturating_add(pot.budget), HorizonError::PotShort);
-        let from_winnings = amount.min(pot.winnings);
-        pot.winnings -= from_winnings;
-        pot.budget -= amount - from_winnings;
-        move_lamports(&pot.to_account_info(), &ctx.accounts.owner.to_account_info(), amount)?;
-        log_pot(&pot.key(), pot);
-        Ok(())
-    }
-
-    /// On, payouts go to the winnings and are never staked again. Off, they refill the budget.
-    /// Switching does not move what either balance already holds.
-    pub fn set_segregation(ctx: Context<OwnPot>, segregate: bool) -> Result<()> {
-        ctx.accounts.pot.segregate = segregate;
-        log_pot(&ctx.accounts.pot.key(), &ctx.accounts.pot);
-        Ok(())
-    }
-
-    /// Returns the whole pot, rent included, once none of the owner's battles there is unsettled.
-    pub fn close_pot(ctx: Context<ClosePot>) -> Result<()> {
-        require!(ctx.accounts.pot.fighting == 0, HorizonError::PotBusy);
-        msg!("HZ_POT_CLOSE {}", ctx.accounts.pot.key());
-        Ok(())
-    }
-
-    /// Deletes an idle army and returns its rent to the owner. A queued army must unlock first;
-    /// past battles keep their own unit snapshots.
+    /// Deletes an idle army and refunds its rent to the owner's Player. A queued army must unlock
+    /// first; past battles keep their own unit snapshots.
     pub fn close_army(ctx: Context<CloseArmy>) -> Result<()> {
-        require!(ctx.accounts.army.status == ArmyStatus::Idle, HorizonError::BadStatus);
-        msg!("HZ_ARMY_CLOSE {}", ctx.accounts.army.key());
+        let info = ctx.accounts.army.to_account_info();
+        require_keys_eq!(*info.owner, ID, HorizonError::BadPda);
+        let army = Box::new(Army::try_deserialize(&mut &info.try_borrow_data()?[..])?);
+        let owner = ctx.accounts.owner.key();
+        require!(army.owner == owner, HorizonError::NotOwner);
+        require!(army.status == ArmyStatus::Idle, HorizonError::BadStatus);
+        verify_pda(&[b"army", owner.as_ref(), &army.index.to_le_bytes()], &info.key(), army.bump)?;
+        let player = &ctx.accounts.player;
+        eph::close(
+            &player.to_account_info(),
+            &[b"player", owner.as_ref(), &[player.bump]],
+            &info,
+            &ctx.accounts.vault,
+        )?;
+        msg!("HZ_ARMY_CLOSE {}", info.key());
         Ok(())
     }
 
@@ -193,7 +239,7 @@ pub mod horizon_zero {
         recheck_behaviors(&ctx.accounts.army, ctx.remaining_accounts)?;
 
         let stake = ctx.accounts.battleground.stake_lamports;
-        require!(ctx.accounts.pot.budget >= stake, HorizonError::PotTooLow);
+        require!(ctx.accounts.player_account.budget >= stake, HorizonError::BudgetTooLow);
         let candidates = queued_opponents(&ctx.accounts.battleground, player, stake, ctx.remaining_accounts)?;
         if candidates.is_empty() {
             let army_key = ctx.accounts.army.key();
@@ -218,111 +264,169 @@ pub mod horizon_zero {
         Ok(())
     }
 
-    /// The VRF callback. Stores the seed and schedules the settlement on a one-shot Hydra crank:
-    /// a whole battle does not fit in the compute the oracle gives its callback.
+    /// The VRF callback. Stores the seed; anyone may then settle the battle. A whole battle does
+    /// not fit in the compute the oracle gives its callback.
     pub fn seed_match(ctx: Context<SeedMatch>, randomness: [u8; 32]) -> Result<()> {
         let battle_key = ctx.accounts.battle.key();
         let battle = &mut ctx.accounts.battle;
         require!(battle.status == BattleStatus::Awaiting, HorizonError::AlreadyResolved);
-        battle_seeds(battle, &battle_key)?;
-        let (fund, fund_bump) = crank::crank_fund_pda(&battle_key);
-        require_keys_eq!(fund, ctx.accounts.crank_fund.key(), HorizonError::BadPda);
-        require_keys_eq!(crank::crank_pda(&fund, &battle_key), ctx.accounts.crank.key(), HorizonError::BadCrank);
-
+        battle_seeds(&battle.battleground, battle.seq, battle.bump, &battle_key)?;
         battle.seed = randomness;
         battle.status = BattleStatus::Seeded;
-        crank::create_settle_crank(
-            battle,
-            battle_key,
-            &ctx.accounts.crank_fund.to_account_info(),
-            fund_bump,
-            &ctx.accounts.crank.to_account_info(),
-            &ctx.accounts.system_program.to_account_info(),
-        )?;
-        msg!("HZ_MATCH_SEEDED {} {} {}", battle_key, ctx.accounts.crank.key(), hex32(&randomness));
+        msg!("HZ_MATCH_SEEDED {} {}", battle_key, hex32(&randomness));
         Ok(())
     }
 
-    /// Runs the battle on the stored seed and pays out. Only a Hydra crank calls it: it must
-    /// directly follow `Trigger` on this battle's crank, which it then cancels to refund the player
-    /// who funded it.
+    /// Plays the battle on the stored seed, pays out and closes the battle. Anyone may call it once
+    /// the battle is seeded. The loser's Player pays the winner's Player and the protocol fee; a
+    /// draw only releases both stakes back into the budgets.
     pub fn settle_match(ctx: Context<SettleMatch>) -> Result<()> {
         #[cfg(feature = "cu-profile")]
         let entered = remaining_units();
-        let battle_key = ctx.accounts.battle.key();
-        let battle = &mut ctx.accounts.battle;
-        require!(battle.status == BattleStatus::Seeded, HorizonError::AlreadyResolved);
+        let info = ctx.accounts.battle.to_account_info();
+        let battle_key = info.key();
+        // A settled battle is closed, so a second settlement finds no battle.
+        require!(*info.owner == ID && !info.data_is_empty(), HorizonError::AlreadyResolved);
+        let battle = read_battle(&info.try_borrow_data()?)?;
+        let (head, tail) = (&battle.head, &battle.tail);
+        require!(tail.status == BattleStatus::Seeded, HorizonError::AlreadyResolved);
+        battle_seeds(&head.battleground, head.seq, tail.bump, &battle_key)?;
+        require_keys_eq!(ctx.accounts.army_a.key(), head.army_a, HorizonError::BadPda);
+        require_keys_eq!(ctx.accounts.army_b.key(), head.army_b, HorizonError::BadPda);
+        verify_pda(&[b"player", head.player_a.as_ref()], &ctx.accounts.player_a.key(), ctx.accounts.player_a.bump)?;
+        verify_pda(&[b"player", head.player_b.as_ref()], &ctx.accounts.player_b.key(), ctx.accounts.player_b.bump)?;
         require!(ctx.accounts.army_a.status == ArmyStatus::Fighting, HorizonError::BadStatus);
         require!(ctx.accounts.army_b.status == ArmyStatus::Fighting, HorizonError::BadStatus);
-        battle_seeds(battle, &battle_key)?;
-        let (fund, _) = crank::crank_fund_pda(&battle_key);
-        let crank_key = crank::crank_pda(&fund, &battle_key);
-        require_keys_eq!(crank_key, ctx.accounts.crank.key(), HorizonError::BadCrank);
-        crank::require_cranked(&ctx.accounts.instructions, &crank_key)?;
 
-        let side_a = combat_units(&battle.units_a, battle.count_a)?;
-        let side_b = combat_units(&battle.units_b, battle.count_b)?;
+        let side_a = combat_units(&battle.units_a, head.count_a)?;
+        let side_b = combat_units(&battle.units_b, head.count_b)?;
         // The trace is replayed off-chain; the program only needs the winner.
         #[cfg(feature = "cu-profile")]
         let before = remaining_units();
-        let winner = simulate_winner(
-            &side_a,
-            &side_b,
-            battle.seed,
-            Geometry { cols: battle.cols as i32, rows: battle.rows as i32 },
-        );
+        let winner =
+            simulate_winner(&side_a, &side_b, tail.seed, Geometry { cols: head.cols as i32, rows: head.rows as i32 });
         #[cfg(feature = "cu-profile")]
         log_program_overhead(entered - before);
-        let stake = battle.stake;
-        let info = battle.to_account_info();
-        // Before the payout: the runtime checks at a CPI that lamports moved only between the
-        // accounts it is given.
-        let (ground, seq, bump) = (battle.battleground, battle.seq.to_le_bytes(), [battle.bump]);
-        crank::cancel_crank(
-            &info,
-            &[b"match", ground.as_ref(), &seq, &bump],
-            &ctx.accounts.crank.to_account_info(),
-            &ctx.accounts.player_b.to_account_info(),
-        )?;
-        let rent = Rent::get()?.minimum_balance(info.data_len());
-        let held = info.lamports().checked_sub(rent).ok_or(HorizonError::NoStake)?;
-        require!(held >= stake.saturating_mul(2), HorizonError::NoStake);
 
-        let outcome = match winner {
-            Some(Side::A) => Outcome::A,
-            Some(Side::B) => Outcome::B,
-            None => Outcome::Draw,
+        // The locker (player B) sponsored the battle; closing refunds its rent. Close before the
+        // payout: in the rollup the close is a CPI, and the runtime checks at a CPI that lamports
+        // moved only between the accounts it is given.
+        let sponsor = ctx.accounts.player_b.to_account_info();
+        let sponsor_bump = [ctx.accounts.player_b.bump];
+        eph::close(&sponsor, &[b"player", head.player_b.as_ref(), &sponsor_bump], &info, &ctx.accounts.vault)?;
+
+        let stake = head.stake;
+        let (outcome, fee) = match winner {
+            Some(side) => {
+                let payout = fees::win_payout(stake, tail.fee_bps);
+                let (winner, loser) = match side {
+                    Side::A => (&mut ctx.accounts.player_a, &mut ctx.accounts.player_b),
+                    Side::B => (&mut ctx.accounts.player_b, &mut ctx.accounts.player_a),
+                };
+                move_lamports(&loser.to_account_info(), &winner.to_account_info(), payout.to_winner)?;
+                move_lamports(&loser.to_account_info(), &ctx.accounts.config.to_account_info(), payout.fee)?;
+                winner.credit(payout.credit);
+                (if side == Side::A { Outcome::A } else { Outcome::B }, payout.fee)
+            }
+            None => {
+                ctx.accounts.player_a.budget += stake;
+                ctx.accounts.player_b.budget += stake;
+                (Outcome::Draw, 0)
+            }
         };
-        let (paid_a, paid_b) = match outcome {
-            Outcome::A => (stake * 2, 0),
-            Outcome::B => (0, stake * 2),
-            _ => (stake, stake),
-        };
-        for (pot, paid) in [(&mut ctx.accounts.pot_a, paid_a), (&mut ctx.accounts.pot_b, paid_b)] {
-            move_lamports(&info, &pot.to_account_info(), paid)?;
-            pot.credit(paid);
-            pot.fighting = pot.fighting.saturating_sub(1);
-            log_pot(&pot.key(), pot);
+        ctx.accounts.config.fees += fee;
+        for player in [&mut ctx.accounts.player_a, &mut ctx.accounts.player_b] {
+            player.locked = player.locked.checked_sub(stake).ok_or(HorizonError::NoStake)?;
+            player.fighting = player.fighting.saturating_sub(1);
+            log_player(&player.key(), player);
         }
-
-        battle.status = BattleStatus::Resolved;
-        battle.outcome = outcome;
         ctx.accounts.army_a.status = ArmyStatus::Idle;
         ctx.accounts.army_b.status = ArmyStatus::Idle;
-        let seed = battle.seed;
-        msg!("HZ_MATCH_RESOLVED {} {} {}", battle_key, outcome as u8, hex32(&seed));
+        msg!("HZ_MATCH_RESOLVED {} {} {} {} {}", battle_key, outcome as u8, fee, hex32(&tail.seed), head.player_b);
         Ok(())
     }
 }
 
+/// What `settle_match` reads from a battle, with the filled snapshot slots on the heap: a whole
+/// `Battle` value and its copy do not fit the 4 KB SBF stack frame.
+struct SettledBattle {
+    head: BattleFront,
+    units_a: Vec<SnapshotUnit>,
+    units_b: Vec<SnapshotUnit>,
+    tail: BattleBack,
+}
+
+/// `Battle`'s fields before the snapshots, in declaration order.
+#[derive(AnchorDeserialize)]
+struct BattleFront {
+    battleground: Pubkey,
+    army_a: Pubkey,
+    army_b: Pubkey,
+    player_a: Pubkey,
+    player_b: Pubkey,
+    stake: u64,
+    seq: u64,
+    count_a: u8,
+    count_b: u8,
+    cols: u8,
+    rows: u8,
+}
+
+/// `Battle`'s fields after the snapshots, in declaration order.
+#[derive(AnchorDeserialize)]
+struct BattleBack {
+    status: BattleStatus,
+    seed: [u8; 32],
+    _outcome: Outcome,
+    _race_a: u8,
+    _race_b: u8,
+    fee_bps: u16,
+    bump: u8,
+}
+
+fn read_battle(data: &[u8]) -> Result<SettledBattle> {
+    require!(data.starts_with(Battle::DISCRIMINATOR), anchor_lang::error::ErrorCode::AccountDiscriminatorMismatch);
+    let mut cursor = &data[Battle::DISCRIMINATOR.len()..];
+    let head = BattleFront::deserialize(&mut cursor)?;
+    // Only the `count` filled slots, sized up front: the SBF heap is a bump allocator, so a
+    // growing vector leaks each old buffer, and the simulation needs most of the 32 KB.
+    let side = |cursor: &mut &[u8], count: u8| -> Result<Vec<SnapshotUnit>> {
+        let mut units = Vec::with_capacity(count as usize);
+        for slot in 0..MAX_UNITS {
+            let unit = SnapshotUnit::deserialize(cursor)?;
+            if slot < count as usize {
+                units.push(unit);
+            }
+        }
+        Ok(units)
+    };
+    let units_a = side(&mut cursor, head.count_a)?;
+    let units_b = side(&mut cursor, head.count_b)?;
+    let tail = BattleBack::deserialize(&mut cursor)?;
+    Ok(SettledBattle { head, units_a, units_b, tail })
+}
+
+/// Creates an ephemeral account sponsored by `player`, after checking its free lamports cover the
+/// rent so a stake or a payout is never spent on storage.
+fn create_sponsored<'info>(
+    player: &Account<'info, Player>,
+    account: &AccountInfo<'info>,
+    account_seeds: &[&[u8]],
+    vault: &AccountInfo<'info>,
+    space: usize,
+) -> Result<()> {
+    let info = player.to_account_info();
+    let rent = Rent::get()?.minimum_balance(info.data_len());
+    require!(player.free(info.lamports(), rent) >= eph::rent(space)?, HorizonError::RentShort);
+    let bump = [player.bump];
+    eph::create(&info, &[b"player", player.owner.as_ref(), &bump], account, account_seeds, vault, space)
+}
+
 /// Checks the battle address against its stored canonical bump (lock_army created it with that
 /// bump), one derivation instead of a bump search.
-fn battle_seeds(battle: &Battle, key: &Pubkey) -> Result<()> {
-    let derived = Pubkey::create_program_address(
-        &[b"match", battle.battleground.as_ref(), &battle.seq.to_le_bytes(), &[battle.bump]],
-        &ID,
-    )
-    .map_err(|_| HorizonError::BadPda)?;
+fn battle_seeds(battleground: &Pubkey, seq: u64, bump: u8, key: &Pubkey) -> Result<()> {
+    let derived = Pubkey::create_program_address(&[b"match", battleground.as_ref(), &seq.to_le_bytes(), &[bump]], &ID)
+        .map_err(|_| HorizonError::BadPda)?;
     require_keys_eq!(derived, *key, HorizonError::BadPda);
     Ok(())
 }
@@ -336,33 +440,33 @@ fn open_matched<'info>(
 ) -> Result<()> {
     let hash = recent_slot_hash(&ctx.accounts.slot_hashes.to_account_info())?;
     let pick = (u64::from_le_bytes(hash[..8].try_into().unwrap()) as usize) % candidates.len();
-    let (opponent_key, opponent_pot_at) = candidates[pick];
+    let (opponent_key, opponent_player_at) = candidates[pick];
     let opponent = account_by_key(ctx.remaining_accounts, &opponent_key)?;
-    let opponent_pot = ctx.remaining_accounts[opponent_pot_at].clone();
-    let mut opponent_pot_state = Pot::try_deserialize(&mut &opponent_pot.try_borrow_data()?[..])?;
+    let opponent_player = ctx.remaining_accounts[opponent_player_at].clone();
+    let mut opponent_state = Player::try_deserialize(&mut &opponent_player.try_borrow_data()?[..])?;
     let mut opponent_army = Box::new(Army::try_deserialize(&mut &opponent.try_borrow_data()?[..])?);
     let opponent_owner = opponent_army.owner;
     require!(opponent_army.status == ArmyStatus::Queued, HorizonError::BadStatus);
     require!(opponent_army.owner != player, HorizonError::OwnArmy);
 
+    let ground = ctx.accounts.battleground.key();
     let seq = ctx.accounts.battleground.match_seq;
-    let (battle_key, battle_bump) =
-        Pubkey::find_program_address(&[b"match", ctx.accounts.battleground.key().as_ref(), &seq.to_le_bytes()], &ID);
+    let seq_bytes = seq.to_le_bytes();
+    let (battle_key, battle_bump) = Pubkey::find_program_address(&[b"match", ground.as_ref(), &seq_bytes], &ID);
     require_keys_eq!(battle_key, ctx.accounts.battle.key(), HorizonError::BadMatch);
-    let battle_space = 8 + Battle::INIT_SPACE;
-    let battle_rent = Rent::get()?.minimum_balance(battle_space);
-    create_program_account_with_lamports(
-        ctx.accounts.player.to_account_info(),
-        ctx.accounts.battle.to_account_info(),
-        battle_space,
-        battle_rent,
-        &[b"match", ctx.accounts.battleground.key().as_ref(), &seq.to_le_bytes(), &[battle_bump]],
+    // The locker's Player sponsors the battle; `settle_match` closes it and refunds the rent.
+    create_sponsored(
+        &ctx.accounts.player_account,
+        &ctx.accounts.battle.to_account_info(),
+        &[b"match", ground.as_ref(), &seq_bytes, &[battle_bump]],
+        &ctx.accounts.vault,
+        8 + Battle::INIT_SPACE,
     )?;
 
     {
         let mut data = ctx.accounts.battle.try_borrow_mut_data()?;
         let head = BattleHead {
-            battleground: ctx.accounts.battleground.key(),
+            battleground: ground,
             army_a: opponent_key,
             army_b: ctx.accounts.army.key(),
             player_a: opponent_owner,
@@ -371,6 +475,7 @@ fn open_matched<'info>(
             seq,
             cols: ctx.accounts.battleground.cols,
             rows: ctx.accounts.battleground.rows,
+            fee_bps: ctx.accounts.config.fee_bps,
             bump: battle_bump,
         };
         write_battle(&mut data, &head, &opponent_army, &ctx.accounts.army)?;
@@ -384,36 +489,25 @@ fn open_matched<'info>(
         opponent_army.status = ArmyStatus::Fighting;
         opponent_army.try_serialize(&mut data.as_mut())?;
     }
-    // Both stakes leave the pots after the VRF request: the runtime checks at a CPI that lamports
-    // moved only between the accounts it is given.
-    for pot in [&mut *ctx.accounts.pot, &mut opponent_pot_state] {
-        pot.budget -= stake;
-        pot.fighting = pot.fighting.checked_add(1).ok_or(HorizonError::PotBusy)?;
+    // Stakes stay on the Players until settlement; only the counters move.
+    for account in [&mut **ctx.accounts.player_account, &mut opponent_state] {
+        account.budget -= stake;
+        account.locked += stake;
+        account.fighting = account.fighting.checked_add(1).ok_or(HorizonError::PlayerBusy)?;
     }
-    opponent_pot_state.try_serialize(&mut opponent_pot.try_borrow_mut_data()?.as_mut())?;
+    opponent_state.try_serialize(&mut opponent_player.try_borrow_mut_data()?.as_mut())?;
     ctx.accounts.army.exit(&ID)?;
     ctx.accounts.battleground.exit(&ID)?;
-    ctx.accounts.pot.exit(&ID)?;
+    ctx.accounts.player_account.exit(&ID)?;
 
-    // The vault that pays for the settlement crank. It must end the callback empty, so it holds
-    // exactly the crank's rent and reward, topped up if someone sent it lamports already.
-    let (fund_key, _) = crank::crank_fund_pda(&battle_key);
-    let fund = account_by_key(ctx.remaining_accounts, &fund_key)?;
-    let funding = crank::crank_funding()?.saturating_sub(fund.lamports());
-    if funding > 0 {
-        transfer_sol(&ctx.accounts.player, &fund, funding)?;
-    }
-
-    request_vrf(&ctx, &fund_key)?;
-    move_lamports(&ctx.accounts.pot.to_account_info(), &ctx.accounts.battle, stake)?;
-    move_lamports(&opponent_pot, &ctx.accounts.battle, stake)?;
-    log_pot(&ctx.accounts.pot.key(), &ctx.accounts.pot);
-    log_pot(opponent_pot.key, &opponent_pot_state);
+    request_vrf(&ctx)?;
+    log_player(&ctx.accounts.player_account.key(), &ctx.accounts.player_account);
+    log_player(opponent_player.key, &opponent_state);
     msg!("HZ_MATCH_OPEN {} {} {} {}", battle_key, opponent_key, ctx.accounts.army.key(), stake);
     Ok(())
 }
 
-fn request_vrf<'info>(ctx: &Context<'info, LockArmy<'info>>, fund: &Pubkey) -> Result<()> {
+fn request_vrf<'info>(ctx: &Context<'info, LockArmy<'info>>) -> Result<()> {
     let battle = ctx.accounts.battle.key();
     let seed = horizon_combat::sha256(&[battle.as_ref()]);
     let ix = create_request_randomness_ix(RequestRandomnessParams {
@@ -422,13 +516,7 @@ fn request_vrf<'info>(ctx: &Context<'info, LockArmy<'info>>, fund: &Pubkey) -> R
         callback_program_id: ID,
         callback_discriminator: instruction::SeedMatch::DISCRIMINATOR.to_vec(),
         caller_seed: seed,
-        accounts_metas: Some(vec![
-            meta(battle, true),
-            meta(*fund, true),
-            meta(crank::crank_pda(fund, &battle), true),
-            meta(crank::HYDRA_ID, false),
-            meta(system_program::ID, false),
-        ]),
+        accounts_metas: Some(vec![meta(battle, true)]),
         ..Default::default()
     });
 
@@ -526,16 +614,21 @@ fn recheck_behaviors(army: &Army, accounts: &[AccountInfo]) -> Result<()> {
     Ok(())
 }
 
-/// The queued armies a locker may meet, each with the index of its owner's pot in `accounts`. An
-/// army whose owner has no pot there, or whose pot no longer covers the stake, is skipped.
-fn queued_opponents(ground: &Account<Battleground>, player: Pubkey, stake: u64, accounts: &[AccountInfo]) -> Result<Vec<(Pubkey, usize)>> {
-    // Every pot is a program account at its PDA, so a program-owned `Pot` is genuine.
-    let mut pots = Vec::new();
+/// The queued armies a locker may meet, each with the index of its owner's Player in `accounts`. An
+/// army whose owner's Player was not passed, or no longer covers the stake, is skipped.
+fn queued_opponents(
+    ground: &Account<Battleground>,
+    player: Pubkey,
+    stake: u64,
+    accounts: &[AccountInfo],
+) -> Result<Vec<(Pubkey, usize)>> {
+    // Every Player is a program account at its PDA, so a program-owned `Player` is genuine.
+    let mut players = Vec::new();
     for (at, account) in accounts.iter().enumerate() {
-        if account.owner == &ID && account.data_len() == 8 + Pot::INIT_SPACE {
-            if let Ok(pot) = Pot::try_deserialize(&mut &account.try_borrow_data()?[..]) {
-                if pot.battleground == ground.key() && pot.budget >= stake {
-                    pots.push((pot.owner, at));
+        if account.owner == &ID && account.data_len() == 8 + Player::INIT_SPACE {
+            if let Ok(state) = Player::try_deserialize(&mut &account.try_borrow_data()?[..]) {
+                if state.budget >= stake {
+                    players.push((state.owner, at));
                 }
             }
         }
@@ -547,7 +640,7 @@ fn queued_opponents(ground: &Account<Battleground>, player: Pubkey, stake: u64, 
             if army.owner == player || army.status != ArmyStatus::Queued {
                 continue;
             }
-            if let Some(&(_, at)) = pots.iter().find(|(owner, _)| *owner == army.owner) {
+            if let Some(&(_, at)) = players.iter().find(|(owner, _)| *owner == army.owner) {
                 found.push((*key, at));
             }
         }
@@ -566,6 +659,7 @@ struct BattleHead {
     seq: u64,
     cols: u8,
     rows: u8,
+    fee_bps: u16,
     bump: u8,
 }
 
@@ -593,6 +687,7 @@ fn write_battle(data: &mut [u8], head: &BattleHead, army_a: &Army, army_b: &Army
     Outcome::Pending.serialize(&mut out)?;
     army_a.race.serialize(&mut out)?;
     army_b.race.serialize(&mut out)?;
+    head.fee_bps.serialize(&mut out)?;
     head.bump.serialize(&mut out)?;
     Ok(())
 }
@@ -693,20 +788,9 @@ fn create_program_account<'info>(
     space: usize,
     signer_seeds: &[&[u8]],
 ) -> Result<()> {
-    let rent = Rent::get()?.minimum_balance(space);
-    create_program_account_with_lamports(payer, account, space, rent, signer_seeds)
-}
-
-fn create_program_account_with_lamports<'info>(
-    payer: AccountInfo<'info>,
-    account: AccountInfo<'info>,
-    space: usize,
-    lamports: u64,
-    signer_seeds: &[&[u8]],
-) -> Result<()> {
     system_program::create_account(
         CpiContext::new_with_signer(system_program::ID, CreateAccount { from: payer, to: account }, &[signer_seeds]),
-        lamports,
+        Rent::get()?.minimum_balance(space),
         space as u64,
         &ID,
     )
@@ -729,13 +813,17 @@ pub(crate) fn move_lamports(from: &AccountInfo, to: &AccountInfo, lamports: u64)
     Ok(())
 }
 
-/// A player's pot on a battleground: `[b"pot", battleground, owner]`.
-pub fn pot_pda(battleground: &Pubkey, owner: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[b"pot", battleground.as_ref(), owner.as_ref()], &ID).0
-}
-
-fn log_pot(key: &Pubkey, pot: &Pot) {
-    msg!("HZ_POT {} {} {} {} {} {}", key, pot.owner, pot.budget, pot.winnings, pot.segregate as u8, pot.fighting);
+fn log_player(key: &Pubkey, player: &Player) {
+    msg!(
+        "HZ_PLAYER {} {} {} {} {} {} {}",
+        key,
+        player.owner,
+        player.budget,
+        player.winnings,
+        player.locked,
+        player.segregate as u8,
+        player.fighting
+    );
 }
 
 fn hex32(bytes: &[u8; 32]) -> String {
@@ -763,6 +851,13 @@ pub struct Initialize<'info> {
 }
 
 #[derive(Accounts)]
+pub struct AdminConfig<'info> {
+    pub admin: Signer<'info>,
+    #[account(mut, seeds = [b"config"], bump = config.bump, has_one = admin @ HorizonError::NotAdmin)]
+    pub config: Account<'info, Config>,
+}
+
+#[derive(Accounts)]
 #[instruction(battleground_id: u8)]
 pub struct CreateBattleground<'info> {
     #[account(mut)]
@@ -780,6 +875,24 @@ pub struct CreateBattleground<'info> {
     pub system_program: Program<'info, System>,
 }
 
+#[derive(Accounts)]
+pub struct RegisterPlayer<'info> {
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    #[account(init, payer = owner, space = 8 + Player::INIT_SPACE, seeds = [b"player", owner.key().as_ref()], bump)]
+    pub player: Account<'info, Player>,
+    #[account(init, payer = owner, space = 8 + Outbox::INIT_SPACE, seeds = [b"outbox", owner.key().as_ref()], bump)]
+    pub outbox: Account<'info, Outbox>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct OwnPlayer<'info> {
+    pub owner: Signer<'info>,
+    #[account(mut, seeds = [b"player", owner.key().as_ref()], bump = player.bump, has_one = owner @ HorizonError::NotOwner)]
+    pub player: Account<'info, Player>,
+}
+
 fn behavior_bytes(behavior: &Behavior) -> Result<&[u8]> {
     let len = behavior.len as usize;
     require!(len <= behavior.body.len(), HorizonError::InvalidBehavior);
@@ -789,35 +902,41 @@ fn behavior_bytes(behavior: &Behavior) -> Result<&[u8]> {
 }
 
 #[derive(Accounts)]
-#[instruction(hash: [u8; 32])]
 pub struct CreateBehavior<'info> {
-    #[account(mut)]
     pub creator: Signer<'info>,
-    #[account(
-        init,
-        payer = creator,
-        space = 8 + Behavior::INIT_SPACE,
-        seeds = [b"behavior".as_ref(), hash.as_ref()],
-        bump
-    )]
-    pub behavior: Account<'info, Behavior>,
+    /// Sponsors the behavior's rent.
+    #[account(mut, seeds = [b"player", creator.key().as_ref()], bump = player.bump)]
+    pub player: Account<'info, Player>,
+    /// CHECK: the behavior PDA, created here as an ephemeral account
+    #[account(mut)]
+    pub behavior: UncheckedAccount<'info>,
+    /// CHECK: the ephemeral rent vault
+    #[cfg_attr(not(feature = "inline-mock-magic"), account(mut, address = EPH_VAULT))]
+    #[cfg_attr(feature = "inline-mock-magic", account(mut))]
+    pub vault: UncheckedAccount<'info>,
+    /// CHECK: the magic program, which creates ephemeral accounts
+    #[cfg_attr(not(feature = "inline-mock-magic"), account(address = MAGIC_PROGRAM))]
+    pub magic_program: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
-#[instruction(index: u32)]
 pub struct CreateArmy<'info> {
-    #[account(mut)]
     pub owner: Signer<'info>,
+    /// Sponsors the army's rent.
+    #[account(mut, seeds = [b"player", owner.key().as_ref()], bump = player.bump)]
+    pub player: Account<'info, Player>,
     pub battleground: Account<'info, Battleground>,
-    #[account(
-        init,
-        payer = owner,
-        space = 8 + Army::INIT_SPACE,
-        seeds = [b"army".as_ref(), owner.key().as_ref(), index.to_le_bytes().as_ref()],
-        bump
-    )]
-    pub army: Account<'info, Army>,
+    /// CHECK: the army PDA, created here as an ephemeral account
+    #[account(mut)]
+    pub army: UncheckedAccount<'info>,
+    /// CHECK: the ephemeral rent vault
+    #[cfg_attr(not(feature = "inline-mock-magic"), account(mut, address = EPH_VAULT))]
+    #[cfg_attr(feature = "inline-mock-magic", account(mut))]
+    pub vault: UncheckedAccount<'info>,
+    /// CHECK: the magic program, which creates ephemeral accounts
+    #[cfg_attr(not(feature = "inline-mock-magic"), account(address = MAGIC_PROGRAM))]
+    pub magic_program: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }
 
@@ -830,43 +949,21 @@ pub struct UpdateArmy<'info> {
 }
 
 #[derive(Accounts)]
-pub struct FundPot<'info> {
-    #[account(mut)]
-    pub owner: Signer<'info>,
-    pub battleground: Account<'info, Battleground>,
-    #[account(
-        init_if_needed,
-        payer = owner,
-        space = 8 + Pot::INIT_SPACE,
-        seeds = [b"pot".as_ref(), battleground.key().as_ref(), owner.key().as_ref()],
-        bump
-    )]
-    pub pot: Account<'info, Pot>,
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct OwnPot<'info> {
-    #[account(mut)]
-    pub owner: Signer<'info>,
-    #[account(mut, has_one = owner @ HorizonError::NotOwner)]
-    pub pot: Account<'info, Pot>,
-}
-
-#[derive(Accounts)]
-pub struct ClosePot<'info> {
-    #[account(mut)]
-    pub owner: Signer<'info>,
-    #[account(mut, close = owner, has_one = owner @ HorizonError::NotOwner)]
-    pub pot: Account<'info, Pot>,
-}
-
-#[derive(Accounts)]
 pub struct CloseArmy<'info> {
-    #[account(mut)]
     pub owner: Signer<'info>,
-    #[account(mut, close = owner, constraint = army.owner == owner.key() @ HorizonError::NotOwner)]
-    pub army: Account<'info, Army>,
+    /// Sponsored the army; gets its rent back.
+    #[account(mut, seeds = [b"player", owner.key().as_ref()], bump = player.bump)]
+    pub player: Account<'info, Player>,
+    /// CHECK: closed here, so read by hand: owner, status and address are checked in the handler
+    #[account(mut)]
+    pub army: UncheckedAccount<'info>,
+    /// CHECK: the ephemeral rent vault
+    #[cfg_attr(not(feature = "inline-mock-magic"), account(mut, address = EPH_VAULT))]
+    #[cfg_attr(feature = "inline-mock-magic", account(mut))]
+    pub vault: UncheckedAccount<'info>,
+    /// CHECK: the magic program, which closes ephemeral accounts
+    #[cfg_attr(not(feature = "inline-mock-magic"), account(address = MAGIC_PROGRAM))]
+    pub magic_program: UncheckedAccount<'info>,
 }
 
 #[vrf]
@@ -874,16 +971,26 @@ pub struct CloseArmy<'info> {
 pub struct LockArmy<'info> {
     #[account(mut)]
     pub player: Signer<'info>,
+    /// The locker's Player: its budget must cover one stake, and it sponsors the battle.
+    #[account(mut, seeds = [b"player".as_ref(), player.key().as_ref()], bump = player_account.bump)]
+    pub player_account: Box<Account<'info, Player>>,
+    /// Its fee rate is copied onto a new battle.
+    #[account(seeds = [b"config"], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
     #[account(mut)]
     pub battleground: Account<'info, Battleground>,
     #[account(mut)]
     pub army: Box<Account<'info, Army>>,
-    /// The locker's pot on this battleground; it must cover one stake.
-    #[account(mut, seeds = [b"pot".as_ref(), battleground.key().as_ref(), player.key().as_ref()], bump = pot.bump)]
-    pub pot: Box<Account<'info, Pot>>,
     /// CHECK: created when two armies match
     #[account(mut)]
     pub battle: UncheckedAccount<'info>,
+    /// CHECK: the ephemeral rent vault
+    #[cfg_attr(not(feature = "inline-mock-magic"), account(mut, address = EPH_VAULT))]
+    #[cfg_attr(feature = "inline-mock-magic", account(mut))]
+    pub vault: UncheckedAccount<'info>,
+    /// CHECK: the magic program, which creates ephemeral accounts
+    #[cfg_attr(not(feature = "inline-mock-magic"), account(address = MAGIC_PROGRAM))]
+    pub magic_program: UncheckedAccount<'info>,
     /// CHECK: oracle queue owned by the VRF program
     #[account(mut)]
     pub oracle_queue: UncheckedAccount<'info>,
@@ -904,43 +1011,33 @@ pub struct UnlockArmy<'info> {
 pub struct SeedMatch<'info> {
     #[account(mut)]
     pub battle: Box<Account<'info, Battle>>,
-    /// CHECK: the battle's crank vault, checked against its derivation
-    #[account(mut)]
-    pub crank_fund: UncheckedAccount<'info>,
-    /// CHECK: the battle's crank, checked against its derivation and created by Hydra
-    #[account(mut)]
-    pub crank: UncheckedAccount<'info>,
-    /// CHECK: the Hydra program
-    #[account(address = crank::HYDRA_ID)]
-    pub hydra_program: UncheckedAccount<'info>,
-    pub system_program: Program<'info, System>,
 }
 
-/// The order is the crank's stored template (see `crank::settle_metas`).
+/// Permissionless. Each army and Player is checked against the battle in the handler.
 #[derive(Accounts)]
 pub struct SettleMatch<'info> {
+    /// CHECK: closed here, so read by hand and checked against its derivation
     #[account(mut)]
-    pub battle: Box<Account<'info, Battle>>,
-    #[account(mut, constraint = army_a.key() == battle.army_a @ HorizonError::BadPda)]
+    pub battle: UncheckedAccount<'info>,
+    #[account(mut)]
     pub army_a: Box<Account<'info, Army>>,
-    #[account(mut, constraint = army_b.key() == battle.army_b @ HorizonError::BadPda)]
-    pub army_b: Box<Account<'info, Army>>,
-    #[account(mut, seeds = [b"pot".as_ref(), battle.battleground.as_ref(), battle.player_a.as_ref()], bump = pot_a.bump)]
-    pub pot_a: Box<Account<'info, Pot>>,
-    #[account(mut, seeds = [b"pot".as_ref(), battle.battleground.as_ref(), battle.player_b.as_ref()], bump = pot_b.bump)]
-    pub pot_b: Box<Account<'info, Pot>>,
-    /// Receives the crank's rent: player B funded the crank.
-    #[account(mut, constraint = player_b.key() == battle.player_b @ HorizonError::BadPda)]
-    pub player_b: SystemAccount<'info>,
-    /// CHECK: the battle's crank, checked against its derivation
     #[account(mut)]
-    pub crank: UncheckedAccount<'info>,
-    /// CHECK: the Hydra program
-    #[account(address = crank::HYDRA_ID)]
-    pub hydra_program: UncheckedAccount<'info>,
-    /// CHECK: the instructions sysvar
-    #[account(address = solana_instructions_sysvar::ID)]
-    pub instructions: UncheckedAccount<'info>,
+    pub army_b: Box<Account<'info, Army>>,
+    #[account(mut)]
+    pub player_a: Box<Account<'info, Player>>,
+    /// Sponsored the battle; gets its rent back.
+    #[account(mut)]
+    pub player_b: Box<Account<'info, Player>>,
+    /// Receives the fee.
+    #[account(mut, seeds = [b"config"], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    /// CHECK: the ephemeral rent vault
+    #[cfg_attr(not(feature = "inline-mock-magic"), account(mut, address = EPH_VAULT))]
+    #[cfg_attr(feature = "inline-mock-magic", account(mut))]
+    pub vault: UncheckedAccount<'info>,
+    /// CHECK: the magic program, which closes ephemeral accounts
+    #[cfg_attr(not(feature = "inline-mock-magic"), account(address = MAGIC_PROGRAM))]
+    pub magic_program: UncheckedAccount<'info>,
 }
 
 /// Compute left in this transaction (profiling builds only).

@@ -36,11 +36,13 @@ pub fn create<'info>(
     {
         use anchor_lang::solana_program::{instruction::Instruction, program::invoke_signed, system_instruction};
         let _ = (sponsor_seeds, vault);
-        crate::move_lamports(sponsor, account, rent(space)?)?;
         // The account may already hold lamports, so allocate and assign rather than create_account.
         let system = |ix: Instruction| invoke_signed(&ix, std::slice::from_ref(account), &[account_seeds]);
         system(system_instruction::allocate(account.key, space as u64))?;
         system(system_instruction::assign(account.key, &crate::ID))?;
+        // After the CPIs: the runtime checks at a CPI that lamports moved only between the accounts
+        // it is given, and the sponsor is not one of them.
+        crate::move_lamports(sponsor, account, rent(space)?)?;
     }
     Ok(())
 }

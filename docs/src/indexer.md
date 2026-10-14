@@ -45,7 +45,7 @@ An older Node database, one whose `behaviors` table has no `element_count` colum
 
 Behaviors: pubkey, creator, canonical body, element count, and a compact summary (`1 element: March`, or the same words the client uses for a custom sequence). `created_at` is the earliest block time seen. `updated_at` is the latest. Behaviors are not updated on chain, so the two match unless a later observation has a different slot time.
 
-Battles (the program's Battle accounts, served as matches): pubkey, battleground, both army pubkeys, both player pubkeys, stake (decimal string), seq, grid, unit snapshots, status, seed (hex), outcome. `open_at` is the block time of the first observation while status is Awaiting (`0`). `resolved_at` is the block time of the first observation while status is Resolved (`1`). A Seeded battle (`2`, seed stored, settlement crank scheduled) sets neither time. A battle first seen already resolved has a null open time.
+Battles (the program's Battle accounts, served as matches): pubkey, battleground, both army pubkeys, both player pubkeys, stake (decimal string), seq, grid, unit snapshots, status, seed (hex), outcome. `open_at` is the block time of the first observation while status is Awaiting (`0`). `resolved_at` is the block time of the first observation while status is Resolved (`1`). A Seeded battle (`2`, seed stored, waiting for `settle_match`) sets neither time. A battle first seen already resolved has a null open time.
 
 Users: every distinct wallet that creates a behavior, owns an army, or is a player on a battle. `first_seen` and `last_seen` are the earliest and latest block times of those observations. Counts are derived from the behavior, army, and battle rows.
 

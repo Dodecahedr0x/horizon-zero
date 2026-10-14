@@ -51,4 +51,4 @@ Without `VITE_RPC_URL` and `VITE_ORACLE_QUEUE`, `vite dev` uses the local RPC an
 
 It ends by printing the build variables for the game (`VITE_DEV_MODE=false`, `VITE_RPC_URL`, `VITE_ORACLE_QUEUE`) and the indexer's `SOLANA_RPC_URL`. `render.yaml` lists `VITE_RPC_URL` (set it in the dashboard) and `VITE_ORACLE_QUEUE` for the game service.
 
-Devnet and mainnet settle battles through the deployed Hydra program `Hydra17i1feui9deaxu6d1TzSQMRNHeBRkDR1Awy7zea`, run by Hydra's crankers; nothing in this repository cranks there, and `app/scripts/hydra-cranker.mjs --url <rpc> --keypair <file>` can run against any cluster if a battle's crank is not picked up. The VRF callback only seeds the battle, so every battle fits; see [Settlement crank](matchmaking.md#settlement-crank).
+On every network, a battle settles through `settle_match`, which any wallet may send once the VRF callback has seeded the battle. The callback only seeds the battle, so every battle fits; see [Settlement and fee](matchmaking.md#settlement-and-fee).

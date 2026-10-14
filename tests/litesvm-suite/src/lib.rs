@@ -3,7 +3,6 @@ use sha2::{Digest, Sha256};
 
 pub const PROGRAM_ID: &str = "Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c";
 pub const VRF_ID: &str = "Vrf1RNUjXmQGjmQrQLvJHs9SNkvDJEsRVFPkfSQUwGz";
-pub const HYDRA_ID: &str = "Hydra17i1feui9deaxu6d1TzSQMRNHeBRkDR1Awy7zea";
 
 pub fn sighash(name: &str) -> [u8; 8] {
     let mut hash = [0u8; 8];

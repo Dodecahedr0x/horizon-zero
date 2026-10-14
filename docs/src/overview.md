@@ -1,6 +1,6 @@
 # Overview
 
-Horizon Zero is a Solana auto-battle game. A player builds an army of catalog units, each bound to an immutable behavior, places each unit on a tile in a starting zone, and locks the army into a battleground. Every army a player locks on a battleground stakes from that player's one pot there, the battle budget. The program pairs the army with another player's queued army, takes one stake from each pot, and asks MagicBlock VRF for a seed. The VRF callback schedules the fight on a one-shot MagicBlock Hydra crank, and `crates/combat` resolves it when the crank runs. The same function replays in the browser.
+Horizon Zero is a Solana auto-battle game. A player builds an army of catalog units, each bound to an immutable behavior, places each unit on a tile in a starting zone, and locks the army into a battleground. Every army a player locks stakes from the budget on that player's one Player account. The program pairs the army with another player's queued army, locks one stake on each Player, and asks MagicBlock VRF for a seed. The VRF callback stores the seed, and anyone may then send `settle_match`, where `crates/combat` resolves the fight and the loser's Player pays the winner and a protocol fee. The same function replays in the browser.
 
 Build this book from the repo root with `mdbook build docs`. Diagrams are mermaid fences. They stay readable as source until `mdbook-mermaid` is installed and enabled in `docs/book.toml`.
 
@@ -16,15 +16,10 @@ flowchart TB
     Battleground["Battleground"]
     Behavior["Behavior"]
     Army["Army"]
-    Pot["Pot"]
+    Player["Player"]
     Battle["Battle"]
     Identity["program identity"]
-    Vault["crank vault"]
   end
-  subgraph hydrabox [Hydra Hydra17i1feui9deaxu6d1TzSQMRNHeBRkDR1Awy7zea]
-    Crank["settlement crank"]
-  end
-  Cranker["cranker"]
   subgraph vrfbox [VRF Vrf1RNUjXmQGjmQrQLvJHs9SNkvDJEsRVFPkfSQUwGz]
     Queue["oracle queue"]
     Scoped["scoped identity"]
@@ -40,18 +35,16 @@ flowchart TB
   App --> Army
   Army --> Battleground
   Army --> Behavior
-  App --> Pot
-  Pot --> Battle
-  Battle --> Pot
+  App --> Player
+  Player -->|"sponsors"| Army
+  Player -->|"sponsors"| Battle
+  Battle -->|"settle_match pays"| Player
+  Battle -->|"fee"| Config
   Battleground --> Battle
   Battle --> Queue
   Identity --> Queue
   Queue --> Scoped
   Scoped --> Battle
-  Vault --> Crank
-  Battle --> Crank
-  Cranker --> Crank
-  Crank --> Battle
   Indexer --> Battleground
   Indexer --> Army
   Indexer --> Behavior
@@ -73,9 +66,9 @@ The program does not hardcode battleground names, budgets, stakes, or grid sizes
 | 1 | Garrison | 16 | 200,000,000 | 0.2 | 10×8 |
 | 2 | Citadel | 32 | 1,000,000,000 | 1 | 12×10 |
 
-The winner of a resolved battle is paid `2 * stake` from the battle account into their pot. A draw pays `stake` back into each pot. A payout goes to the pot's budget, or to its separate winnings when the owner turned segregation on. No instruction sends lamports to an admin or a protocol fee account. The battle account is left in place, so its rent stays there.
+Stakes stay on the Players until `settle_match`. The winner of a resolved battle gets the pot, `2 * stake`, less a protocol fee of `fee_bps` basis points of the pot (at most `1000`; `DEFAULT_FEE_BPS` is `500`, 5%): the loser's Player sends `stake - fee` to the winner's Player and `fee` to Config, where it counts toward `config.fees`. The admin sets the rate with `set_fee`. A draw takes no fee and returns each stake to its budget. A win credits the winner's budget, or their separate winnings when the owner turned segregation on. `settle_match` closes the battle account and refunds its rent to the Player that paid it.
 
-A queued army can `unlock_army`; it holds no stake, so nothing moves. A fighting army cannot. The pot's owner withdraws from it with `withdraw_pot`, and closes it with `close_pot` once none of their battles there is unsettled. `settle_match` sets both armies back to Idle. An Idle army can be deleted with `close_army`, which returns its rent to the owner.
+A player registers once with `register_player`, which creates their Player account and deposits lamports into it, and moves lamports into the budget with `fund_budget`. Behaviors, armies and battles are ephemeral rollup accounts whose rent the Player's free lamports pay. A queued army can `unlock_army`; it holds no stake, so nothing moves. A fighting army cannot. `settle_match` sets both armies back to Idle. An Idle army can be deleted with `close_army`, which returns its rent to the owner's Player.
 
 Behaviors are permissionless. The PDA is `[b"behavior", sha256(canonical body)]`. There is no update and no close.
 
@@ -124,12 +117,12 @@ With 1000 battles a cell moves by about 1.5 points from one sample to the next. 
 
 Each battleground is its own grid. An army holds at most 10 units, one tile each. The cap was 6 until Rootborn: with 6, Citadel's budget of 32 bought six Ashborn units that left points unspent while Rootborn spent all of it, and Rootborn won almost every Citadel battle. A battle lasts at most 12 rounds. Distance is integer Manhattan. The VRF seed changes initiative, tie-breaks, and which tiles between the starting zones are blocked. It does not change deployment.
 
-`lock_army` chooses the opponent from the recent slot hash before it requests randomness. The VRF callback only stores the seed that `simulate` uses and schedules the settlement; the Hydra crank runs `settle_match`, which plays the battle and pays out.
+`lock_army` chooses the opponent from the recent slot hash before it requests randomness. The VRF callback only stores the seed that `simulate` uses; `settle_match`, which anyone may send, plays the battle and pays out.
 
 Program id: `Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c`.
 
 VRF program: `Vrf1RNUjXmQGjmQrQLvJHs9SNkvDJEsRVFPkfSQUwGz`, crate `ephemeral-vrf-sdk` 0.17.3. `lock_army` sends a scoped request whose first byte is `10`.
 
-Hydra program: `Hydra17i1feui9deaxu6d1TzSQMRNHeBRkDR1Awy7zea`, layouts from `hydra-api` 0.2.0. The settlement costs the locker one 10 000-lamport cranker reward.
+Ephemeral accounts: `ephemeral-rollups-sdk` 0.17.3, through the magic program `Magic11111111111111111111111111111111111111` and its rent vault `MagicVau1t999999999999999999999999999999999`.
 
 `VITE_DEV_MODE=true` renders the app without a Solana connection. Behaviors, battlegrounds, armies, and battles for that run live in the local ledger SQLite file. The asset studio is a local process and is absent from `render.yaml`. `horizon-zero-landing` is a static site in `render.yaml`. It presents the game and loads approved files from the web service. The game remains `horizon-zero`.
