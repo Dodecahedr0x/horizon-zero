@@ -1,4 +1,13 @@
 import { sha256 } from "@noble/hashes/sha2";
+import {
+  DELEGATION_PROGRAM_ID,
+  EPHEMERAL_VAULT_ID,
+  MAGIC_CONTEXT_ID,
+  MAGIC_PROGRAM_ID,
+  delegateBufferPdaFromDelegatedAccountAndOwnerProgram,
+  delegationMetadataPdaFromDelegatedAccount,
+  delegationRecordPdaFromDelegatedAccount,
+} from "@magicblock-labs/ephemeral-rollups-sdk";
 import { PublicKey, SystemProgram, TransactionInstruction } from "@solana/web3.js";
 import catalogFile from "../../content/catalog.json" with { type: "json" };
 import {
@@ -22,8 +31,12 @@ export { MAX_BEHAVIOR_NAME_LEN, clipBehaviorName } from "../../content/interpret
 
 export const PROGRAM_ID = new PublicKey("Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c");
 export const VRF_PROGRAM_ID = new PublicKey("Vrf1RNUjXmQGjmQrQLvJHs9SNkvDJEsRVFPkfSQUwGz");
-export const DEFAULT_QUEUE = new PublicKey("Cuj97ggrhhidhbu39TijNVqE74xvKJ69gDervRUXAxGh");
+// The VRF queues whose oracles call back into the rollup. ephemeral_vrf_sdk::consts::DEFAULT_EPHEMERAL_QUEUE
+// is served by MagicBlock; DEFAULT_EPHEMERAL_TEST_QUEUE by the local stack's second vrf-oracle.
+export const DEFAULT_EPHEMERAL_QUEUE = new PublicKey("5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc");
+export const EPHEMERAL_TEST_QUEUE = new PublicKey("Sc9MJUngNbQXSXGP3F67KvKwVnhaYn6kcioxXNVowYT");
 export const SLOT_HASHES = new PublicKey("SysvarS1otHashes111111111111111111111111111");
+export { DELEGATION_PROGRAM_ID, EPHEMERAL_VAULT_ID, MAGIC_CONTEXT_ID, MAGIC_PROGRAM_ID };
 
 export type CastSpec = { damage: number; range: number; aoe: number; effect: number; aim: number; power: number; rounds: number; cooldown: number };
 export type UnitSpec = {
@@ -120,20 +133,23 @@ export function battlegroundPda(id: number) {
   return PublicKey.findProgramAddressSync([Buffer.from("battleground"), Buffer.from([id])], PROGRAM_ID)[0];
 }
 
-/** A player's stake budget on one battleground. Every army they lock there stakes from it. */
-export function potPda(battleground: PublicKey, owner: PublicKey) {
-  return PublicKey.findProgramAddressSync([Buffer.from("pot"), battleground.toBuffer(), owner.toBuffer()], PROGRAM_ID)[0];
+/** One per wallet: its lamports are the owner's balance on every battleground. */
+export function playerPda(owner: PublicKey) {
+  return PublicKey.findProgramAddressSync([Buffer.from("player"), owner.toBuffer()], PROGRAM_ID)[0];
 }
 
-/** The `Pot` account: discriminator, owner, battleground, budget, winnings, segregate, fighting, bump. */
-export function decodePot(data: Uint8Array) {
-  if (data.length < 92) return null;
-  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-  return {
-    budget: view.getBigUint64(72, true).toString(),
-    winnings: view.getBigUint64(80, true).toString(),
-    segregate: data[88] !== 0,
-  };
+/** One per wallet: the one-shot account a withdrawal leaves the rollup through. */
+export function outboxPda(owner: PublicKey) {
+  return PublicKey.findProgramAddressSync([Buffer.from("outbox"), owner.toBuffer()], PROGRAM_ID)[0];
+}
+
+export function configPda() {
+  return PublicKey.findProgramAddressSync([Buffer.from("config")], PROGRAM_ID)[0];
+}
+
+/** The Outbox that pays claimed fees to the admin. */
+export function treasuryOutboxPda() {
+  return outboxPda(configPda());
 }
 
 export function matchPda(battleground: PublicKey, seq: number) {
@@ -142,13 +158,138 @@ export function matchPda(battleground: PublicKey, seq: number) {
   return PublicKey.findProgramAddressSync([Buffer.from("match"), battleground.toBuffer(), seqBytes], PROGRAM_ID)[0];
 }
 
-/** The vault the matching player funds to pay for the battle's settlement crank. */
-export function crankFundPda(battle: PublicKey) {
-  return PublicKey.findProgramAddressSync([Buffer.from("crank-fund"), battle.toBuffer()], PROGRAM_ID)[0];
-}
-
 export function identityPda() {
   return PublicKey.findProgramAddressSync([Buffer.from("identity")], PROGRAM_ID)[0];
+}
+
+export const PLAYER_LEN = 68;
+export const CONFIG_LEN = 83;
+export const OUTBOX_LEN = 49;
+export const BATTLEGROUND_LEN = 576;
+export const ARMY_LEN = 1360;
+export const BATTLE_LEN = 2147;
+
+function view(data: Uint8Array) {
+  return new DataView(data.buffer, data.byteOffset, data.byteLength);
+}
+
+function key(data: Uint8Array, at: number) {
+  return new PublicKey(data.subarray(at, at + 32));
+}
+
+/** `Player`: owner 8, budget 40, winnings 48, locked 56, segregate 64, fighting 65, bump 67. Lamports as decimal strings. */
+export function decodePlayer(data: Uint8Array) {
+  if (data.length !== PLAYER_LEN) return null;
+  const v = view(data);
+  return {
+    owner: key(data, 8).toBase58(),
+    budget: v.getBigUint64(40, true).toString(),
+    winnings: v.getBigUint64(48, true).toString(),
+    locked: v.getBigUint64(56, true).toString(),
+    segregate: data[64] !== 0,
+    fighting: v.getUint16(65, true),
+  };
+}
+
+/** `Config`: admin 8, fee_bps 40, fees 42, validator 50, bump 82. */
+export function decodeConfig(data: Uint8Array) {
+  if (data.length !== CONFIG_LEN) return null;
+  const v = view(data);
+  return {
+    admin: key(data, 8).toBase58(),
+    feeBps: v.getUint16(40, true),
+    fees: v.getBigUint64(42, true).toString(),
+    validator: key(data, 50).toBase58(),
+  };
+}
+
+/** `Outbox`: owner 8, amount 40, bump 48. */
+export function decodeOutbox(data: Uint8Array) {
+  if (data.length !== OUTBOX_LEN) return null;
+  return { owner: key(data, 8).toBase58(), amount: view(data).getBigUint64(40, true).toString() };
+}
+
+/** The `Battleground` fields the client reads live: stake 43, queue_len 54, queue 55, match_seq 567. */
+export function decodeBattleground(data: Uint8Array) {
+  if (data.length !== BATTLEGROUND_LEN) return null;
+  const v = view(data);
+  const queueLen = Math.min(data[54], 16);
+  return {
+    battlegroundId: data[40],
+    stake: v.getBigUint64(43, true).toString(),
+    queue: Array.from({ length: queueLen }, (_, i) => key(data, 55 + i * 32).toBase58()),
+    matchSeq: Number(v.getBigUint64(567, true)),
+  };
+}
+
+/** The `Army` fields the client reads live: owner 8, battleground 40, status 1358. */
+export function decodeArmyHead(data: Uint8Array) {
+  if (data.length !== ARMY_LEN) return null;
+  return { owner: key(data, 8).toBase58(), battleground: key(data, 40).toBase58(), status: data[1358] };
+}
+
+function hex(bytes: Uint8Array) {
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+// A 96-byte battle snapshot unit: kind, len, body (77), col, row, cost u16, hp, atk, range, speed,
+// the eight cast bytes, actions.
+function snapshotUnit(data: Uint8Array, at: number, race: number) {
+  const len = Math.min(data[at + 1], 77);
+  const c = at + 87;
+  return {
+    kind: data[at],
+    body: [...data.subarray(at + 2, at + 2 + len)],
+    col: data[at + 79],
+    row: data[at + 80],
+    cost: view(data).getUint16(at + 81, true),
+    hp: data[at + 83],
+    atk: data[at + 84],
+    range: data[at + 85],
+    speed: data[at + 86],
+    cast: { damage: data[c], range: data[c + 1], aoe: data[c + 2], effect: data[c + 3], aim: data[c + 4], power: data[c + 5], rounds: data[c + 6], cooldown: data[c + 7] },
+    actions: data[at + 95],
+    race,
+  };
+}
+
+/** `Battle`, shaped like the indexer's match rows. `status` 0 Awaiting, 2 Seeded; `seed` is hex. */
+export function decodeBattle(pubkey: PublicKey, data: Uint8Array) {
+  if (data.length !== BATTLE_LEN) return null;
+  const v = view(data);
+  const countA = Math.min(data[184], 10);
+  const countB = Math.min(data[185], 10);
+  const raceA = data[2142];
+  const raceB = data[2143];
+  return {
+    pubkey: pubkey.toBase58(),
+    battleground: key(data, 8).toBase58(),
+    armyA: key(data, 40).toBase58(),
+    armyB: key(data, 72).toBase58(),
+    playerA: key(data, 104).toBase58(),
+    playerB: key(data, 136).toBase58(),
+    stake: v.getBigUint64(168, true).toString(),
+    seq: Number(v.getBigUint64(176, true)),
+    cols: data[186],
+    rows: data[187],
+    unitsA: Array.from({ length: countA }, (_, i) => snapshotUnit(data, 188 + i * 96, raceA)),
+    unitsB: Array.from({ length: countB }, (_, i) => snapshotUnit(data, 1148 + i * 96, raceB)),
+    status: data[2108],
+    seed: hex(data.subarray(2109, 2141)),
+    outcome: data[2141],
+    feeBps: v.getUint16(2144, true),
+  };
+}
+
+/** The outcome byte of `HZ_MATCH_RESOLVED <battle> <outcome> <fee> <seed> <player_b>`, if a log line has it. */
+export function resolvedOutcome(logs: readonly string[], battle: string) {
+  for (const line of logs) {
+    const at = line.indexOf("HZ_MATCH_RESOLVED ");
+    if (at < 0) continue;
+    const [name, pubkey, outcome] = line.slice(at).split(" ");
+    if (name === "HZ_MATCH_RESOLVED" && pubkey === battle) return Number(outcome);
+  }
+  return null;
 }
 
 function data(name: string, rest: Uint8Array = new Uint8Array()) {
@@ -156,6 +297,140 @@ function data(name: string, rest: Uint8Array = new Uint8Array()) {
   out.set(sighash(name), 0);
   out.set(rest, 8);
   return Buffer.from(out);
+}
+
+type Meta = { pubkey: PublicKey; isSigner: boolean; isWritable: boolean };
+
+function signer(pubkey: PublicKey, isWritable = true): Meta {
+  return { pubkey, isSigner: true, isWritable };
+}
+
+function writable(pubkey: PublicKey): Meta {
+  return { pubkey, isSigner: false, isWritable: true };
+}
+
+function readonly(pubkey: PublicKey): Meta {
+  return { pubkey, isSigner: false, isWritable: false };
+}
+
+function ix(name: string, keys: Meta[], rest?: Uint8Array) {
+  return new TransactionInstruction({ programId: PROGRAM_ID, keys, data: data(name, rest) });
+}
+
+function u64(value: bigint) {
+  const out = Buffer.alloc(8);
+  out.writeBigUInt64LE(value);
+  return out;
+}
+
+/** `EphAccounts`: what creating or closing an ephemeral account needs after the account itself. */
+function ephemeral(): Meta[] {
+  return [writable(EPHEMERAL_VAULT_ID), readonly(MAGIC_PROGRAM_ID)];
+}
+
+/** `MagicAccounts`: what scheduling the Outbox's commit-and-undelegate needs. */
+function magic(): Meta[] {
+  return [writable(MAGIC_CONTEXT_ID), readonly(MAGIC_PROGRAM_ID)];
+}
+
+/**
+ * `#[delegate]`'s order for one delegated account: its buffer, delegation record and metadata, the
+ * account, then this program, the delegation program and the system program.
+ */
+function delegated(account: PublicKey): { head: Meta[]; tail: Meta[] } {
+  return {
+    head: [
+      writable(delegateBufferPdaFromDelegatedAccountAndOwnerProgram(account, PROGRAM_ID)),
+      writable(delegationRecordPdaFromDelegatedAccount(account)),
+      writable(delegationMetadataPdaFromDelegatedAccount(account)),
+      writable(account),
+    ],
+    tail: [readonly(PROGRAM_ID), readonly(DELEGATION_PROGRAM_ID), readonly(SystemProgram.programId)],
+  };
+}
+
+function delegateIx(name: string, signerKey: PublicKey, account: PublicKey) {
+  const { head, tail } = delegated(account);
+  return ix(name, [signer(signerKey), readonly(configPda()), ...head, ...tail]);
+}
+
+/** Solana. Creates the wallet's Player and Outbox and moves `deposit` into the Player's free lamports. */
+export function registerPlayerIx(owner: PublicKey, deposit: bigint) {
+  return ix(
+    "register_player",
+    [signer(owner), writable(playerPda(owner)), writable(outboxPda(owner)), readonly(SystemProgram.programId)],
+    u64(deposit),
+  );
+}
+
+/** Solana. Delegates the wallet's Player to Config's rollup validator. */
+export function delegatePlayerIx(owner: PublicKey) {
+  return delegateIx("delegate_player", owner, playerPda(owner));
+}
+
+/** Solana. Delegates the wallet's empty Outbox again before a withdrawal. */
+export function delegateOutboxIx(owner: PublicKey) {
+  return delegateIx("delegate_outbox", owner, outboxPda(owner));
+}
+
+/** Solana, admin. Delegates the empty treasury Outbox again before a claim. */
+export function delegateTreasuryOutboxIx(admin: PublicKey) {
+  return delegateIx("delegate_treasury_outbox", admin, treasuryOutboxPda());
+}
+
+/** Rollup. Moves free lamports into the budget. */
+export function fundBudgetIx(owner: PublicKey, lamports: bigint) {
+  return ix("fund_budget", [signer(owner, false), writable(playerPda(owner))], u64(lamports));
+}
+
+/** Rollup. Off, a won payout goes back into the budget; on, it is set aside as winnings. */
+export function setSegregationIx(owner: PublicKey, segregate: boolean) {
+  return ix("set_segregation", [signer(owner, false), writable(playerPda(owner))], Uint8Array.of(segregate ? 1 : 0));
+}
+
+/** Rollup. Moves `lamports` from the Player (free, then winnings, then budget) into the Outbox. `withdrawIx` follows in the same transaction. */
+export function fundOutboxIx(owner: PublicKey, lamports: bigint) {
+  return ix("fund_outbox", [signer(owner, false), writable(playerPda(owner)), writable(outboxPda(owner))], u64(lamports));
+}
+
+/** Rollup. Schedules the funded Outbox's commit-and-undelegate; `release_outbox` then pays the wallet on Solana. */
+export function withdrawIx(owner: PublicKey) {
+  return ix("withdraw", [signer(owner), writable(outboxPda(owner)), ...magic()]);
+}
+
+/** Solana, permissionless. Pays an undelegated Outbox's amount to its recorded owner. */
+export function releaseOutboxIx(outbox: PublicKey, owner: PublicKey) {
+  return ix("release_outbox", [writable(outbox), writable(owner)]);
+}
+
+/** Rollup, admin. */
+export function setFeeIx(admin: PublicKey, bps: number) {
+  const rest = new Uint8Array(2);
+  new DataView(rest.buffer).setUint16(0, bps, true);
+  return ix("set_fee", [signer(admin, false), writable(configPda())], rest);
+}
+
+/** Rollup, admin. Moves every claimable fee into the treasury Outbox. `claimFeesIx` follows in the same transaction. */
+export function fundTreasuryOutboxIx(admin: PublicKey) {
+  return ix("fund_treasury_outbox", [signer(admin, false), writable(configPda()), writable(treasuryOutboxPda())]);
+}
+
+/** Rollup, admin. `withdrawIx` for the treasury Outbox. */
+export function claimFeesIx(admin: PublicKey) {
+  return ix("claim_fees", [signer(admin), readonly(configPda()), writable(treasuryOutboxPda()), ...magic()]);
+}
+
+/** Rollup, permissionless. Pays out a Seeded battle and closes it. */
+export function settleMatchIx(match: { pubkey: string; armyA: string; armyB: string; playerA: string; playerB: string }) {
+  return ix("settle_match", [
+    writable(new PublicKey(match.pubkey)),
+    writable(new PublicKey(match.armyA)),
+    writable(new PublicKey(match.armyB)),
+    writable(playerPda(new PublicKey(match.playerA))),
+    writable(playerPda(new PublicKey(match.playerB))),
+    writable(configPda()),
+    ...ephemeral(),
+  ]);
 }
 
 export function createBehaviorIx(creator: PublicKey, elements: ElementSpec[]) {
@@ -166,16 +441,11 @@ export function createBehaviorIx(creator: PublicKey, elements: ElementSpec[]) {
   rest.set(hash, 0);
   new DataView(rest.buffer).setUint32(32, body.length, true);
   rest.set(body, 36);
-  const behavior = behaviorPda(body);
-  return new TransactionInstruction({
-    programId: PROGRAM_ID,
-    keys: [
-      { pubkey: creator, isSigner: true, isWritable: true },
-      { pubkey: behavior, isSigner: false, isWritable: true },
-      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-    ],
-    data: data("create_behavior", rest),
-  });
+  return ix(
+    "create_behavior",
+    [signer(creator, false), writable(playerPda(creator)), writable(behaviorPda(body)), ...ephemeral(), readonly(SystemProgram.programId)],
+    rest,
+  );
 }
 
 export function createArmyIx(
@@ -186,10 +456,10 @@ export function createArmyIx(
   units: { kind: number; behavior: PublicKey; col: number; row: number }[],
 ) {
   const rest = new Uint8Array(4 + 1 + 4 + units.length * 35);
-  const view = new DataView(rest.buffer);
-  view.setUint32(0, index, true);
+  const v = new DataView(rest.buffer);
+  v.setUint32(0, index, true);
   rest[4] = race;
-  view.setUint32(5, units.length, true);
+  v.setUint32(5, units.length, true);
   units.forEach((unit, i) => {
     const at = 9 + i * 35;
     rest[at] = unit.kind;
@@ -197,20 +467,26 @@ export function createArmyIx(
     rest[at + 33] = unit.col;
     rest[at + 34] = unit.row;
   });
-  const behaviors = units.map((unit) => unit.behavior);
-  return new TransactionInstruction({
-    programId: PROGRAM_ID,
-    keys: [
-      { pubkey: owner, isSigner: true, isWritable: true },
-      { pubkey: battlegroundPda(battlegroundId), isSigner: false, isWritable: false },
-      { pubkey: armyPda(owner, index), isSigner: false, isWritable: true },
-      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-      ...behaviors.map((pubkey) => ({ pubkey, isSigner: false, isWritable: false })),
+  return ix(
+    "create_army",
+    [
+      signer(owner, false),
+      writable(playerPda(owner)),
+      readonly(battlegroundPda(battlegroundId)),
+      writable(armyPda(owner, index)),
+      ...ephemeral(),
+      readonly(SystemProgram.programId),
+      ...units.map((unit) => readonly(unit.behavior)),
     ],
-    data: data("create_army", rest),
-  });
+    rest,
+  );
 }
 
+/**
+ * Rollup. `candidates` are queued armies offered as opponents; each is passed writable with its
+ * owner's Player once. The program matches a candidate whose owner's budget covers the stake and
+ * evicts one whose owner's Player shows less.
+ */
 export function lockArmyIx(args: {
   player: PublicKey;
   battlegroundId: number;
@@ -218,96 +494,37 @@ export function lockArmyIx(args: {
   behaviors: PublicKey[];
   queue: PublicKey;
   seq: number;
-  opponents: { army: PublicKey; owner: PublicKey }[];
+  candidates: { army: PublicKey; owner: PublicKey }[];
 }) {
   const battleground = battlegroundPda(args.battlegroundId);
-  const battle = matchPda(battleground, args.seq);
   const keys = [
-    { pubkey: args.player, isSigner: true, isWritable: true },
-    { pubkey: battleground, isSigner: false, isWritable: true },
-    { pubkey: args.army, isSigner: false, isWritable: true },
-    { pubkey: potPda(battleground, args.player), isSigner: false, isWritable: true },
-    { pubkey: battle, isSigner: false, isWritable: true },
-    { pubkey: args.queue, isSigner: false, isWritable: true },
-    { pubkey: identityPda(), isSigner: false, isWritable: false },
-    { pubkey: VRF_PROGRAM_ID, isSigner: false, isWritable: false },
-    { pubkey: SLOT_HASHES, isSigner: false, isWritable: false },
-    { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-    ...args.behaviors.map((pubkey) => ({ pubkey, isSigner: false, isWritable: false })),
+    signer(args.player),
+    writable(playerPda(args.player)),
+    readonly(configPda()),
+    writable(battleground),
+    writable(args.army),
+    writable(matchPda(battleground, args.seq)),
+    ...ephemeral(),
+    writable(args.queue),
+    readonly(identityPda()),
+    readonly(VRF_PROGRAM_ID),
+    readonly(SLOT_HASHES),
+    readonly(SystemProgram.programId),
+    ...args.behaviors.map(readonly),
   ];
-  if (args.opponents.length > 0) {
-    // Each queued army, then each of their owners' pots once; the program skips armies whose pot
-    // is missing or under one stake.
-    for (const opponent of args.opponents) keys.push({ pubkey: opponent.army, isSigner: false, isWritable: true });
-    for (const owner of new Set(args.opponents.map((opponent) => opponent.owner.toBase58()))) {
-      keys.push({ pubkey: potPda(battleground, new PublicKey(owner)), isSigner: false, isWritable: true });
-    }
-    keys.push({ pubkey: crankFundPda(battle), isSigner: false, isWritable: true });
+  for (const candidate of args.candidates) keys.push(writable(candidate.army));
+  for (const owner of new Set(args.candidates.map((candidate) => candidate.owner.toBase58()))) {
+    keys.push(writable(playerPda(new PublicKey(owner))));
   }
-  return new TransactionInstruction({ programId: PROGRAM_ID, keys, data: data("lock_army") });
+  return ix("lock_army", keys);
 }
 
 export function unlockArmyIx(player: PublicKey, battlegroundId: number, army: PublicKey) {
-  return new TransactionInstruction({
-    programId: PROGRAM_ID,
-    keys: [
-      { pubkey: player, isSigner: true, isWritable: true },
-      { pubkey: battlegroundPda(battlegroundId), isSigner: false, isWritable: true },
-      { pubkey: army, isSigner: false, isWritable: true },
-    ],
-    data: data("unlock_army"),
-  });
-}
-
-function u64(value: bigint) {
-  const out = Buffer.alloc(8);
-  out.writeBigUInt64LE(value);
-  return out;
-}
-
-export function fundPotIx(owner: PublicKey, battlegroundId: number, lamports: bigint) {
-  const battleground = battlegroundPda(battlegroundId);
-  return new TransactionInstruction({
-    programId: PROGRAM_ID,
-    keys: [
-      { pubkey: owner, isSigner: true, isWritable: true },
-      { pubkey: battleground, isSigner: false, isWritable: false },
-      { pubkey: potPda(battleground, owner), isSigner: false, isWritable: true },
-      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-    ],
-    data: data("fund_pot", u64(lamports)),
-  });
-}
-
-function ownPotIx(owner: PublicKey, battlegroundId: number, name: string, rest: Uint8Array) {
-  return new TransactionInstruction({
-    programId: PROGRAM_ID,
-    keys: [
-      { pubkey: owner, isSigner: true, isWritable: true },
-      { pubkey: potPda(battlegroundPda(battlegroundId), owner), isSigner: false, isWritable: true },
-    ],
-    data: data(name, rest),
-  });
-}
-
-/** Takes from the winnings first, then from the budget. */
-export function withdrawPotIx(owner: PublicKey, battlegroundId: number, lamports: bigint) {
-  return ownPotIx(owner, battlegroundId, "withdraw_pot", u64(lamports));
-}
-
-export function setSegregationIx(owner: PublicKey, battlegroundId: number, segregate: boolean) {
-  return ownPotIx(owner, battlegroundId, "set_segregation", Uint8Array.of(segregate ? 1 : 0));
+  return ix("unlock_army", [signer(player), writable(battlegroundPda(battlegroundId)), writable(army)]);
 }
 
 export function closeArmyIx(owner: PublicKey, army: PublicKey) {
-  return new TransactionInstruction({
-    programId: PROGRAM_ID,
-    keys: [
-      { pubkey: owner, isSigner: true, isWritable: true },
-      { pubkey: army, isSigner: false, isWritable: true },
-    ],
-    data: data("close_army"),
-  });
+  return ix("close_army", [signer(owner, false), writable(playerPda(owner)), writable(army), ...ephemeral()]);
 }
 
 export function computeBudgetIx(units = 1_400_000) {

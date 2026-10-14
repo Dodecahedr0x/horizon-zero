@@ -24,8 +24,14 @@ export type Battleground = {
   queue: string[];
   matchSeq: number;
 };
-/** Lamport amounts as decimal strings, like `stake`. */
-export type Pot = { budget: string; winnings: string; segregate: boolean };
+/**
+ * The connected wallet's Player, read in the rollup. Lamport amounts are decimal strings, like `stake`.
+ * `free` is what the Player holds beyond its rent and the three counters. `outboxPending` is a
+ * withdrawal that left the rollup but has not been paid to the wallet yet.
+ */
+export type PlayerBalance = { free: string; budget: string; winnings: string; locked: string; segregate: boolean; outboxPending: string };
+/** Config, read in the rollup. `fees` is the claimable fee balance in lamports. */
+export type ProtocolConfig = { admin: string; feeBps: number; fees: string };
 export type MatchUnit = {
   kind: number;
   body: number[];
@@ -67,11 +73,25 @@ export interface ChainAdapter {
   lock(army: Army): Promise<Match | null>;
   unlock(army: Army): Promise<void>;
   closeArmy(army: Army): Promise<void>;
-  /** The connected player's pot on a battleground, or null before it is first funded. */
-  pot(battlegroundId: number): Promise<Pot | null>;
-  fundPot(battlegroundId: number, lamports: bigint): Promise<void>;
-  withdrawPot(battlegroundId: number, lamports: bigint): Promise<void>;
-  setSegregation(battlegroundId: number, segregate: boolean): Promise<void>;
+  /** The connected wallet's Player, or null before it registers. */
+  player(): Promise<PlayerBalance | null>;
+  /** Creates the Player and Outbox with `depositLamports` free, and delegates both to the rollup. */
+  register(depositLamports: bigint): Promise<void>;
+  /** Moves lamports from the wallet into the delegated Player's free balance. */
+  topUp(lamports: bigint): Promise<void>;
+  /** Moves free lamports into the stake budget. */
+  fundBudget(lamports: bigint): Promise<void>;
+  /** Pays lamports from the Player (free, then winnings, then budget) back to the wallet through the Outbox. */
+  withdraw(lamports: bigint): Promise<void>;
+  setSegregation(segregate: boolean): Promise<void>;
+  /** Settles a Seeded battle. Anyone may. */
+  settle(match: Match): Promise<void>;
+  /** Config, or null before `initialize`. */
+  admin(): Promise<ProtocolConfig | null>;
+  /** Admin only: pays every claimable fee to the admin wallet through the treasury Outbox. */
+  claimFees(): Promise<void>;
+  /** Admin only. */
+  setFee(bps: number): Promise<void>;
   /** The owner's latest matches, newest first. */
   matches(owner: string): Promise<Match[]>;
   match(pubkey: string): Promise<Match | null>;

@@ -4,7 +4,15 @@ The app is a Vite React page. `app/src/main.tsx` branches on `import.meta.env.VI
 
 In that mode the root renders `DevApp` only. Wallet adapters, `ConnectionProvider`, and `WalletProvider` are loaded only on the Solana branch, so this page does not load Phantom or Solflare and it never constructs a `Connection`. A "Dev" tag in the header says no Solana node is connected. The header shows the local player's short label. There is no wallet prompt. `installDevSimulate` loads `simulate_json` from `app/src/combat-wasm` before the first render so the page can replay a stored battle. Account reads and writes go to the local ledger over `/api/local`.
 
-Any other value, including unset, uses the Solana shell. The endpoint and the VRF queue come from `app/src/network.ts`: `VITE_RPC_URL` and `VITE_ORACLE_QUEUE` when set; otherwise, under `vite dev`, the local stack at `http://127.0.0.1:8899` and its test queue `GKE6d7iv8kCBrsxr78W3xVdjGLLLJnxsGiuzrsZCGEvb`, and in a production build devnet and the default queue. `pnpm dev:chain` runs the game this way against `pnpm localnet`; see [Networks and deployment](deployment.md). Wallets are Phantom and Solflare. Chain reads and writes go through `createSolanaChain`. The ledger process still listens, and the Solana page does not call it.
+Any other value, including unset, uses the Solana shell. It talks to two RPC endpoints, set in `app/src/network.ts`:
+
+| variable | what | unset under `vite dev` | unset in a production build |
+| --- | --- | --- | --- |
+| `VITE_RPC_URL` | Solana | the local stack, `http://127.0.0.1:8899` | devnet |
+| `VITE_ER_RPC_URL` | the MagicBlock ephemeral rollup; its WebSocket is the next port | the local rollup, `http://127.0.0.1:7799` | none: `createSolanaChain` throws until it is set, because it must be the rollup that serves the validator pinned in Config |
+| `VITE_ORACLE_QUEUE` | the VRF queue `lock_army` asks; an ephemeral queue, whose oracle calls back into the rollup | the local test queue `Sc9MJUngNbQXSXGP3F67KvKwVnhaYn6kcioxXNVowYT` | MagicBlock's `DEFAULT_EPHEMERAL_QUEUE`, `5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc` |
+
+`pnpm dev:chain` runs the game this way against `pnpm localnet`; see [Networks and deployment](deployment.md). Wallets are Phantom and Solflare. Chain reads and writes go through `createSolanaChain`. The ledger process still listens, and the Solana page does not call it.
 
 ## ChainAdapter
 
@@ -21,14 +29,22 @@ Any other value, including unset, uses the Solana shell. The endpoint and the VR
 | `lock(army)` | queue, or open a match |
 | `unlock(army)` | leave the queue |
 | `closeArmy(army)` | delete an Idle army |
-| `pot(battlegroundId)` | the current player's pot there, `{ budget, winnings, segregate }` in lamport strings, or `null` before it is first funded |
-| `fundPot(battlegroundId, lamports)` | add to the battle budget |
-| `withdrawPot(battlegroundId, lamports)` | take from the winnings first, then the budget |
-| `setSegregation(battlegroundId, segregate)` | set winnings aside, or stake them again |
+| `player()` | the wallet's Player, `{ free, budget, winnings, locked, segregate, outboxPending }` with lamports as decimal strings, or `null` before it registers |
+| `register(depositLamports)` | create the Player and Outbox with that deposit free, and delegate both to the rollup |
+| `topUp(lamports)` | move lamports from the wallet into the Player's free balance |
+| `fundBudget(lamports)` | move free lamports into the stake budget |
+| `withdraw(lamports)` | pay lamports back to the wallet: free first, then winnings, then budget |
+| `setSegregation(segregate)` | set winnings aside, or stake them again; one switch for every battleground |
+| `settle(match)` | settle a Seeded battle; anyone may |
+| `admin()` | Config's `{ admin, feeBps, fees }`, or `null` before `initialize` |
+| `claimFees()` | admin only: pay the claimable fees to the admin wallet |
+| `setFee(bps)` | admin only: change the fee rate for battles opened afterwards |
 | `matches(owner)` | that owner's latest battles, newest first |
 | `match(pubkey)` | one battle record |
 
-`lock` returns the opened match, or `null` when the army only queued.
+`lock` returns the opened match, or `null` when the army only queued. On Solana the match it returns is already settled when the VRF seed arrived in time (see [Solana chain](#solana-chain)).
+
+The local ledger below still keeps one pot per player and battleground, and `createLocalChain` still implements the pot methods this surface replaced, so dev mode does not type-check until it moves to Players.
 
 ## Walkthrough
 
@@ -137,20 +153,58 @@ The ledger and the Vite proxy both use the `/api/local` prefix. A failed call re
 
 ## Solana chain
 
-Reads are `fetch("/api...")`. The static server proxies that prefix to the indexer. See [Indexer and Render](indexer.md).
+`createSolanaChain` keeps two `Connection`s at `confirmed`: `base` for Solana and `er` for the rollup. Every write is a legacy transaction sent to one of them. The client fetches the blockhash from that connection, has the wallet sign with `signTransaction`, sends the raw transaction through that same connection, and throws when the confirmation carries an error. It does not use the wallet's own send, which would send a rollup transaction to Solana. A wallet without `signTransaction` can only send to Solana.
 
-Writes are legacy transactions, confirmed at `confirmed`:
+Where each instruction goes:
 
-- `create_behavior` uses `behaviorPda(canonical body)`
-- `create_army` uses the next index above any army the indexer already lists for this wallet, the selected race byte, and the behavior accounts as remaining accounts
-- `lock_army` passes the player's pot, loads each queued army from `/army/:pubkey`, skips those owned by the player, and passes the rest, then each of their owners' pots once, then the battle's crank vault `crankFundPda(battle)` when there is at least one. It also passes the behavior accounts, the oracle queue, and a compute budget of `1_400_000`
-- `unlock_army` uses the battleground id and the army
-- `fund_pot`, `withdraw_pot` and `set_segregation` use `potPda(battleground, wallet)`
-- `close_army` passes the owner and the army
+| connection | instructions |
+| --- | --- |
+| Solana | `register_player`, `delegate_player`, `delegate_outbox`, `delegate_treasury_outbox`, `release_outbox`, the eSPL top-up |
+| rollup | `create_behavior`, `create_army`, `lock_army`, `unlock_army`, `close_army`, `fund_budget`, `set_segregation`, `fund_outbox` + `withdraw`, `settle_match`, `set_fee`, `fund_treasury_outbox` + `claim_fees` |
 
-After `lock_army` confirms, the client reads `/matches` and returns the first row whose `armyA` or `armyB` is this army. If the indexer has not stored the battle yet, the call returns `null` even though the match is open.
+`app/src/codec.ts` builds each instruction with the account order in [Accounts and instructions](accounts.md). The delegate instructions derive the delegation buffer, record and metadata with the `@magicblock-labs/ephemeral-rollups-sdk` helpers (0.17.3, the version the spike used). Instructions that create or close an ephemeral account pass the vault and the magic program; `withdraw` and `claim_fees` pass the magic context and the magic program. `app/src/codec.test.mjs` checks the discriminators, the account order of several builders, and the decoders' offsets.
 
-`pot(battlegroundId)` reads the pot account from the RPC and decodes it with `decodePot`; the indexer does not store pots. `armies(owner)` reads `/armies?owner=` from the indexer and then drops every row whose account `getMultipleAccountsInfo` no longer finds, so a closed army disappears at once even before the indexer prunes it. `matches(owner)` reads `/matches` and keeps the first 20 rows where the owner is player A or B.
+Reads:
+
+- `behaviors` and `matches(owner)` come from the indexer, through `fetch("/api...")`, which the static server proxies to it (see [Indexer and Render](indexer.md)). `matches(owner)` keeps the first 20 rows where the owner is player A or B.
+- `battlegrounds` lists the indexer's rows and replaces each queue and `matchSeq` with the battleground account read in the rollup.
+- `armies(owner)` lists the indexer's rows, reads each army in the rollup, drops those it no longer finds there, and takes the status from the rollup, so a closed or newly queued army shows at once.
+- `match(pubkey)` reads the indexer and falls back to the battle account in the rollup.
+- `player()` reads the Player in the rollup. `free` is its lamports minus the rent-exempt minimum for 68 bytes (read once from Solana) and `budget + winnings + locked`. `outboxPending` is the Outbox's `amount` from Solana while the Outbox is undelegated there, otherwise the rollup copy's `amount` (a `fund_outbox` whose `withdraw` did not land).
+- `admin()` reads Config in the rollup.
+
+`createArmy` uses the next index above any army the indexer lists for this wallet.
+
+### Registration and top-up
+
+`register(deposit)` sends one Solana transaction: `register_player(deposit)`, `delegate_player` and `delegate_outbox`. A retry after a partial registration sends only what is missing, and moves the deposit with a top-up when the Player already exists. It then polls the rollup until it sees the Player owned by the program, for up to 60 seconds.
+
+`topUp(lamports)` sends the SDK's `lamportsDelegatedTransferIx(wallet, player, lamports, salt)` to Solana with a random 32-byte salt, then waits until the rollup shows the Player's lamports grown. The wallet pays the amount plus 300 000 lamports and the fee (see [Money in and out](matchmaking.md#money-in-and-out)).
+
+### Lock and settle
+
+`lock(army)` reads the battleground in the rollup for its queue and `match_seq`, and reads each queued army there. It offers, in queue order, every queued army whose status is Queued and whose owner is another wallet, each with its owner's Player once, so the program can match a funded owner and evict one whose budget no longer covers a stake. It stops adding candidates when the transaction would pass 32 accounts. It sends a compute budget of `1_400_000` and `lock_army` with the player's Player, Config, the battle `[b"match", battleground, match_seq]`, the vault and the magic program, the oracle queue, and the army's distinct behaviors.
+
+If the battle account then exists in the rollup, a match opened. The client polls it every half second until it is Seeded (status 2), for up to 60 seconds, then sends `settle_match` and reads the outcome from the transaction's `HZ_MATCH_RESOLVED` log. `lock` returns the battle decoded from the rollup with that outcome and status 1. If someone else settled first, the battle is gone; `settle_match` fails with `AlreadyResolved`, and `lock` returns the indexer's row for it, or the last decoded state. If the seed has not arrived in time, `lock` returns the battle still Awaiting, and `settle(match)` can settle it later. `settle` treats a battle that is already closed as settled and throws while it is still Awaiting (`NotSeeded`).
+
+### Withdrawal and fee claim
+
+```mermaid
+flowchart TD
+  Start["withdraw(amount)"] --> Read{"Outbox on Solana"}
+  Read -->|"owned by horizon-zero"| Release["Solana tx: release_outbox if amount > 0, then delegate_outbox"]
+  Release --> Read
+  Read -->|"owned by the delegation program"| Rollup{"Outbox in the rollup"}
+  Rollup -->|"not visible yet, or still being undelegated"| Read
+  Rollup -->|"amount > 0: an earlier fund_outbox without withdraw"| Flush["rollup tx: withdraw"]
+  Flush --> Read
+  Rollup -->|"owned by horizon-zero, amount 0"| Send["rollup tx: fund_outbox(amount), withdraw"]
+  Send --> Wait["poll Solana until the Outbox is undelegated;<br/>release_outbox if the action left an amount"]
+```
+
+`withdraw(amount)` first readies the Outbox, polling for up to 60 seconds. While the Outbox is owned by the program on Solana, a previous withdrawal undelegated it: the client sends one Solana transaction with `release_outbox` when its `amount` is not 0, then `delegate_outbox`. While it is delegated, the client waits until the rollup shows it owned by the program. A rollup copy holding an amount is a `fund_outbox` whose `withdraw` never landed: the client sends `withdraw` alone to release it and starts again. Once the Outbox is delegated, empty and visible in the rollup, the client sends one rollup transaction with `fund_outbox(amount)` and `withdraw`. It then polls Solana for up to 30 seconds until the Outbox is owned by the program again, and sends `release_outbox` itself if the post-undelegate action left an amount. Each withdrawal that needs `delegate_outbox` costs the wallet about 300 000 lamports of delegation rent that does not come back, plus fees.
+
+`claimFees()` is the same flow for the treasury Outbox `[b"outbox", config]`, with `delegate_treasury_outbox`, and `fund_treasury_outbox` + `claim_fees` in the rollup transaction. `setFee(bps)` sends `set_fee` to the rollup.
 
 ## Replay and board
 

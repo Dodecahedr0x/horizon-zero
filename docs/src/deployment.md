@@ -33,7 +33,7 @@ flowchart LR
 
 `pnpm dev:chain` is `pnpm dev:all` with the stack and the indexer added and the game in its Solana shell (`VITE_DEV_MODE=false`) pointed at the local RPC and test queue; the indexer's default `SOLANA_RPC_URL` is already the local base layer. A browser wallet must be set to a custom or localnet RPC at `http://127.0.0.1:8899`. `pnpm localnet:fund <address>` airdrops 10 SOL there. `pnpm dev:all` without `--chain` keeps the no-wallet local ledger and starts no indexer, since nothing serves the local RPC then.
 
-Without `VITE_RPC_URL` and `VITE_ORACLE_QUEUE`, `vite dev` uses the local RPC and the test queue (`app/src/network.ts`); a production build without them uses devnet and the default queue.
+Without `VITE_RPC_URL`, `VITE_ER_RPC_URL` and `VITE_ORACLE_QUEUE`, `vite dev` uses the local RPC, the local rollup at `http://127.0.0.1:7799` and the ephemeral test queue `Sc9MJUngNbQXSXGP3F67KvKwVnhaYn6kcioxXNVowYT` (`app/src/network.ts`). A production build without them uses devnet and MagicBlock's ephemeral queue `5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc`, and has no rollup: it must set `VITE_ER_RPC_URL` (see [Client and dev mode](client.md)).
 
 ## Bootstrap
 

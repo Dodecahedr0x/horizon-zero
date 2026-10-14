@@ -90,7 +90,7 @@ The Player's lamports are split by its counters (see [Player](accounts.md#player
 
 Money enters and leaves the Player in the rollup, without undelegating the Player.
 
-**Top-up.** A lamport transfer into the Player lands in free lamports. In the rollup the client sends it through the eSPL program's delegated lamports transfer (`lamportsDelegatedTransfer` in the TypeScript SDK). The rollup credits the Player with the exact amount. The wallet pays the amount plus 300 000 lamports and the transaction fee. The credit exists only in the rollup. Nothing commits the Player, so its Solana copy keeps the data and lamports it had when it was delegated; money reaches Solana only through a withdrawal. `fund_budget` then moves free lamports into the budget.
+**Top-up.** A lamport transfer into the Player lands in free lamports. The client sends it on Solana through the eSPL program's delegated lamports transfer (`lamportsDelegatedTransfer` in the TypeScript SDK). The rollup credits the Player with the exact amount. The wallet pays the amount plus 300 000 lamports and the transaction fee. The credit exists only in the rollup. Nothing commits the Player, so its Solana copy keeps the data and lamports it had when it was delegated; money reaches Solana only through a withdrawal. `fund_budget` then moves free lamports into the budget.
 
 **Withdrawal.** Lamports leave the rollup through the wallet's one-shot [Outbox](accounts.md#outbox--49-bytes). The client sends one rollup transaction with two instructions:
 
@@ -152,7 +152,7 @@ The CPI is signed by the program identity `[b"identity"]`. The accounts on that 
 
 The oracle later invokes `seed_match`. The signer it supplies is the scoped identity `[b"identity", horizon_program_id]` on the VRF program. `randomness` becomes the battle seed and later the `simulate` seed. Deployment does not read it. The seed does choose the blocked tiles between the two starting zones. `settle_match` passes the `cols` and `rows` copied onto the battle at `lock_army`.
 
-The queue is `VITE_ORACLE_QUEUE` when set. Devnet and mainnet use the SDK default `Cuj97ggrhhidhbu39TijNVqE74xvKJ69gDervRUXAxGh`. The local stack serves the SDK test queue `GKE6d7iv8kCBrsxr78W3xVdjGLLLJnxsGiuzrsZCGEvb`, which `vite dev` uses by default. The program accepts any queue the VRF program owns. See [Networks and deployment](deployment.md).
+The web client sends `lock_army` to the rollup, so it asks an ephemeral queue, whose oracle calls back into the rollup. The queue is `VITE_ORACLE_QUEUE` when set. Otherwise a production build uses the SDK's `DEFAULT_EPHEMERAL_QUEUE` `5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc`, and `vite dev` uses the ephemeral test queue `Sc9MJUngNbQXSXGP3F67KvKwVnhaYn6kcioxXNVowYT`, which the local stack serves with a second `vrf-oracle` pointed at the rollup (spike finding; `scripts/local-stack.mjs` does not start it yet). The program accepts any queue the VRF program owns. See [Networks and deployment](deployment.md).
 
 ## Settlement and fee
 
