@@ -57,6 +57,10 @@ flowchart LR
   Locked -->|"win, segregate off: pot - fee"| Budget
   Locked -->|"win, segregate on: pot - fee"| Winnings[("winnings")]
   Locked -->|"loss: stake leaves the Player"| Out["winner's Player, and the fee to Config"]
+  Free -->|"fund_outbox: 1st"| Outbox[("Outbox")]
+  Winnings -->|"fund_outbox: 2nd"| Outbox
+  Budget -->|"fund_outbox: 3rd"| Outbox
+  Outbox -->|"release_outbox on Solana"| Wallet
 ```
 
 Opening a match moves no lamports. Each Player's `budget` drops by the stake, its `locked` grows by it, and its `fighting` count grows by one. The lamports stay on the Player until `settle_match`, because an ephemeral battle cannot hold lamports.
@@ -72,6 +76,57 @@ A won payout goes back to the Player. With `segregate` off, the default, it goes
 A match creates the battle as an ephemeral account sponsored by the locker's Player, which must have the rent free (`RentShort`). `settle_match` closes the battle and refunds that rent to the locker's Player, so a battle costs the locker nothing once it settles.
 
 There is no timeout instruction. Until the callback lands and someone settles, both armies stay Fighting and both stakes stay locked on their Players.
+
+## Money in and out
+
+The Player's lamports are split by its counters (see [Player](accounts.md#player--68-bytes)):
+
+| part | what it is | staked | withdrawable |
+| --- | --- | --- | --- |
+| free | lamports no counter claims; they pay ephemeral rent | no | first |
+| winnings | payouts set aside while `segregate` is on | no | second |
+| budget | what matches may stake | one stake per match | third |
+| locked | stakes in battles that have not settled | already | never |
+
+Money enters and leaves the Player in the rollup, without undelegating the Player.
+
+**Top-up.** A lamport transfer into the Player lands in free lamports. In the rollup the client sends it through the eSPL program's delegated lamports transfer (`lamportsDelegatedTransfer` in the TypeScript SDK). The rollup credits the Player with the exact amount. The wallet pays the amount plus 300 000 lamports and the transaction fee. The credit exists only in the rollup until the Player is committed. `fund_budget` then moves free lamports into the budget.
+
+**Withdrawal.** Lamports leave the rollup through the wallet's one-shot [Outbox](accounts.md#outbox--49-bytes). The client sends one rollup transaction with two instructions:
+
+1. `fund_outbox(amount)` takes `amount` from free lamports, then winnings, then budget, never from locked stakes, and moves it from the Player to the Outbox. `outbox.amount` records it.
+2. `withdraw` schedules a commit-and-undelegate of the Outbox, with a post-undelegate action that calls `release_outbox` on Solana.
+
+They are two instructions because the rollup refuses one instruction that moves lamports into an account and also schedules that account's commit. The rollup validator then sends one Solana transaction that commits the Outbox, undelegates it, and runs the action. `release_outbox` pays `outbox.amount` to `outbox.owner` and sets the amount to 0. On the local stack the release had landed about a second after the rollup transaction.
+
+```mermaid
+sequenceDiagram
+  participant Wallet as owner wallet
+  participant ER as horizon-zero (rollup)
+  participant Magic as magic program
+  participant Validator as rollup validator
+  participant DLP as delegation program
+  participant Base as horizon-zero (Solana)
+  Wallet->>ER: fund_outbox(amount)
+  ER->>ER: free, then winnings, then budget, never locked (BalanceShort)
+  ER->>ER: Player to Outbox lamports, outbox.amount = amount (HZ_WITHDRAW)
+  Wallet->>ER: withdraw (same transaction)
+  ER->>Magic: commit-and-undelegate the Outbox, then release_outbox(outbox, owner), paid by the wallet
+  Magic-->>Validator: intent queued in the magic context
+  Validator->>DLP: commit, finalize, undelegate the Outbox
+  DLP->>Base: process_undelegation: the Outbox is owned by horizon-zero again
+  DLP->>Base: post-undelegate action: release_outbox + 3 escrow accounts
+  Base->>Wallet: amount lamports (HZ_RELEASE), outbox.amount = 0
+  opt the action did not run
+    Wallet->>Base: release_outbox, from any wallet
+  end
+```
+
+`release_outbox` is permissionless. The delegation program signs the action with an escrow PDA, so the program cannot tell the action from any other caller. That is safe: the instruction pays only the owner recorded in the Outbox, which is the wallet for `[b"outbox", owner]` and the admin for the treasury Outbox, and is checked against the passed account. A second call pays 0. While the Outbox is still delegated, the delegation program owns it on Solana and the call fails. If the action never runs, the client calls `release_outbox` itself once the Outbox is undelegated.
+
+A funded Outbox blocks the next `fund_outbox` with `OutboxBusy` until it is released. Every withdrawal also ends the Outbox's delegation, so before the next one the client must delegate the Outbox again. This version of the program has no instruction for that yet. On the local stack one delegation session cost the wallet about 300 000 lamports, or 0.0003 SOL, plus transaction fees: 3 138 960 lamports of delegation record and metadata rent at delegation, of which 2 838 960 come back at undelegation.
+
+**Fee claim.** Fees collect on Config (`config.fees`, on top of its rent). The admin creates the treasury Outbox `[b"outbox", config]` once on Solana with `init_treasury_outbox`. A claim is the same two-instruction rollup transaction: `fund_treasury_outbox` moves all of `config.fees` to the treasury Outbox, records the admin as its owner and sets `config.fees` to 0 (`HZ_CLAIM`), and `claim_fees` schedules its commit-and-undelegate with the same `release_outbox` action, which pays the admin. Only the admin can send either instruction (`NotAdmin`). With no fees, `fund_treasury_outbox` fails with `NothingToWithdraw`.
 
 ## VRF request
 

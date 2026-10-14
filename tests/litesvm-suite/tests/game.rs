@@ -1479,3 +1479,210 @@ fn a_rootborn_army_stores_its_own_catalog_rows() {
     assert_eq!(stored[72], Race::Deeplings.id());
     assert_eq!(stored[78 + 119], stats_for(Race::Deeplings.id(), DeeplingsKind::Clawling.id()).unwrap().cast.damage);
 }
+
+/// As [`send`], building the instructions from the environment first.
+fn send_with(env: &mut Env, payer: &Keypair, build: impl Fn(&Env) -> Vec<Instruction>) -> Vec<String> {
+    let ixs = build(env);
+    send(&mut env.svm, payer, &ixs)
+}
+
+const OUTBOX_LEN: usize = 49;
+/// The rollup's magic context, written by every commit. The mock build does not check it.
+const MAGIC_CONTEXT: Address = address!("MagicContext1111111111111111111111111111111");
+
+fn treasury_outbox(env: &Env) -> Address {
+    pda(&[b"outbox", env.config.as_ref()], &env.program).0
+}
+
+/// (owner, amount) of an Outbox, at the offsets in the accounts chapter.
+fn outbox_state(env: &Env, outbox: &Address) -> (Address, u64) {
+    let data = env.svm.get_account(outbox).unwrap().data;
+    assert_eq!(data.len(), OUTBOX_LEN);
+    (Address::try_from(&data[8..40]).unwrap(), u64::from_le_bytes(data[40..48].try_into().unwrap()))
+}
+
+/// `fund_outbox(amount)`: the owner, their Player and their Outbox.
+fn fund_outbox_ix(env: &Env, owner: &Keypair, amount: u64) -> Instruction {
+    let accounts = vec![meta(owner.pubkey(), false, true), meta(player_pda(env, &owner.pubkey()), true, false), meta(outbox_pda(env, &owner.pubkey()), true, false)];
+    ix(env.program, accounts, disc("fund_outbox", &amount.to_le_bytes()))
+}
+
+/// `withdraw`: the signer, the Outbox, then the magic context and program.
+fn withdraw_ix(env: &Env, signer: &Keypair, outbox: Address) -> Instruction {
+    let accounts = vec![meta(signer.pubkey(), true, true), meta(outbox, true, false), meta(MAGIC_CONTEXT, true, false), meta(MAGIC, false, false)];
+    ix(env.program, accounts, disc("withdraw", &[]))
+}
+
+/// `release_outbox`: the Outbox and the wallet it pays.
+fn release_ix(env: &Env, outbox: Address, owner: Address) -> Instruction {
+    ix(env.program, vec![meta(outbox, true, false), meta(owner, true, false)], disc("release_outbox", &[]))
+}
+
+/// `init_treasury_outbox`, `fund_treasury_outbox` and `claim_fees` take the signer, Config and the
+/// treasury Outbox; the first adds the system program, the last the magic accounts.
+fn treasury_ix(env: &Env, signer: &Keypair, name: &str) -> Instruction {
+    let mut accounts = vec![meta(signer.pubkey(), true, true), meta(env.config, name == "fund_treasury_outbox", false), meta(treasury_outbox(env), true, false)];
+    match name {
+        "init_treasury_outbox" => accounts.push(meta(SYSTEM, false, false)),
+        "claim_fees" => accounts.extend([meta(MAGIC_CONTEXT, true, false), meta(MAGIC, false, false)]),
+        _ => {}
+    }
+    ix(env.program, accounts, disc(name, &[]))
+}
+
+/// One battle on battleground 0 that the first wallet's squad wins against the second's lone
+/// guard, with the winner's payouts segregated when `segregate`. Returns (winner, loser).
+fn won_battle(env: &mut Env, segregate: bool) -> (Keypair, Keypair) {
+    let advance = env.behavior(&behavior_march().canonical_bytes());
+    let hold = env.behavior(&still_body());
+    let (winner, loser) = (Keypair::new(), Keypair::new());
+    env.fund(&winner);
+    env.fund(&loser);
+    let strong: [Placement; 2] = [(AshbornKind::Warden, 3, 0), (AshbornKind::Guard, 4, 0)];
+    let army_a = env.squad(&winner, 0, 0, &strong, advance);
+    let army_b = env.army(&loser, 0, 0, AshbornKind::Guard.id(), hold);
+    if segregate {
+        let call = [player_ix(env, &winner, "set_segregation", &[1])];
+        send(&mut env.svm, &winner, &call);
+    }
+    queue(env, &winner, army_a, advance);
+    let logs = lock_match(env, &loser, army_b, hold, army_a, &winner);
+    assert_eq!(resolved(&logs), (1, FEE), "the fixture needs side A to win");
+    (winner, loser)
+}
+
+#[test]
+fn withdraw_takes_free_then_winnings_then_budget_and_release_pays_the_owner() {
+    let mut env = setup();
+    let (owner, _) = won_battle(&mut env, true);
+    let stranger = Keypair::new();
+    env.fund(&stranger);
+    assert_eq!(player_state(&env, &owner.pubkey()), (0, CREDIT, 0, true, 0));
+    let ixs = [player_ix(&env, &owner, "fund_budget", &40_000_000u64.to_le_bytes())];
+    send(&mut env.svm, &owner, &ixs);
+    let player = player_pda(&env, &owner.pubkey());
+    let outbox = outbox_pda(&env, &owner.pubkey());
+    let outbox_rent = env.svm.minimum_balance_for_rent_exemption(OUTBOX_LEN);
+    assert_eq!(env.balance(&outbox), outbox_rent);
+    assert_eq!(outbox_state(&env, &outbox), (owner.pubkey(), 0));
+
+    // Nothing to send, and only the owner's own Player and Outbox.
+    send_expect_reason_with(&mut env, &owner, |env| vec![fund_outbox_ix(env, &owner, 0)], "NothingToWithdraw");
+    let mut seized = fund_outbox_ix(&env, &owner, 1);
+    seized.accounts[0] = meta(stranger.pubkey(), false, true);
+    send_expect_reason(&mut env.svm, &stranger, &[seized], "ConstraintSeeds");
+    send_expect_reason_with(&mut env, &owner, |env| vec![withdraw_ix(env, &owner, outbox)], "NothingToWithdraw");
+
+    // All the free lamports, then 10_000_000 of the winnings; the budget is untouched.
+    let free = player_free(&env, &owner.pubkey());
+    let held = env.balance(&player);
+    let first = free + 10_000_000;
+    let ixs = [fund_outbox_ix(&env, &owner, first), withdraw_ix(&env, &owner, outbox)];
+    let logs = send(&mut env.svm, &owner, &ixs);
+    assert!(logs.iter().any(|line| line.contains(&format!("HZ_WITHDRAW {outbox} {first}"))));
+    assert!(logs.iter().any(|line| line.contains("HZ_PLAYER")));
+    assert_eq!(player_state(&env, &owner.pubkey()), (40_000_000, CREDIT - 10_000_000, 0, true, 0));
+    assert_eq!(player_free(&env, &owner.pubkey()), 0);
+    assert_eq!(env.balance(&player), held - first);
+    assert_eq!(env.balance(&outbox), outbox_rent + first);
+    assert_eq!(outbox_state(&env, &outbox), (owner.pubkey(), first));
+
+    // One withdrawal at a time, until the Outbox is released.
+    send_expect_reason_with(&mut env, &owner, |env| vec![fund_outbox_ix(env, &owner, 1)], "OutboxBusy");
+    // The release pays the recorded owner, whoever sends it, and only them.
+    send_expect_reason_with(&mut env, &stranger, |env| vec![release_ix(env, outbox, stranger.pubkey())], "ConstraintAddress");
+    let wallet = env.balance(&owner.pubkey());
+    let logs = send_with(&mut env, &stranger, |env| vec![release_ix(env, outbox, owner.pubkey())]);
+    assert!(logs.iter().any(|line| line.contains(&format!("HZ_RELEASE {outbox} {first}"))));
+    assert_eq!(env.balance(&owner.pubkey()), wallet + first);
+    assert_eq!(env.balance(&outbox), outbox_rent, "the release leaves the Outbox its rent");
+    assert_eq!(outbox_state(&env, &outbox), (owner.pubkey(), 0));
+    // A second release pays nothing.
+    let logs = send_with(&mut env, &stranger, |env| vec![release_ix(env, outbox, owner.pubkey())]);
+    assert!(logs.iter().any(|line| line.contains(&format!("HZ_RELEASE {outbox} 0"))));
+    assert_eq!(env.balance(&owner.pubkey()), wallet + first);
+
+    // The rest of the winnings, then 15_000_000 of the budget; asking past it is short.
+    let second = CREDIT - 10_000_000 + 15_000_000;
+    let ixs = [fund_outbox_ix(&env, &owner, second), withdraw_ix(&env, &owner, outbox)];
+    send(&mut env.svm, &owner, &ixs);
+    assert_eq!(player_state(&env, &owner.pubkey()), (25_000_000, 0, 0, true, 0));
+    assert_eq!(env.balance(&player), held - first - second);
+    send_with(&mut env, &stranger, |env| vec![release_ix(env, outbox, owner.pubkey())]);
+    assert_eq!(env.balance(&owner.pubkey()), wallet + first + second - 5_000, "less the fee for the second withdrawal");
+    send_expect_reason_with(&mut env, &owner, |env| vec![fund_outbox_ix(env, &owner, 25_000_001)], "BalanceShort");
+    send_with(&mut env, &owner, |env| vec![fund_outbox_ix(env, &owner, 25_000_000)]);
+    assert_eq!(player_state(&env, &owner.pubkey()), (0, 0, 0, true, 0));
+    assert_eq!(env.balance(&player), env.svm.minimum_balance_for_rent_exemption(PLAYER_LEN), "the Player keeps its rent");
+}
+
+#[test]
+fn withdraw_never_touches_locked_stakes() {
+    let mut env = setup();
+    let hold = env.behavior(&still_body());
+    let (first, second) = (Keypair::new(), Keypair::new());
+    env.fund(&first);
+    env.fund(&second);
+    let army_a = env.army(&first, 0, 0, AshbornKind::Guard.id(), hold);
+    let army_b = env.army(&second, 0, 0, AshbornKind::Guard.id(), hold);
+    queue(&mut env, &first, army_a, hold);
+    let (battle, _) = lock_and_seed(&mut env, 0, &second, army_b, hold, army_a, &first, None);
+    let ixs = [player_ix(&env, &first, "fund_budget", &30_000_000u64.to_le_bytes())];
+    send(&mut env.svm, &first, &ixs);
+    assert_eq!(player_state(&env, &first.pubkey()), (30_000_000, 0, STAKE, false, 1));
+
+    // Free and budget may leave; the locked stake may not, by even one lamport.
+    let player = player_pda(&env, &first.pubkey());
+    let open = player_free(&env, &first.pubkey()) + 30_000_000;
+    send_expect_reason_with(&mut env, &first, |env| vec![fund_outbox_ix(env, &first, open + 1)], "BalanceShort");
+    send_with(&mut env, &first, |env| vec![fund_outbox_ix(env, &first, open)]);
+    assert_eq!(player_state(&env, &first.pubkey()), (0, 0, STAKE, false, 1));
+    assert_eq!(env.balance(&player), env.svm.minimum_balance_for_rent_exemption(PLAYER_LEN) + STAKE);
+    assert_eq!(outbox_state(&env, &outbox_pda(&env, &first.pubkey())).1, open);
+
+    // The stake is still there for the settlement: the guards draw and it returns to the budget.
+    let logs = settle(&mut env, &battle);
+    assert_eq!(resolved(&logs), (3, 0));
+    assert_eq!(player_state(&env, &first.pubkey()), (STAKE, 0, 0, false, 0));
+}
+
+#[test]
+fn only_the_admin_claims_fees_and_release_pays_the_admin() {
+    let mut env = setup();
+    won_battle(&mut env, false);
+    assert_eq!(config_fees(&env), FEE);
+    let admin = env.admin.insecure_clone();
+    let stranger = Keypair::new();
+    env.fund(&stranger);
+    let outbox = treasury_outbox(&env);
+
+    send_expect_reason_with(&mut env, &stranger, |env| vec![treasury_ix(env, &stranger, "init_treasury_outbox")], "NotAdmin");
+    send_with(&mut env, &admin, |env| vec![treasury_ix(env, &admin, "init_treasury_outbox")]);
+    let outbox_rent = env.svm.minimum_balance_for_rent_exemption(OUTBOX_LEN);
+    assert_eq!(env.balance(&outbox), outbox_rent);
+    assert_eq!(outbox_state(&env, &outbox), (admin.pubkey(), 0));
+
+    send_expect_reason_with(&mut env, &stranger, |env| vec![treasury_ix(env, &stranger, "fund_treasury_outbox")], "NotAdmin");
+    send_expect_reason_with(&mut env, &admin, |env| vec![treasury_ix(env, &admin, "claim_fees")], "NothingToWithdraw");
+    let config_held = env.balance(&env.config);
+    let ixs = [treasury_ix(&env, &admin, "fund_treasury_outbox"), treasury_ix(&env, &admin, "claim_fees")];
+    let logs = send(&mut env.svm, &admin, &ixs);
+    assert!(logs.iter().any(|line| line.contains(&format!("HZ_CLAIM {outbox} {FEE}"))));
+    assert_eq!(config_fees(&env), 0);
+    assert_eq!(env.balance(&env.config), config_held - FEE);
+    assert_eq!(env.balance(&env.config), env.svm.minimum_balance_for_rent_exemption(51), "Config keeps its rent");
+    assert_eq!(env.balance(&outbox), outbox_rent + FEE);
+    assert_eq!(outbox_state(&env, &outbox), (admin.pubkey(), FEE));
+    send_expect_reason_with(&mut env, &admin, |env| vec![treasury_ix(env, &admin, "fund_treasury_outbox")], "OutboxBusy");
+    send_expect_reason_with(&mut env, &stranger, |env| vec![treasury_ix(env, &stranger, "claim_fees")], "NotAdmin");
+
+    let wallet = env.balance(&admin.pubkey());
+    send_expect_reason_with(&mut env, &stranger, |env| vec![release_ix(env, outbox, stranger.pubkey())], "ConstraintAddress");
+    let logs = send_with(&mut env, &stranger, |env| vec![release_ix(env, outbox, admin.pubkey())]);
+    assert!(logs.iter().any(|line| line.contains(&format!("HZ_RELEASE {outbox} {FEE}"))));
+    assert_eq!(env.balance(&admin.pubkey()), wallet + FEE);
+    assert_eq!(env.balance(&outbox), outbox_rent);
+    assert_eq!(outbox_state(&env, &outbox), (admin.pubkey(), 0));
+    // No fees left: nothing to claim.
+    send_expect_reason_with(&mut env, &admin, |env| vec![treasury_ix(env, &admin, "fund_treasury_outbox")], "NothingToWithdraw");
+}

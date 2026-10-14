@@ -25,6 +25,9 @@ pub const EPH_VAULT: Pubkey = Pubkey::new_from_array(ephemeral_rollups_sdk::cons
 /// Creates and closes ephemeral accounts in the rollup. Unchecked under LiteSVM.
 #[cfg(not(feature = "inline-mock-magic"))]
 pub const MAGIC_PROGRAM: Pubkey = Pubkey::new_from_array(ephemeral_rollups_sdk::consts::MAGIC_PROGRAM_ID.to_bytes());
+/// Queues the rollup's commits. Unchecked under LiteSVM.
+#[cfg(not(feature = "inline-mock-magic"))]
+pub const MAGIC_CONTEXT: Pubkey = Pubkey::new_from_array(ephemeral_rollups_sdk::consts::MAGIC_CONTEXT_ID.to_bytes());
 
 #[cfg(feature = "inline-mock-vrf")]
 fn program_identity_bump() -> u8 {
@@ -356,6 +359,124 @@ pub mod horizon_zero {
         msg!("HZ_MATCH_RESOLVED {} {} {} {} {}", battle_key, outcome as u8, fee, hex32(&tail.seed), head.player_b);
         Ok(())
     }
+
+    /// Rollup. Moves `amount` from the owner's Player to their Outbox and records it there. It
+    /// takes free lamports first, then winnings, then budget, and never a locked stake. `withdraw`
+    /// follows in the same transaction: the rollup refuses a lamport move and the commit of the
+    /// account it credits in one instruction.
+    pub fn fund_outbox(ctx: Context<FundOutbox>, amount: u64) -> Result<()> {
+        require!(ctx.accounts.outbox.amount == 0, HorizonError::OutboxBusy);
+        require!(amount > 0, HorizonError::NothingToWithdraw);
+        let free = free_lamports(&ctx.accounts.player)?;
+        let player = &mut ctx.accounts.player;
+        let rest = amount.saturating_sub(free);
+        let from_winnings = rest.min(player.winnings);
+        player.winnings -= from_winnings;
+        player.budget = player.budget.checked_sub(rest - from_winnings).ok_or(HorizonError::BalanceShort)?;
+        move_lamports(&player.to_account_info(), &ctx.accounts.outbox.to_account_info(), amount)?;
+        ctx.accounts.outbox.amount = amount;
+        log_player(&player.key(), player);
+        msg!("HZ_WITHDRAW {} {}", ctx.accounts.outbox.key(), amount);
+        Ok(())
+    }
+
+    /// Rollup. Commits and undelegates the owner's funded Outbox, with a post-undelegate action
+    /// that calls `release_outbox` on Solana. The owner's wallet pays the intent.
+    pub fn withdraw<'info>(ctx: Context<'info, Withdraw<'info>>) -> Result<()> {
+        let outbox = ctx.accounts.outbox.to_account_info();
+        let state = read_funded_outbox(&outbox)?;
+        require_keys_eq!(state.owner, ctx.accounts.owner.key(), HorizonError::NotOwner);
+        schedule_release(&ctx.accounts.owner.to_account_info(), &outbox, state.owner, &ctx.accounts.magic)
+    }
+
+    /// Solana, admin only: creates the treasury Outbox `[b"outbox", config]`, which pays the admin.
+    pub fn init_treasury_outbox(ctx: Context<InitTreasuryOutbox>) -> Result<()> {
+        ctx.accounts.outbox.owner = ctx.accounts.admin.key();
+        ctx.accounts.outbox.amount = 0;
+        ctx.accounts.outbox.bump = ctx.bumps.outbox;
+        Ok(())
+    }
+
+    /// Rollup, admin only: moves all claimable fees from Config to the treasury Outbox, payable to
+    /// the admin. `claim_fees` follows in the same transaction.
+    pub fn fund_treasury_outbox(ctx: Context<FundTreasuryOutbox>) -> Result<()> {
+        require!(ctx.accounts.outbox.amount == 0, HorizonError::OutboxBusy);
+        let fees = ctx.accounts.config.fees;
+        require!(fees > 0, HorizonError::NothingToWithdraw);
+        move_lamports(&ctx.accounts.config.to_account_info(), &ctx.accounts.outbox.to_account_info(), fees)?;
+        ctx.accounts.config.fees = 0;
+        ctx.accounts.outbox.owner = ctx.accounts.admin.key();
+        ctx.accounts.outbox.amount = fees;
+        msg!("HZ_CLAIM {} {}", ctx.accounts.outbox.key(), fees);
+        Ok(())
+    }
+
+    /// Rollup, admin only: as `withdraw`, for the funded treasury Outbox.
+    pub fn claim_fees<'info>(ctx: Context<'info, ClaimFees<'info>>) -> Result<()> {
+        let outbox = ctx.accounts.outbox.to_account_info();
+        let state = read_funded_outbox(&outbox)?;
+        require_keys_eq!(state.owner, ctx.accounts.admin.key(), HorizonError::NotAdmin);
+        schedule_release(&ctx.accounts.admin.to_account_info(), &outbox, state.owner, &ctx.accounts.magic)
+    }
+
+    /// Solana, permissionless: pays an undelegated Outbox's `amount` to its recorded owner and
+    /// zeroes it. The post-undelegate action calls it; anyone may call it again, which pays 0.
+    pub fn release_outbox(ctx: Context<ReleaseOutbox>) -> Result<()> {
+        let amount = ctx.accounts.outbox.amount;
+        ctx.accounts.outbox.amount = 0;
+        move_lamports(&ctx.accounts.outbox.to_account_info(), &ctx.accounts.owner.to_account_info(), amount)?;
+        msg!("HZ_RELEASE {} {}", ctx.accounts.outbox.key(), amount);
+        Ok(())
+    }
+}
+
+/// An Outbox read by hand, for the instructions that schedule its undelegation: a typed account
+/// would be written back after the scheduling CPI, when the rollup no longer lets the program
+/// change it. It must hold a recorded amount.
+fn read_funded_outbox(info: &AccountInfo) -> Result<Outbox> {
+    require_keys_eq!(*info.owner, ID, HorizonError::BadPda);
+    let state = Outbox::try_deserialize(&mut &info.try_borrow_data()?[..])?;
+    require!(state.amount != 0, HorizonError::NothingToWithdraw);
+    Ok(state)
+}
+
+/// Schedules the commit and undelegation of `outbox`, then a `release_outbox` call on Solana that
+/// pays `owner`. `payer` signs and pays the intent. Under `inline-mock-magic` it does nothing: the
+/// Outbox is never delegated there, and the tests call `release_outbox` themselves.
+fn schedule_release<'info>(
+    payer: &AccountInfo<'info>,
+    outbox: &AccountInfo<'info>,
+    owner: Pubkey,
+    magic: &MagicAccounts<'info>,
+) -> Result<()> {
+    #[cfg(feature = "inline-mock-magic")]
+    {
+        let _ = (payer, outbox, owner, magic);
+    }
+    #[cfg(not(feature = "inline-mock-magic"))]
+    {
+        use ephemeral_rollups_sdk::ephem::{CallHandler, FoldableIntentBuilder, MagicIntentBundleBuilder};
+        use ephemeral_rollups_sdk::{ActionArgs, ShortAccountMeta};
+        let release = CallHandler {
+            destination_program: ID,
+            accounts: vec![
+                ShortAccountMeta { pubkey: outbox.key(), is_writable: true },
+                ShortAccountMeta { pubkey: owner, is_writable: true },
+            ],
+            args: ActionArgs::new(instruction::ReleaseOutbox::DISCRIMINATOR.to_vec()),
+            escrow_authority: payer.clone(),
+            compute_units: 20_000,
+        };
+        MagicIntentBundleBuilder::new(
+            payer.clone(),
+            magic.magic_context.to_account_info(),
+            magic.magic_program.to_account_info(),
+        )
+        .commit_and_undelegate(std::slice::from_ref(outbox))
+        .add_post_undelegate_actions([release])
+        .build_and_invoke()?;
+    }
+    Ok(())
 }
 
 /// What `settle_match` reads from a battle, with the filled snapshot slots on the heap: a whole
@@ -1060,6 +1181,83 @@ pub struct SettleMatch<'info> {
     #[account(mut, seeds = [b"config"], bump = config.bump)]
     pub config: Box<Account<'info, Config>>,
     pub ephemeral: EphAccounts<'info>,
+}
+
+/// What scheduling a commit needs.
+#[derive(Accounts)]
+pub struct MagicAccounts<'info> {
+    /// CHECK: the magic context, which queues the commit
+    #[cfg_attr(not(feature = "inline-mock-magic"), account(mut, address = MAGIC_CONTEXT))]
+    #[cfg_attr(feature = "inline-mock-magic", account(mut))]
+    pub magic_context: UncheckedAccount<'info>,
+    /// CHECK: the magic program, which schedules the commit and undelegation
+    #[cfg_attr(not(feature = "inline-mock-magic"), account(address = MAGIC_PROGRAM))]
+    pub magic_program: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct FundOutbox<'info> {
+    pub owner: Signer<'info>,
+    #[account(mut, seeds = [b"player", owner.key().as_ref()], bump = player.bump, has_one = owner @ HorizonError::NotOwner)]
+    pub player: Account<'info, Player>,
+    #[account(mut, seeds = [b"outbox", owner.key().as_ref()], bump = outbox.bump, has_one = owner @ HorizonError::NotOwner)]
+    pub outbox: Account<'info, Outbox>,
+}
+
+#[derive(Accounts)]
+pub struct Withdraw<'info> {
+    /// Pays the intent.
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    /// CHECK: read by hand (see `read_funded_outbox`); its address is the owner's Outbox
+    #[account(mut, seeds = [b"outbox", owner.key().as_ref()], bump)]
+    pub outbox: UncheckedAccount<'info>,
+    pub magic: MagicAccounts<'info>,
+}
+
+#[derive(Accounts)]
+pub struct InitTreasuryOutbox<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    #[account(seeds = [b"config"], bump = config.bump, has_one = admin @ HorizonError::NotAdmin)]
+    pub config: Account<'info, Config>,
+    #[account(init, payer = admin, space = 8 + Outbox::INIT_SPACE, seeds = [b"outbox", config.key().as_ref()], bump)]
+    pub outbox: Account<'info, Outbox>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct FundTreasuryOutbox<'info> {
+    pub admin: Signer<'info>,
+    /// Holds the fees on top of its rent.
+    #[account(mut, seeds = [b"config"], bump = config.bump, has_one = admin @ HorizonError::NotAdmin)]
+    pub config: Account<'info, Config>,
+    #[account(mut, seeds = [b"outbox", config.key().as_ref()], bump = outbox.bump)]
+    pub outbox: Account<'info, Outbox>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimFees<'info> {
+    /// Pays the intent.
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    #[account(seeds = [b"config"], bump = config.bump, has_one = admin @ HorizonError::NotAdmin)]
+    pub config: Account<'info, Config>,
+    /// CHECK: read by hand (see `read_funded_outbox`); its address is the treasury Outbox
+    #[account(mut, seeds = [b"outbox", config.key().as_ref()], bump)]
+    pub outbox: UncheckedAccount<'info>,
+    pub magic: MagicAccounts<'info>,
+}
+
+/// Permissionless. The delegation program's post-undelegate call appends three accounts (the
+/// destination program, the escrow authority and the escrow PDA), which stay remaining accounts.
+#[derive(Accounts)]
+pub struct ReleaseOutbox<'info> {
+    /// Typed, so an Outbox still delegated (owned by the delegation program) is refused.
+    #[account(mut)]
+    pub outbox: Account<'info, Outbox>,
+    #[account(mut, address = outbox.owner)]
+    pub owner: SystemAccount<'info>,
 }
 
 /// Compute left in this transaction (profiling builds only).

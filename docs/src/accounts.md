@@ -11,6 +11,7 @@ The program is Anchor. Every account begins with the 8-byte discriminator `SHA-2
 | Battleground | `[b"battleground", &[battleground_id]]` | `battleground_id` is one byte |
 | Player | `[b"player", owner]` | one per wallet; its lamports are the owner's balance on every battleground |
 | Outbox | `[b"outbox", owner]` | one per wallet, created with the Player |
+| treasury Outbox | `[b"outbox", config]` | one per program; pays the claimed fees to the admin |
 | Behavior | `[b"behavior", hash]` | ephemeral; `hash = SHA-256(canonical body)` |
 | Army | `[b"army", owner, index_le]` | ephemeral; `index` is `u32` |
 | Battle | `[b"match", battleground_pubkey, seq_le]` | ephemeral; `seq` is `u64`, the battleground's `match_seq` at creation |
@@ -113,7 +114,9 @@ Free lamports pay ephemeral rent and are what `fund_budget` can move into the bu
 | 40 | `amount` u64 |
 | 48 | `bump` |
 
-`register_player` creates it with `amount` 0. No instruction in this version reads or writes it after that.
+A one-shot cash-out account. `owner` is the wallet `release_outbox` pays, and `amount` is the withdrawal waiting to be paid, or 0. The account's lamports are its rent plus `amount`.
+
+`register_player` creates a wallet's Outbox with `owner` = the wallet and `amount` 0. `init_treasury_outbox` creates the treasury Outbox with `owner` = the admin. `fund_outbox` and `fund_treasury_outbox` set `amount`; `release_outbox` pays it and sets it back to 0. See [Money in and out](matchmaking.md#money-in-and-out).
 
 ### Behavior — 119 bytes
 
@@ -254,7 +257,7 @@ Accounts: owner signer writable, player init `[b"player", owner]`, outbox init `
 
 Creates the wallet's Player and Outbox, both paid by the owner, then transfers `deposit` from the owner into the Player, where it is free lamports. A second call fails because the accounts exist.
 
-Log: `HZ_PLAYER <player> <owner> <budget> <winnings> <locked> <segregate> <fighting>`. `fund_budget` and `set_segregation` send it too, and `lock_army` (when a match opens) and `settle_match` send it for both Players. The instructions that only pay ephemeral rent from a Player (`create_behavior`, `create_army`, `close_army`) do not.
+Log: `HZ_PLAYER <player> <owner> <budget> <winnings> <locked> <segregate> <fighting>`. `fund_budget`, `set_segregation` and `fund_outbox` send it too, and `lock_army` (when a match opens) and `settle_match` send it for both Players. The instructions that only pay ephemeral rent from a Player (`create_behavior`, `create_army`, `close_army`) do not.
 
 ### `fund_budget(amount: u64)`
 
@@ -378,3 +381,49 @@ The battle account is read by hand, because the instruction closes it. An accoun
 A credit goes to `budget`, or to `winnings` when the winner's `segregate` is on. For both Players, `locked -= stake` and `fighting` drops by one. Every counter change is checked: an overflow fails with `BalanceShort`, and a `locked` or `fighting` that would go below zero fails with `NoStake`. Both armies return to Idle. `programs/horizon-zero/src/fees.rs` (`win_payout`) holds the arithmetic.
 
 Log: `HZ_MATCH_RESOLVED <battle> <outcome> <fee> <seed hex> <player_b>`. The outcome byte is the `Outcome` id. `player_b` is the locker's wallet, whose Player got the battle rent back.
+
+### `fund_outbox(amount: u64)`
+
+Rollup. Accounts: owner signer, player writable `[b"player", owner]`, outbox writable `[b"outbox", owner]`. Both must record the signer as `owner` (`NotOwner`).
+
+An Outbox whose `amount` is not 0 fails with `OutboxBusy`: it has not been released yet. An `amount` of 0 fails with `NothingToWithdraw`. The amount comes from free lamports first, then `winnings`, then `budget`. It never comes from `locked`, and more than `free + winnings + budget` fails with `BalanceShort`. The instruction lowers the counters, moves `amount` lamports from the Player to the Outbox, and sets `outbox.amount`. The Player keeps its rent and the locked stakes.
+
+Send `withdraw` after it in the same transaction. The rollup refuses an instruction that both moves lamports into an account and schedules that account's commit, so the two cannot be one instruction.
+
+Logs: `HZ_PLAYER …`, then `HZ_WITHDRAW <outbox> <amount>`.
+
+### `withdraw`
+
+Rollup. Accounts: owner signer writable, outbox writable `[b"outbox", owner]`, magic context writable (`MagicContext1111111111111111111111111111111`), magic program (`Magic11111111111111111111111111111111111111`).
+
+The Outbox is read by hand, because the magic program takes it over during the instruction and Anchor would write a typed account back afterwards. It must be owned by this program (`BadPda`), record the signer as `owner` (`NotOwner`), and hold a non-zero `amount` (`NothingToWithdraw`). The instruction then schedules a commit-and-undelegate of the Outbox alone. A post-undelegate action calls `release_outbox` on Solana with the accounts outbox (writable) and owner (writable). The wallet pays the intent and is the action's escrow authority. No escrow account has to exist.
+
+No log. The release on Solana logs `HZ_RELEASE`.
+
+### `release_outbox`
+
+Solana. Permissionless. Accounts: outbox writable, owner writable, which must be `outbox.owner` (`ConstraintAddress`) and a system account. When the delegation program runs it as the post-undelegate action, it appends three more accounts: the destination program, the escrow authority, and the escrow PDA, which signs. The instruction ignores them.
+
+The Outbox is a typed account, so while it is still delegated, and owned by the delegation program on Solana, the instruction fails. Once the Outbox is undelegated, the instruction moves `amount` lamports to the owner and sets `amount` to 0. The Outbox keeps its rent. Anyone may call it again; that call pays 0.
+
+Log: `HZ_RELEASE <outbox> <amount>`.
+
+### `init_treasury_outbox`
+
+Solana. Accounts: admin signer writable, config, outbox init `[b"outbox", config]`, system program.
+
+The signer must be `config.admin` (`NotAdmin`). It pays the rent. The treasury Outbox starts with `owner` = admin and `amount` 0. A second call fails because the account exists.
+
+### `fund_treasury_outbox`
+
+Rollup. Accounts: admin signer, config writable, treasury outbox writable `[b"outbox", config]`.
+
+The signer must be `config.admin` (`NotAdmin`). An unreleased treasury Outbox fails with `OutboxBusy`, and `config.fees` of 0 fails with `NothingToWithdraw`. The instruction moves all of `config.fees` from Config to the treasury Outbox, sets `outbox.owner` to the admin and `outbox.amount` to the fees, and sets `config.fees` to 0. Config keeps its rent. Send `claim_fees` after it in the same transaction.
+
+Log: `HZ_CLAIM <outbox> <amount>`.
+
+### `claim_fees`
+
+Rollup. Accounts: admin signer writable, config, treasury outbox writable `[b"outbox", config]`, magic context writable, magic program.
+
+`withdraw` for the treasury Outbox. The signer must be `config.admin` and the Outbox's `owner` (`NotAdmin`), and `amount` must not be 0 (`NothingToWithdraw`). The admin pays the intent. The post-undelegate `release_outbox` pays the admin.

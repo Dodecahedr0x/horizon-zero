@@ -64,4 +64,6 @@ pub enum HorizonError {
     AlreadyExists,
     #[msg("Battle has no VRF seed yet")]
     NotSeeded,
+    #[msg("There is nothing to withdraw")]
+    NothingToWithdraw,
 }
