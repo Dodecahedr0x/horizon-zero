@@ -3,13 +3,16 @@
 //   node scripts/local-stack.mjs              build, boot, bootstrap, index, then keep running (Ctrl-C stops all)
 //   node scripts/local-stack.mjs --check      the same, then play, settle and cash out one battle and exit
 //   node scripts/local-stack.mjs --check --probe   also record what the rollup's RPC answers (slower)
-//   node scripts/local-stack.mjs --no-build   reuse target/deploy/horizon_zero.so
+//   node scripts/local-stack.mjs --no-build   reuse target/deploy/horizon_zero.so, only if it is the
+//                                             default-features build this script or deploy.mjs recorded
 //   node scripts/local-stack.mjs --no-indexer do not start the indexer
 //
 // mb-stack (npm @magicblock-labs/ephemeral-validator) runs the base validator with the delegation,
 // VRF and eSPL programs and the VRF queues preloaded, the ephemeral rollup, and the query-filtering
-// front. horizon_zero is loaded into the base validator at genesis (`solana program deploy` of a
-// default build is refused locally); the rollup clones it on first use. vrf-oracle from the same
+// front. horizon_zero is loaded into the base validator at genesis as an upgradeable program whose
+// upgrade authority is the bootstrap admin (target/localnet/admin.json): `initialize` accepts only
+// the upgrade authority. mb-stack passes its extra arguments to solana-test-validator, so this is
+// `--upgradeable-program <id> <so> <admin>`. The rollup clones it on first use. vrf-oracle from the same
 // package watches the rollup and answers the ephemeral test queue, where lock_army asks for its seed.
 // The bootstrap creates and funds the eSPL rent PDA top-ups need, initializes Config pinned to the
 // rollup's identity, and delegates Config, the battlegrounds and the treasury Outbox.
@@ -20,6 +23,7 @@ import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { indexerListenPort } from "./indexer-port.mjs";
+import { SO, assertDefaultBuild, buildDefault } from "./program-build.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const work = path.join(root, "target/localnet");
@@ -154,15 +158,22 @@ async function main() {
 
   if (!args.has("--no-build")) {
     // Default features: inline-mock-vrf and inline-mock-magic are LiteSVM-only builds and must not
-    // reach a real validator.
-    log("building programs/horizon-zero");
-    run("cargo-build-sbf", ["--manifest-path", "programs/horizon-zero/Cargo.toml"]);
+    // reach a real validator. The LiteSVM suite's mock build overwrites the same .so, so build here.
+    log("building programs/horizon-zero with default features");
+    buildDefault(root, log);
   }
-  const so = path.join(root, "target/deploy/horizon_zero.so");
-  if (!fs.existsSync(so)) {
-    process.stderr.write(`[local] ${path.relative(root, so)} is missing; run without --no-build\n`);
+  const so = path.join(root, SO);
+  try {
+    assertDefaultBuild(root);
+  } catch (err) {
+    process.stderr.write(`[local] ${err.message}; run without --no-build\n`);
     process.exit(1);
   }
+
+  // The admin holds the program's upgrade authority from genesis, so it is the one key `initialize`
+  // accepts. The ledger is reset on every start; the keypair is kept between runs.
+  const admin = path.join(work, "admin.json");
+  if (!fs.existsSync(admin)) run("solana-keygen", ["new", "--no-bip39-passphrase", "--silent", "--force", "-o", admin], { stdio: "ignore" });
 
   // `--reset` resets only the base ledger. The rollup keeps its accounts in
   // magicblock-test-storage/ under its working directory, so it runs in target/localnet and that
@@ -176,7 +187,7 @@ async function main() {
     "--gossip-port", String(GOSSIP),
     "--dynamic-port-range", DYNAMIC,
     "--faucet-port", String(FAUCET),
-    "--bpf-program", PROGRAM_ID, so,
+    "--upgradeable-program", PROGRAM_ID, so, admin,
   ], "mb-stack.log", { cwd: work });
   await waitFor("mb-stack", async () => fs.readFileSync(path.join(work, "mb-stack.log"), "utf8").includes("stack is ready"), 180, "mb-stack.log");
   if (stopping) return;
@@ -187,8 +198,6 @@ async function main() {
     env: { ...process.env, RUST_LOG: process.env.RUST_LOG || "info" },
   });
 
-  const admin = path.join(work, "admin.json");
-  if (!fs.existsSync(admin)) run("solana-keygen", ["new", "--no-bip39-passphrase", "--silent", "--force", "-o", admin], { stdio: "ignore" });
   run("solana", ["airdrop", "100", "-k", admin, "-u", BASE_URL], { stdio: "ignore" });
   log("bootstrapping: eSPL rent PDA, config, battlegrounds, treasury Outbox, delegations");
   run("node", ["app/scripts/bootstrap.mjs", "--url", BASE_URL, "--er-url", ER_URL, "--keypair", admin, "--espl-rent"]);

@@ -10,7 +10,9 @@
  *     [--fee-bps 500]            used by initialize only
  *     [--espl-rent]              local stack only: create and fund the eSPL rent PDA top-ups need
  *
- * The keypair pays and becomes the admin on the first run. Later runs must use that same admin.
+ * The keypair pays and becomes the admin on the first run, and `initialize` accepts it only if it is
+ * the program's upgrade authority: deploy with this keypair (scripts/deploy.mjs and the local stack
+ * do). Later runs must use that same admin.
  * Standard behaviors are not created here: behaviors live in the rollup and a Player pays their rent.
  */
 import fs from "node:fs";
@@ -32,6 +34,7 @@ import {
   delegateTreasuryOutboxIx,
   initTreasuryOutboxIx,
   initializeIx,
+  programDataPda,
   treasuryOutboxPda,
 } from "../src/codec.ts";
 
@@ -52,6 +55,16 @@ export async function send(connection, payer, instructions) {
 }
 
 /** The identity a rollup signs with: the validator Config pins and every delegation names. */
+/**
+ * The program's upgrade authority from its ProgramData (UpgradeableLoaderState::ProgramData: tag 3
+ * u32, slot u64, then an Option<Pubkey>), or null when it has none or the program is not upgradeable.
+ */
+export async function upgradeAuthority(base) {
+  const info = await base.getAccountInfo(programDataPda());
+  if (!info || info.data.length < 45 || info.data.readUInt32LE(0) !== 3 || info.data[12] !== 1) return null;
+  return new PublicKey(info.data.subarray(13, 45));
+}
+
 export async function rollupIdentity(er) {
   const response = await er._rpcRequest("getIdentity", []);
   if (!response.result?.identity) throw new Error(`the rollup at ${er.rpcEndpoint} did not return its identity`);
@@ -103,6 +116,12 @@ export async function bootstrap(base, er, admin, { validator, feeBps = FEE_BPS, 
       throw new Error(`Config pins validator ${stored.validator}, but the rollup is ${identity.toBase58()}`);
     }
   } else {
+    // initialize refuses any signer but the upgrade authority (NotUpgradeAuthority): say which key it wants.
+    const authority = await upgradeAuthority(base);
+    if (!authority) throw new Error(`horizon_zero at ${PROGRAM_ID.toBase58()} is not upgradeable or has no upgrade authority, so nobody can initialize it`);
+    if (!authority.equals(admin.publicKey)) {
+      throw new Error(`initialize needs the program's upgrade authority ${authority.toBase58()}; the keypair is ${admin.publicKey.toBase58()}`);
+    }
     await send(base, admin, [initializeIx(admin.publicKey, feeBps, identity)]);
     log(`config: initialized, admin ${admin.publicKey.toBase58()}, fee ${feeBps} bps, validator ${identity.toBase58()}`);
   }

@@ -2,19 +2,23 @@
 //
 //   node scripts/deploy.mjs devnet  [--keypair ~/.config/solana/id.json] [--url <rpc>]
 //   node scripts/deploy.mjs mainnet --confirm-mainnet [--keypair <path>] [--url <rpc>] [--priority <micro-lamports>]
-//   extra flags: --skip-build (reuse target/deploy/horizon_zero.so), --skip-bootstrap,
+//   extra flags: --skip-build (reuse target/deploy/horizon_zero.so, only if it is the default-features
+//                build this script or the local stack recorded), --skip-bootstrap,
 //                --er-url <rollup rpc> and --validator <its identity> (both required unless --skip-bootstrap;
 //                the identity must be what the rollup's getIdentity returns)
 //
 // The program id is the address of target/deploy/horizon_zero-keypair.json, which must be
 // Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c. The --keypair wallet pays, holds the upgrade
-// authority, and becomes the game admin on the first bootstrap. Local testing does not use this
-// script: it runs on scripts/local-stack.mjs.
+// authority, and becomes the game admin on the first bootstrap: `initialize` accepts only the
+// upgrade authority, so the deploy and the bootstrap use that one keypair. An upgrade by another
+// wallet is refused before anything is sent. Local testing does not use this script: it runs on
+// scripts/local-stack.mjs.
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { assertDefaultBuild, buildDefault } from "./program-build.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PROGRAM_ID = "Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c";
@@ -88,20 +92,37 @@ if (!fs.existsSync(programKeypair)) fail(`program keypair not found: ${programKe
 const programAddress = output("solana-keygen", ["pubkey", programKeypair]);
 if (programAddress !== PROGRAM_ID) fail(`program keypair is ${programAddress}, but declare_id! is ${PROGRAM_ID}`);
 
-if (!has("--skip-build")) {
-  // Default features only: inline-mock-vrf and inline-mock-magic are for LiteSVM; they would break
-  // the real VRF callback and skip the rollup's ephemeral accounts and delegation.
-  run("cargo-build-sbf", ["--manifest-path", "programs/horizon-zero/Cargo.toml"]);
+// Default features only: inline-mock-vrf and inline-mock-magic are for LiteSVM; they would break
+// the real VRF callback and skip the rollup's ephemeral accounts and delegation. A reused .so must
+// be the default build recorded next to it (a LiteSVM mock build overwrites the same file).
+try {
+  if (has("--skip-build")) assertDefaultBuild(root);
+  else buildDefault(root, (line) => process.stdout.write(`[deploy] ${line}\n`));
+} catch (err) {
+  fail(has("--skip-build") ? `${err.message}; drop --skip-build` : err.message);
 }
 
 const payer = output("solana-keygen", ["pubkey", keypair]);
 const balance = output("solana", ["balance", payer, "--url", url]);
 process.stdout.write(`[deploy] ${cluster} via ${url}, payer ${payer} (${balance})\n`);
 
+// An upgrade needs the upgrade authority, and the bootstrap's initialize needs it as the admin.
+const shown = spawnSync("solana", ["program", "show", PROGRAM_ID, "--url", url, "--output", "json"], { cwd: root, encoding: "utf8" });
+if (shown.status === 0) {
+  let authority = null;
+  try {
+    authority = JSON.parse(shown.stdout).authority ?? null;
+  } catch {
+    fail(`could not read the upgrade authority from solana program show: ${shown.stdout.trim()}`);
+  }
+  if (authority !== payer) fail(`${PROGRAM_ID} is deployed with upgrade authority ${authority ?? "none"}, not ${payer}; deploy and bootstrap with that keypair`);
+}
+
 const deploy = [
   "program", "deploy", "target/deploy/horizon_zero.so",
   "--program-id", programKeypair,
   "--keypair", keypair,
+  "--upgrade-authority", keypair,
   "--url", url,
 ];
 const priority = value("--priority", "");
