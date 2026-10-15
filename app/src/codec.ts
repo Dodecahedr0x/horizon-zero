@@ -307,14 +307,6 @@ export function resolvedMatch(logs: readonly string[], battle: string) {
   return null;
 }
 
-/** `HZ_MATCH_CANCELLED <battle>` for `battle`: true when a log line has it. */
-export function cancelledMatch(logs: readonly string[], battle: string) {
-  return logs.some((line) => {
-    const at = line.indexOf("HZ_MATCH_CANCELLED ");
-    return at >= 0 && line.slice(at).split(" ")[1] === battle;
-  });
-}
-
 /** Whether `cancel_match` may end `match` at unix time `now`: Awaiting, and `CANCEL_AFTER_SECS` after it opened. */
 export function cancellable(match: { status: number; openedAt?: number | null }, now: number) {
   return match.status === 0 && typeof match.openedAt === "number" && match.openedAt > 0 && now >= match.openedAt + CANCEL_AFTER_SECS;

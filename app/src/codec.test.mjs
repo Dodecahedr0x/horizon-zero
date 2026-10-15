@@ -37,7 +37,6 @@ import {
   CANCEL_AFTER_SECS,
   cancelMatchIx,
   cancellable,
-  cancelledMatch,
   programDataPda,
   configPda,
   decodeBattle,
@@ -307,9 +306,6 @@ test("a battle is cancellable only while Awaiting, CANCEL_AFTER_SECS after it op
   assert.equal(cancellable({ status: 3, openedAt: opened }, opened + 9_999), false, "already cancelled");
   assert.equal(cancellable({ status: 0, openedAt: null }, opened), false, "unknown open time");
   assert.equal(cancellable({ status: 0 }, opened), false, "no open time");
-  const battle = key(8).toBase58();
-  assert.equal(cancelledMatch([`Program log: HZ_PLAYER ${battle}`, `Program log: HZ_MATCH_CANCELLED ${battle}`], battle), true);
-  assert.equal(cancelledMatch([`Program log: HZ_MATCH_CANCELLED ${key(9).toBase58()}`], battle), false);
 });
 
 test("decoders read the documented offsets", () => {
