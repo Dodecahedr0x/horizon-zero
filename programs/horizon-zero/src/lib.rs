@@ -457,8 +457,9 @@ pub mod horizon_zero {
 
     /// Rollup. In one intent bundle: commits the owner's Player (it stays delegated), and commits
     /// and undelegates the owner's funded Outbox, with a post-undelegate action that calls
-    /// `release_outbox` on Solana. The owner's wallet pays the intent. Committing the Player brings
-    /// its Solana balance down by what left it, so the validator does not front the withdrawal.
+    /// `release_outbox` on Solana. The owner signs as the intent's payer; the validator identity pays
+    /// the Solana transactions that carry it out. Committing the Player settles the validator's books
+    /// (see `schedule_release`).
     pub fn withdraw<'info>(ctx: Context<'info, Withdraw<'info>>) -> Result<()> {
         let outbox = ctx.accounts.outbox.to_account_info();
         let state = read_funded_outbox(&outbox)?;
@@ -643,12 +644,17 @@ fn read_funded_outbox(info: &AccountInfo) -> Result<Outbox> {
 
 /// Schedules, in one intent bundle, a plain commit of `source` (the Player or Config the money
 /// left; it stays delegated) and the commit and undelegation of `outbox`, then a `release_outbox`
-/// call on Solana that pays `owner`. `payer` signs and pays the intent.
+/// call on Solana that pays `owner`. `payer` signs as the intent's payer; the validator identity
+/// sends and pays the Solana transactions (commit, finalize, undelegate, action).
 ///
-/// The commit of `source` is what keeps Solana's books straight: the rollup moved the lamports from
-/// `source` to `outbox`, and committing only the Outbox would raise its Solana balance with the
-/// validator fronting the difference. These are the only commits the program schedules: a Player
-/// or Config is committed when cash leaves it, never on a timer.
+/// The commit of `source` is what keeps the validator's books exact. A top-up reaches the Player in
+/// the rollup only: on Solana its lamports go from the eSPL lamports PDA, once committed down, to the
+/// validator's fees vault. A commit that raises a delegated account's Solana balance is paid by the
+/// validator identity. Committing the Outbox alone would have the validator pay out the amount while
+/// Solana's Player still showed the money; committing `source` with it moves Solana's copy to the
+/// rollup's balance, so what the validator pays matches what its fees vault took in for that account.
+/// These are the only commits the program schedules: a Player or Config is committed when cash leaves
+/// it, never on a timer.
 ///
 /// Both accounts must be unchecked in the calling instruction: once scheduled, the rollup no
 /// longer lets the program write them, so Anchor must not serialize a typed copy afterwards.

@@ -99,7 +99,20 @@ The Player's lamports are split by its counters (see [Player](accounts.md#player
 
 Money enters and leaves the Player in the rollup, without undelegating the Player.
 
-**Top-up.** A lamport transfer into the Player lands in free lamports. The client sends it on Solana through the eSPL program's delegated lamports transfer (`lamportsDelegatedTransfer` in the TypeScript SDK). The rollup credits the Player with the exact amount. The wallet pays the amount plus 300 000 lamports and the transaction fee. The credit exists only in the rollup. Nothing commits the Player on a timer, so its Solana copy keeps the data and lamports of its last commit; the next withdrawal commits it. `fund_budget` then moves free lamports into the budget.
+**Top-up.** A lamport transfer into the Player lands in free lamports. The client sends it on Solana through the eSPL program's delegated lamports transfer (`lamportsDelegatedTransfer` in the TypeScript SDK, eSPL `SPLxh1LVZzEkX99H6rqYizhytLWPZVV296zyYDPagv2`). The wallet funds a fresh eSPL lamports PDA `[b"lamports", wallet, player, salt]` with the amount plus its rent, and the eSPL rent PDA fronts that PDA's delegation rent. The rollup moves the amount into the Player, then commits the drained PDA back to Solana; the delegation program's finalize sends a delegated account's decrease to the validator's fees vault `[b"v-fees-vault", validator]` (a delegation-program PDA the validator claims with `validator_claim_fees`, which keeps 10% for the protocol's fees vault), and the eSPL rent PDA gets its delegation rent back. So on Solana a top-up ends in the validator's fees vault, not in the Player's Solana copy. On the local stack, with two 0.05 SOL top-ups, both PDAs were at 0 and the fees vault up 100 540 000 lamports (the top-ups plus 270 000 per commit) within seconds. The wallet pays the amount plus 300 000 lamports and the transaction fee. The credit exists only in the rollup. Nothing commits the Player on a timer, so its Solana copy keeps the data and lamports of its last commit; the next withdrawal commits it. `fund_budget` then moves free lamports into the budget.
+
+```mermaid
+sequenceDiagram
+  participant Wallet as wallet
+  participant ESPL as eSPL program (Solana)
+  participant ER as rollup
+  participant DLP as delegation program
+  participant Vault as validator fees vault
+  Wallet->>ESPL: lamportsDelegatedTransfer(amount, salt): fund and delegate the lamports PDA
+  ER->>ER: lamports PDA to Player: amount (free lamports)
+  ER->>DLP: commit the drained lamports PDA
+  DLP->>Vault: finalize: the PDA's decrease, the top-up
+```
 
 **Withdrawal.** Lamports leave the rollup through the wallet's one-shot [Outbox](accounts.md#outbox--49-bytes). The client sends one rollup transaction with two instructions:
 
@@ -108,7 +121,7 @@ Money enters and leaves the Player in the rollup, without undelegating the Playe
 
 They are two instructions because the rollup refuses one instruction that moves lamports into an account and also schedules that account's commit. The rollup validator then commits the Player, and commits the Outbox, undelegates it, and runs the action on Solana.
 
-The Player commit is what pays for the withdrawal on Solana. The rollup moved the lamports from the Player to the Outbox, but Solana sees only what is committed. Committing the Outbox alone would raise its Solana balance while the Player's Solana copy kept its old balance, and the rollup validator would fund the difference. On the local stack spike, which committed only the Outbox, the validator's own balance paid it. Committing the Player in the same bundle brings its Solana balance down by the same amount. This is the only time a Player is committed: on each withdrawal, never on a timer. `release_outbox` pays `outbox.amount` to `outbox.owner` and sets the amount to 0. On the local stack the release had landed about a second after the rollup transaction.
+On Solana the validator identity pays every commit that raises a delegated account's balance: it sends the commit and finalize transactions and the delegation program takes the raise from it. It also pays their base fees. The Player commit sets the Player's Solana copy to its rollup balance, which holds the top-ups that went to the fees vault, so the identity pays that raise plus the Outbox's amount. On the local stack a withdrawal of 0.01 SOL from a Player whose Solana copy still showed its registration (1 364 160 lamports) set that copy to 50 312 992 and cost the identity 59 573 832 lamports: 48 948 832 for the Player, 10 000 000 for the Outbox, and 625 000 of base fees. Its fees vault had taken in the top-ups. So each cash-out commit settles the validator's books exactly: after it, the account's Solana copy holds what the rollup says, and across a run the identity and its fees vault together have gained the top-ups minus what was committed out to Solana, minus base fees; `pnpm localnet:check` asserts both (see [Testing](testing.md#local-stack)). Committing the Outbox alone, as the local stack spike did, paid the withdrawal out of the same validator but left the Player's Solana copy stale. The owner signs as the intent's payer; the identity pays the Solana transactions. This is the only time a Player is committed: on each withdrawal, never on a timer. `release_outbox` pays `outbox.amount` to `outbox.owner` and sets the amount to 0. On the local stack the release had landed about a second after the rollup transaction.
 
 ```mermaid
 sequenceDiagram
@@ -126,10 +139,10 @@ sequenceDiagram
   ER->>ER: free, then winnings, then budget, never locked (BalanceShort)
   ER->>ER: Player to Outbox lamports, outbox.amount = amount (HZ_OUTBOX_FUND)
   Wallet->>ER: withdraw (same transaction, HZ_WITHDRAW)
-  ER->>Magic: one bundle: commit the Player; commit-and-undelegate the Outbox, then release_outbox(outbox, owner); paid by the wallet
+  ER->>Magic: one bundle: commit the Player; commit-and-undelegate the Outbox, then release_outbox(outbox, owner); the wallet signs as payer
   Magic-->>Validator: intent queued in the magic context
-  Validator->>DLP: commit the Player (it stays delegated): its Solana balance drops by amount
-  Validator->>DLP: commit, finalize, undelegate the Outbox
+  Validator->>DLP: commit the Player (it stays delegated): its Solana copy becomes the rollup's balance; the identity pays the raise
+  Validator->>DLP: commit, finalize, undelegate the Outbox; the identity pays its amount
   DLP->>Base: process_undelegation: the Outbox is owned by horizon-zero again
   DLP->>Base: post-undelegate action: release_outbox + 3 escrow accounts
   Base->>Wallet: amount lamports (HZ_RELEASE), outbox.amount = 0
@@ -146,7 +159,7 @@ sequenceDiagram
 
 A funded Outbox blocks the next `fund_outbox` with `OutboxBusy` until it is released. `fund_outbox` also refuses a move that would leave the Player holding less than its rent plus `budget + winnings + locked` (`BalanceShort`). Every withdrawal also ends the Outbox's delegation, so before the next one the client sends `delegate_outbox` on Solana, paid by the wallet. It delegates to the rollup validator pinned in Config. It refuses an Outbox whose `amount` is not 0 (`OutboxBusy`): a withdrawal that is undelegated but not yet released is released first, so it is never locked back into the rollup. On the local stack one delegation session cost the wallet about 300 000 lamports, or 0.0003 SOL, plus transaction fees: 3 138 960 lamports of delegation record and metadata rent at delegation, of which 2 838 960 come back at undelegation.
 
-**Fee claim.** Fees collect on Config (`config.fees`, on top of its rent). The admin creates the treasury Outbox `[b"outbox", config]` once on Solana with `init_treasury_outbox`. A claim is the same two-instruction rollup transaction: `fund_treasury_outbox` moves all of `config.fees` to the treasury Outbox, records the admin as its owner and sets `config.fees` to 0 (`HZ_OUTBOX_FUND`), and `claim_fees` schedules one bundle that commits Config (it stays delegated) and commits and undelegates the treasury Outbox with the same `release_outbox` action, which pays the admin (`HZ_CLAIM`). As with the Player, the Config commit lowers Config's Solana balance by the fees that left it, and Config is committed only on a claim. Only the admin can send either instruction (`NotAdmin`). With no fees, `fund_treasury_outbox` fails with `NothingToWithdraw`. If `fund_treasury_outbox` lands without `claim_fees`, the fees wait in the delegated treasury Outbox until a later `claim_fees`; no instruction moves them back to Config. Like the player Outbox, every claim ends the treasury Outbox's delegation, so before the next claim the admin sends `delegate_treasury_outbox` on Solana, with the same `OutboxBusy` rule. `init_treasury_outbox` and `delegate_treasury_outbox` read Config by hand, so they work whether or not Config is delegated. See [Delegation](accounts.md#delegation).
+**Fee claim.** Fees collect on Config (`config.fees`, on top of its rent). The admin creates the treasury Outbox `[b"outbox", config]` once on Solana with `init_treasury_outbox`. A claim is the same two-instruction rollup transaction: `fund_treasury_outbox` moves all of `config.fees` to the treasury Outbox, records the admin as its owner and sets `config.fees` to 0 (`HZ_OUTBOX_FUND`), and `claim_fees` schedules one bundle that commits Config (it stays delegated) and commits and undelegates the treasury Outbox with the same `release_outbox` action, which pays the admin (`HZ_CLAIM`). As with the Player, the Config commit sets Config's Solana copy to the rollup's (on the local stack its lamports were unchanged: the fee came in and left), the identity pays the treasury Outbox's amount, and Config is committed only on a claim. Only the admin can send either instruction (`NotAdmin`). With no fees, `fund_treasury_outbox` fails with `NothingToWithdraw`. If `fund_treasury_outbox` lands without `claim_fees`, the fees wait in the delegated treasury Outbox until a later `claim_fees`; no instruction moves them back to Config. Like the player Outbox, every claim ends the treasury Outbox's delegation, so before the next claim the admin sends `delegate_treasury_outbox` on Solana, with the same `OutboxBusy` rule. `init_treasury_outbox` and `delegate_treasury_outbox` read Config by hand, so they work whether or not Config is delegated. See [Delegation](accounts.md#delegation).
 
 ## VRF request
 

@@ -4,10 +4,18 @@
  *
  *  1. Two wallets register on Solana, delegating their Player and Outbox in the same transaction.
  *  2. Each tops its Player up with 0.05 SOL (lamportsDelegatedTransferIx) and funds a 0.02 SOL budget.
+ *     On Solana the top-up sits in an eSPL lamports PDA until the rollup commits it down; the
+ *     delegation program then moves it to the validator's fees vault, which is checked.
  *  3. Each creates a behavior and an army on Outpost in the rollup; both lock; the rollup's VRF oracle
  *     seeds the battle; settle_match pays the winner and the fee (or releases both stakes on a draw).
  *  4. The winner withdraws 0.01 SOL (fund_outbox + withdraw); the post-undelegate action pays it on Solana.
- *  5. The admin claims the fee (fund_treasury_outbox + claim_fees) and receives it on Solana.
+ *     The same bundle commits the Player: its Solana copy becomes the rollup's balance. The
+ *     validator identity pays exactly its base fees plus what the commits raised on Solana (the
+ *     Player's raise and the Outbox's amount), money its fees vault took in from the top-ups.
+ *  5. The admin claims the fee (fund_treasury_outbox + claim_fees) and receives it on Solana, with
+ *     Config committed and the identity checked the same way.
+ *  At the end the validator (identity + fees vault) must not be out of pocket beyond its base fees.
+ *  BOOKS lines print the Solana lamports of every account involved after each step.
  *  6. Both Outboxes are delegated again, and the indexer (when INDEXER_URL is set) shows the settled battle.
  *
  * FEE lines record what each step cost the wallet. With `--probe` (off by default, about 40 s
@@ -17,11 +25,14 @@
  *
  *   node app/scripts/localnet-assert.mjs [--probe]     (pnpm localnet --check runs it; pass --probe there too)
  *
+ * cancel_match is not played here: it needs a battle left unseeded for CANCEL_AFTER_SECS (600 s) of
+ * rollup clock, which this check cannot shorten. The LiteSVM suite covers it with a warped clock.
+ *
  * Env: RPC_URL (Solana), ER_RPC_URL (rollup), ORACLE_QUEUE, ADMIN_KEYPAIR (the bootstrap admin), INDEXER_URL.
  */
 import { randomBytes } from "node:crypto";
 import { createRequire } from "node:module";
-import { lamportsDelegatedTransferIx } from "@magicblock-labs/ephemeral-rollups-sdk";
+import { deriveLamportsPda, deriveRentPda, lamportsDelegatedTransferIx, validatorFeesVaultPdaFromValidator } from "@magicblock-labs/ephemeral-rollups-sdk";
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SendTransactionError, Transaction } from "@solana/web3.js";
 import {
   BATTLEGROUNDS,
@@ -149,6 +160,85 @@ async function erPlayer(owner) {
   return { lamports: BigInt(info.lamports), ...decodePlayer(info.data) };
 }
 
+/**
+ * Base fees `payer` paid in transactions after `slot`, read from its signatures. The identity sends
+ * the commits, undelegations and post-undelegate actions, so this is what it may lose to them.
+ */
+async function feesPaidSince(payer, slot) {
+  let total = 0n;
+  let count = 0;
+  for (const { signature, slot: at } of await base.getSignaturesForAddress(payer, { limit: 200 }, "confirmed")) {
+    if (at <= slot) continue;
+    const tx = await base.getTransaction(signature, { commitment: "confirmed", maxSupportedTransactionVersion: 0 });
+    if (!tx?.meta || !tx.transaction.message.staticAccountKeys[0].equals(payer)) continue;
+    total += BigInt(tx.meta.fee);
+    count += 1;
+  }
+  return { total, count };
+}
+
+/**
+ * Waits until Solana's copy of a delegated `account` matches the rollup's lamports and data: the
+ * commit landed. Returns both copies.
+ */
+async function awaitCommitted(account, label) {
+  return until(`${label}: Solana's copy matches the rollup's`, 60, async () => {
+    const [onBase, inEr] = await Promise.all([base.getAccountInfo(account, "confirmed"), er.getAccountInfo(account)]);
+    if (!onBase || !inEr || !onBase.owner.equals(DELEGATION_PROGRAM_ID)) return null;
+    return onBase.lamports === inEr.lamports && Buffer.compare(onBase.data, inEr.data) === 0 ? { onBase, inEr } : null;
+  });
+}
+
+/** The rollup identity's and its delegation-program fees vault's Solana balances. */
+async function validatorBalance() {
+  const [id, vault] = await base.getMultipleAccountsInfo([identity, feesVault], "confirmed");
+  return { identity: BigInt(id.lamports), vault: BigInt(vault?.lamports ?? 0) };
+}
+
+/**
+ * The validator's books across a withdrawal or claim. A top-up's lamports reach Solana in the
+ * validator's fees vault (the eSPL lamports PDA is committed down and the delegation program's
+ * finalize sends the decrease there). A commit that raises a delegated account's Solana balance is
+ * paid by the identity. So across a cash-out the identity pays exactly its base fees plus `raised`:
+ * the Player or Config commit's raise plus the Outbox's amount. Nothing else may leave it.
+ */
+async function cashOutCheck(label, before, slot, raised) {
+  // Let the last base transactions of the bundle (finalize, action) land.
+  await sleep(3000);
+  const after = await validatorBalance();
+  const paid = await feesPaidSince(identity, slot);
+  const loss = before.identity - after.identity;
+  console.log(`VALIDATOR ${label} identity_loss=${loss} base_fees=${paid.total} (${paid.count} txs) committed_raise=${raised} fees_vault_gain=${after.vault - before.vault}`);
+  check(loss === paid.total + raised, `${label}: the identity lost ${loss}, not its ${paid.total} of base fees plus the ${raised} its commits raised on Solana`);
+  await books(`after ${label}`);
+  return { loss, fees: paid.total };
+}
+
+/**
+ * Lamports on Solana of every account money moves through, printed as one BOOKS line per step with
+ * the change since the last step. `validator` is the identity plus its fees vault in the delegation
+ * program; `identity_fees` is what the identity paid in base fees since the last step.
+ */
+const tracked = new Map();
+let booksLast = null;
+let identityFeesTotal = 0n;
+async function books(step) {
+  const names = [...tracked.keys()];
+  const infos = await base.getMultipleAccountsInfo(names.map((name) => tracked.get(name)), "confirmed");
+  const slot = await base.getSlot("confirmed");
+  const now = Object.fromEntries(names.map((name, i) => [name, BigInt(infos[i]?.lamports ?? 0)]));
+  now.validator = now.identity + now.fees_vault;
+  const fees = booksLast ? (await feesPaidSince(identity, booksLast.slot)).total : 0n;
+  identityFeesTotal += fees;
+  const parts = Object.entries(now).map(([name, value]) => {
+    const delta = booksLast ? value - (booksLast.now[name] ?? 0n) : 0n;
+    return `${name}=${value}${delta ? `(${delta > 0n ? "+" : ""}${delta})` : ""}`;
+  });
+  console.log(`BOOKS ${step} | ${parts.join(" ")} | identity_fees=${fees}`);
+  booksLast = { slot, now };
+  return now;
+}
+
 async function inRollup(key) {
   return (await er.getAccountInfo(key))?.owner.equals(PROGRAM_ID) ? true : null;
 }
@@ -181,6 +271,7 @@ async function awaitRelease(outbox, owner, label) {
 const identityKey = (await er._rpcRequest("getIdentity", []).catch(() => null))?.result?.identity;
 check(identityKey, `the rollup at ${er.rpcEndpoint} returns its identity (getIdentity)`);
 const identity = new PublicKey(identityKey);
+const feesVault = validatorFeesVaultPdaFromValidator(identity);
 const configInfo = await base.getAccountInfo(configPda());
 check(configInfo, "Config exists on Solana: run the bootstrap (scripts/local-stack.mjs does)");
 const configOnBase = decodeConfig(configInfo.data);
@@ -188,6 +279,11 @@ check(configOnBase, "the account at the Config address is a Config");
 check(configOnBase.validator === identity.toBase58(), "Config pins the rollup's identity");
 check(configOnBase.admin === admin.publicKey.toBase58(), "ADMIN_KEYPAIR is Config's admin");
 say(`rollup identity ${identity.toBase58()}, admin ${admin.publicKey.toBase58()}`);
+tracked.set("identity", identity);
+tracked.set("fees_vault", feesVault);
+tracked.set("espl_rent", deriveRentPda()[0]);
+tracked.set("config", configPda());
+tracked.set("treasury", treasuryOutboxPda());
 
 // Subscriptions the indexer depends on, opened before anything happens in the rollup.
 const notified = { logs: 0, program: 0 };
@@ -210,6 +306,11 @@ for (const wallet of wallets) {
   await base.confirmTransaction(await base.requestAirdrop(wallet.publicKey, 2 * LAMPORTS_PER_SOL), "confirmed");
 }
 const [first, second] = wallets;
+for (const [i, wallet] of wallets.entries()) {
+  tracked.set(`player${i}`, playerPda(wallet.publicKey));
+  tracked.set(`outbox${i}`, outboxPda(wallet.publicKey));
+}
+const startBooks = await books("start");
 
 // 1. Register: Player + Outbox created and delegated in one Solana transaction, as the app does.
 for (const wallet of wallets) {
@@ -219,15 +320,19 @@ for (const wallet of wallets) {
   fee(`register wallet_delta=${before - (await balance(owner))} tx_fee=${info.meta.fee} (Player and Outbox rent, delegation record and metadata rent for both)`);
   await until("the rollup picks up the Player", 60, () => inRollup(playerPda(owner)));
   await until("the rollup picks up the Outbox", 60, () => inRollup(outboxPda(owner)));
+  await books(`register ${owner.toBase58().slice(0, 6)}`);
 }
 say("both Players and Outboxes are live in the rollup");
 
 // 2. Top up 0.05 SOL each through the eSPL program, then fund a 0.02 SOL budget.
-for (const wallet of wallets) {
+for (const [i, wallet] of wallets.entries()) {
   const owner = wallet.publicKey;
   const playerBefore = (await erPlayer(owner)).lamports;
   const walletBefore = await balance(owner);
-  const { info } = await send(base, "top-up", [wallet], lamportsDelegatedTransferIx(owner, playerPda(owner), TOP_UP, randomBytes(32)));
+  const salt = randomBytes(32);
+  tracked.set(`espl${i}`, deriveLamportsPda(owner, playerPda(owner), salt)[0]);
+  const { info } = await send(base, "top-up", [wallet], lamportsDelegatedTransferIx(owner, playerPda(owner), TOP_UP, salt));
+  await books(`top-up ${i} sent`);
   const walletDelta = walletBefore - (await balance(owner));
   fee(`top-up wallet_delta=${walletDelta} amount=${TOP_UP} overhead=${walletDelta - TOP_UP} tx_fee=${info.meta.fee}`);
   const credited = await until("the rollup credits the top-up", 60, async () => {
@@ -235,10 +340,23 @@ for (const wallet of wallets) {
     return now > playerBefore ? now : null;
   });
   check(credited - playerBefore === TOP_UP, `top-up credited ${credited - playerBefore}, expected ${TOP_UP}`);
+  await books(`top-up ${i} credited in the rollup`);
   await send(er, "fund_budget", [wallet], fundBudgetIx(owner, BUDGET));
   check(BigInt((await erPlayer(owner)).budget) === BUDGET, "budget is 0.02 SOL");
 }
 say(`both Players hold ${sol(TOP_UP)} more in the rollup, ${sol(BUDGET)} of it as budget`);
+// The rollup commits the drained eSPL lamports PDAs back to Solana on its own schedule; finalize
+// sends their decrease, the top-ups, to the validator's fees vault.
+{
+  const vaultBefore = (await validatorBalance()).vault;
+  await until("the eSPL lamports PDAs settle on Solana", 120, async () => {
+    const infos = await base.getMultipleAccountsInfo([tracked.get("espl0"), tracked.get("espl1")], "confirmed");
+    return infos.every((info) => !info || info.lamports === 0) ? true : null;
+  });
+  const settled = await books("eSPL PDAs settled");
+  check(settled.fees_vault - vaultBefore >= 2n * TOP_UP, `the fees vault received the top-ups: +${settled.fees_vault - vaultBefore}, at least ${2n * TOP_UP}`);
+  say(`the top-ups are in the validator's fees vault on Solana (+${settled.fees_vault - vaultBefore})`);
+}
 
 // 3. A behavior and an army each, then the battle.
 const race = RACES[0];
@@ -291,6 +409,8 @@ const seeded = await until("the VRF oracle seeds the battle", 60, async () => {
   return state?.status === 2 ? state : null;
 });
 say(`seeded ${seeded.seed}`);
+const nowUnix = Math.floor(Date.now() / 1000);
+check(seeded.openedAt > 0 && Math.abs(seeded.openedAt - nowUnix) < 600, `the battle records when it opened (opened_at ${seeded.openedAt}, now ${nowUnix})`);
 
 // Replay the battle off-chain to know the winner before the program says it.
 const strip = ({ race: _race, ...unit }) => unit;
@@ -339,6 +459,7 @@ if (outcome === 3) {
 }
 check(configFees >= fees, "config.fees counts the fee");
 say(`settled; config.fees ${configFees}`);
+await books("settle");
 
 // close_army: the Player signs as sponsor by its seeds, and gets the army's rent back.
 {
@@ -392,8 +513,22 @@ const cashing = outcome === 2 ? second : first;
   const outbox = outboxPda(owner);
   const walletBefore = await balance(owner);
   const playerBefore = (await erPlayer(owner)).lamports;
+  const playerOnBaseBefore = BigInt((await base.getAccountInfo(playerPda(owner), "confirmed")).lamports);
+  await books("before withdraw");
+  const validatorBefore = await validatorBalance();
+  const slotBefore = await base.getSlot("confirmed");
   await send(er, "fund_outbox + withdraw", [cashing], fundOutboxIx(owner, WITHDRAW), withdrawIx(owner));
   const release = await awaitRelease(outbox, owner, "withdraw");
+  // The Player was committed in the same bundle: Solana's copy holds the rollup's lower balance.
+  const { onBase: playerOnBase } = await awaitCommitted(playerPda(owner), "withdraw");
+  const committed = decodePlayer(playerOnBase.data);
+  const live = await erPlayer(owner);
+  check(BigInt(playerOnBase.lamports) === live.lamports && committed.budget === live.budget && committed.winnings === live.winnings,
+    "the Player's Solana copy carries the committed balance");
+  console.log(`COMMIT withdraw player_on_solana before=${playerOnBaseBefore} after=${playerOnBase.lamports} rollup=${live.lamports}`);
+  const raised = BigInt(playerOnBase.lamports) - playerOnBaseBefore + WITHDRAW;
+  const identityLoss = await cashOutCheck("withdraw", validatorBefore, slotBefore, raised);
+  say(`withdraw: identity paid ${identityLoss.loss} = ${identityLoss.fees} of base fees + ${raised} committed; the Player on Solana is ${playerOnBase.lamports}`);
   check(release.payer === identity.toBase58() && release.undelegated, "the post-undelegate action ran release_outbox with the undelegation");
   const walletDelta = (await balance(owner)) - walletBefore;
   fee(`withdraw wallet_delta=+${walletDelta} amount=${WITHDRAW} beyond_amount=${walletDelta - WITHDRAW} (delegation record and metadata rent refund, minus what the rollup charged)`);
@@ -406,8 +541,19 @@ const cashing = outcome === 2 ? second : first;
 if (configFees > 0n) {
   const treasury = treasuryOutboxPda();
   const adminBefore = await balance(admin.publicKey);
+  const configOnBaseBefore = BigInt((await base.getAccountInfo(configPda(), "confirmed")).lamports);
+  await books("before claim");
+  const validatorBefore = await validatorBalance();
+  const slotBefore = await base.getSlot("confirmed");
   await send(er, "fund_treasury_outbox + claim_fees", [admin], fundTreasuryOutboxIx(admin.publicKey), claimFeesIx(admin.publicKey));
   const release = await awaitRelease(treasury, admin.publicKey, "claim");
+  // Config was committed in the same bundle: Solana's copy shows the fees gone.
+  const { onBase: configOnBase, inEr: configInEr } = await awaitCommitted(configPda(), "claim");
+  check(decodeConfig(configOnBase.data).fees === "0" && configOnBase.lamports === configInEr.lamports, "Config's Solana copy carries the committed claim");
+  console.log(`COMMIT claim config_on_solana before=${configOnBaseBefore} after=${configOnBase.lamports} rollup=${configInEr.lamports}`);
+  const raised = BigInt(configOnBase.lamports) - configOnBaseBefore + configFees;
+  const identityLoss = await cashOutCheck("claim", validatorBefore, slotBefore, raised);
+  say(`claim: identity paid ${identityLoss.loss} = ${identityLoss.fees} of base fees + ${raised} committed; Config on Solana is ${configOnBase.lamports}`);
   check(release.payer === identity.toBase58() && release.undelegated, "the post-undelegate action ran release_outbox for the claim");
   const adminDelta = (await balance(admin.publicKey)) - adminBefore;
   fee(`claim admin_delta=+${adminDelta} fees=${configFees} beyond_fees=${adminDelta - configFees}`);
@@ -442,7 +588,7 @@ if (indexerUrl) {
   });
   check(row.outcome === outcome, `indexer outcome ${row.outcome}, expected ${outcome}`);
   check(BigInt(row.fee) === fees && row.feeBps === seeded.feeBps, `indexer fee ${row.fee} at ${row.feeBps} bps`);
-  check(row.openAt !== null && row.resolvedAt !== null, "the indexer has the battle's open and resolve times");
+  check(row.openAt === seeded.openedAt && row.resolvedAt !== null, `the indexer's open time ${row.openAt} is the battle's opened_at ${seeded.openedAt}, and it has a resolve time`);
   const players = await (await fetch(`${indexerUrl}/battlegrounds`)).json();
   probe(`indexer /matches/${battle.toBase58()}: ${JSON.stringify({ ...row, unitsA: undefined, unitsB: undefined })}; /battlegrounds ${players.length} rows`);
 }
@@ -450,5 +596,13 @@ if (indexerUrl) {
 probe(`blockhash validity while a signature was still unknown: ${JSON.stringify(blockhashChecks)}`);
 if (logsSub !== null) await er.removeOnLogsListener(logsSub);
 if (programSub !== null) await er.removeProgramAccountChangeListener(programSub);
+{
+  // Over the whole run the validator (identity + fees vault) took in the top-ups and paid out only
+  // what was cashed out, plus its base fees: it is never out of pocket.
+  const end = await books("end");
+  const net = end.validator - startBooks.validator;
+  console.log(`VALIDATOR run net=${net} identity_base_fees=${identityFeesTotal}`);
+  check(net + identityFeesTotal >= 0n, `the validator is out of pocket by ${-(net + identityFeesTotal)} beyond its base fees`);
+}
 say(`passed: outcome ${outcome}, fee ${fees}, battle ${battle.toBase58()}`);
 process.exit(0);
