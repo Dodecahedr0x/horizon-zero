@@ -22,9 +22,9 @@ The scoped VRF identity is a different account, owned by the derivation under th
 
 | account | created on Solana by | delegated to the rollup by | leaves the rollup |
 | --- | --- | --- | --- |
-| Config | `initialize` | `delegate_config` | never |
+| Config | `initialize` | `delegate_config` | never; each `claim_fees` commits it and it stays delegated |
 | Battleground | `create_battleground` | `delegate_battleground` | never |
-| Player | `register_player` | `delegate_player` | never |
+| Player | `register_player` | `delegate_player` | never; each `withdraw` commits it and it stays delegated |
 | Outbox | `register_player` | `delegate_outbox`, before each withdrawal | `withdraw` commits and undelegates it |
 | treasury Outbox | `init_treasury_outbox` | `delegate_treasury_outbox`, before each claim | `claim_fees` commits and undelegates it |
 | program identity | `initialize` | not delegated | — |
@@ -32,7 +32,9 @@ The scoped VRF identity is a different account, owned by the derivation under th
 
 The first five are program PDAs. Each is delegated to the rollup validator pinned in Config by `initialize`. Once delegated, each one's Solana copy is owned by the delegation program `DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh`; the rollup holds the live copy.
 
-Nothing schedules commits: every delegation uses the SDK's default commit frequency, `u32::MAX` ms, and no instruction commits Config, a Battleground or a Player. Their Solana copies therefore keep the data they had when they were delegated. Balances, budgets, stakes and fees live in the rollup, and money leaves it only through an Outbox (see [Money in and out](matchmaking.md#money-in-and-out)), whose `withdraw` or `claim_fees` commits and undelegates that Outbox alone.
+Nothing commits on a timer: every delegation uses the SDK's default commit frequency, `u32::MAX` ms. Commits happen only when cash leaves the rollup. Money leaves only through an Outbox (see [Money in and out](matchmaking.md#money-in-and-out)). In one intent bundle, `withdraw` commits the owner's Player and commits and undelegates their Outbox; `claim_fees` commits Config and commits and undelegates the treasury Outbox. The Player and Config stay delegated. A Battleground is never committed.
+
+The commit is what keeps Solana's lamports straight. The rollup moved the withdrawn lamports from the Player (or Config) to the Outbox. Committed alone, the Outbox's Solana balance would rise by the amount while the Player's Solana copy kept its old balance, and the rollup validator would pay the difference out of its own balance. Committing the source in the same bundle lowers its Solana balance by what left it. Between withdrawals a Player's Solana copy is stale: it shows the data and lamports of its last commit, or of its delegation if it was never committed. Top-ups, budgets, stakes and payouts live in the rollup until the next withdrawal.
 
 The program has no instruction that undelegates Config, a Battleground or a Player. The delegation program can still undelegate one: it then calls `process_undelegation`, which `#[ephemeral]` adds (see [Delegation](#delegation)), and the account is this program's again on Solana. A Player returned that way can be delegated again with `delegate_player`, whose ownership check passes once more. The flows that need the rollup (creating behaviors and armies, `lock_army`, `settle_match`, `fund_outbox`, `withdraw`, `fund_treasury_outbox`, `claim_fees`) run there once the accounts they write are delegated. The program does not check which side it runs on; an instruction that writes an account the rollup does not hold delegated fails there.
 
@@ -50,7 +52,7 @@ flowchart LR
   end
   Init -->|"delegate_config, delegate_battleground, delegate_player,<br/>delegate_outbox, delegate_treasury_outbox"| Live
   Live -->|"Player sponsors"| Eph
-  Live -->|"withdraw, claim_fees: commit and undelegate the Outbox"| Release
+  Live -->|"withdraw, claim_fees: commit the Player or Config,<br/>commit and undelegate the Outbox"| Release
   Release -->|"delegate_outbox or delegate_treasury_outbox again"| Live
 ```
 
@@ -431,9 +433,9 @@ Logs: `HZ_OUTBOX_FUND <outbox> <owner> <amount>`, then `HZ_PLAYER …`.
 
 ### `withdraw`
 
-Rollup. Accounts: owner signer writable, outbox writable `[b"outbox", owner]`, magic context writable (`MagicContext1111111111111111111111111111111`), magic program (`Magic11111111111111111111111111111111111111`).
+Rollup. Accounts: owner signer writable, player writable `[b"player", owner]` (`ConstraintSeeds`), outbox writable `[b"outbox", owner]`, magic context writable (`MagicContext1111111111111111111111111111111`), magic program (`Magic11111111111111111111111111111111111111`).
 
-The Outbox is read by hand, because the magic program takes it over during the instruction and Anchor would write a typed account back afterwards. It must be owned by this program (`BadPda`), record the signer as `owner` (`NotOwner`), and hold a non-zero `amount` (`NothingToWithdraw`). The instruction then schedules a commit-and-undelegate of the Outbox alone. A post-undelegate action calls `release_outbox` on Solana with the accounts outbox (writable) and owner (writable). The wallet pays the intent and is the action's escrow authority. No escrow account has to exist.
+The Player and the Outbox are unchecked accounts read by hand: the magic program takes both over during the instruction, and Anchor would write a typed account back afterwards. The Player must be owned by this program (`BadPda`). The Outbox must be owned by this program (`BadPda`), record the signer as `owner` (`NotOwner`), and hold a non-zero `amount` (`NothingToWithdraw`). The instruction then schedules one intent bundle with two intents: a plain commit of the Player, which stays delegated, and a commit-and-undelegate of the Outbox. A post-undelegate action calls `release_outbox` on Solana with the accounts outbox (writable) and owner (writable). The wallet pays the intent and is the action's escrow authority. No escrow account has to exist. The Player commit lowers the Player's Solana balance by what `fund_outbox` moved, so the validator does not fund the withdrawal (see [Where each account lives](#where-each-account-lives)).
 
 Log: `HZ_WITHDRAW <outbox> <amount>`, with the amount read from the Outbox. Under `inline-mock-magic` the instruction runs its checks and logs, and schedules nothing.
 
@@ -463,9 +465,9 @@ Log: `HZ_OUTBOX_FUND <outbox> <admin> <amount>`.
 
 ### `claim_fees`
 
-Rollup. Accounts: admin signer writable, config, treasury outbox writable `[b"outbox", config]`, magic context writable, magic program.
+Rollup. Accounts: admin signer writable, config writable, treasury outbox writable `[b"outbox", config]`, magic context writable, magic program.
 
-`withdraw` for the treasury Outbox. The signer must be `config.admin` and the Outbox's `owner` (`NotAdmin`), and `amount` must not be 0 (`NothingToWithdraw`). The admin pays the intent. The post-undelegate `release_outbox` pays the admin. Config is not writable: the instruction only reads its admin.
+`withdraw` for the treasury Outbox, with Config in the Player's place. Config is committed, so it is an unchecked account read by hand, as in [`init_treasury_outbox`](#init_treasury_outbox), and must also be owned by this program (`BadPda`). The signer must be `config.admin` and the Outbox's `owner` (`NotAdmin`), and `amount` must not be 0 (`NothingToWithdraw`). The bundle commits Config, which stays delegated, and commits and undelegates the treasury Outbox. The admin pays the intent. The post-undelegate `release_outbox` pays the admin.
 
 Log: `HZ_CLAIM <outbox> <amount>`, with the amount read from the Outbox.
 

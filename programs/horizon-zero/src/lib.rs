@@ -397,14 +397,18 @@ pub mod horizon_zero {
         Ok(())
     }
 
-    /// Rollup. Commits and undelegates the owner's funded Outbox, with a post-undelegate action
-    /// that calls `release_outbox` on Solana. The owner's wallet pays the intent.
+    /// Rollup. In one intent bundle: commits the owner's Player (it stays delegated), and commits
+    /// and undelegates the owner's funded Outbox, with a post-undelegate action that calls
+    /// `release_outbox` on Solana. The owner's wallet pays the intent. Committing the Player brings
+    /// its Solana balance down by what left it, so the validator does not front the withdrawal.
     pub fn withdraw<'info>(ctx: Context<'info, Withdraw<'info>>) -> Result<()> {
         let outbox = ctx.accounts.outbox.to_account_info();
         let state = read_funded_outbox(&outbox)?;
         require_keys_eq!(state.owner, ctx.accounts.owner.key(), HorizonError::NotOwner);
+        let player = ctx.accounts.player.to_account_info();
+        require_keys_eq!(*player.owner, ID, HorizonError::BadPda);
         msg!("HZ_WITHDRAW {} {}", outbox.key(), state.amount);
-        schedule_release(&ctx.accounts.owner.to_account_info(), &outbox, state.owner, &ctx.accounts.magic)
+        schedule_release(&ctx.accounts.owner.to_account_info(), &player, &outbox, state.owner, &ctx.accounts.magic)
     }
 
     /// Solana, admin only: creates the treasury Outbox `[b"outbox", config]`, which pays the admin.
@@ -427,13 +431,16 @@ pub mod horizon_zero {
         fill_outbox(&info, keep, &mut ctx.accounts.outbox, ctx.accounts.admin.key(), fees)
     }
 
-    /// Rollup, admin only: as `withdraw`, for the funded treasury Outbox.
+    /// Rollup, admin only: as `withdraw`, for the funded treasury Outbox, committing Config.
     pub fn claim_fees<'info>(ctx: Context<'info, ClaimFees<'info>>) -> Result<()> {
+        let config = ctx.accounts.config.to_account_info();
+        require_admin(&config, &ctx.accounts.admin.key())?;
+        require_keys_eq!(*config.owner, ID, HorizonError::BadPda);
         let outbox = ctx.accounts.outbox.to_account_info();
         let state = read_funded_outbox(&outbox)?;
         require_keys_eq!(state.owner, ctx.accounts.admin.key(), HorizonError::NotAdmin);
         msg!("HZ_CLAIM {} {}", outbox.key(), state.amount);
-        schedule_release(&ctx.accounts.admin.to_account_info(), &outbox, state.owner, &ctx.accounts.magic)
+        schedule_release(&ctx.accounts.admin.to_account_info(), &config, &outbox, state.owner, &ctx.accounts.magic)
     }
 
     /// Solana, permissionless: pays an undelegated Outbox's `amount` to its recorded owner and
@@ -576,18 +583,29 @@ fn read_funded_outbox(info: &AccountInfo) -> Result<Outbox> {
     Ok(state)
 }
 
-/// Schedules the commit and undelegation of `outbox`, then a `release_outbox` call on Solana that
-/// pays `owner`. `payer` signs and pays the intent. Under `inline-mock-magic` it does nothing: the
-/// Outbox is never delegated there, and the tests call `release_outbox` themselves.
+/// Schedules, in one intent bundle, a plain commit of `source` (the Player or Config the money
+/// left; it stays delegated) and the commit and undelegation of `outbox`, then a `release_outbox`
+/// call on Solana that pays `owner`. `payer` signs and pays the intent.
+///
+/// The commit of `source` is what keeps Solana's books straight: the rollup moved the lamports from
+/// `source` to `outbox`, and committing only the Outbox would raise its Solana balance with the
+/// validator fronting the difference. These are the only commits the program schedules: a Player
+/// or Config is committed when cash leaves it, never on a timer.
+///
+/// Both accounts must be unchecked in the calling instruction: once scheduled, the rollup no
+/// longer lets the program write them, so Anchor must not serialize a typed copy afterwards.
+/// Under `inline-mock-magic` it does nothing: nothing is delegated there, and the tests call
+/// `release_outbox` themselves.
 fn schedule_release<'info>(
     payer: &AccountInfo<'info>,
+    source: &AccountInfo<'info>,
     outbox: &AccountInfo<'info>,
     owner: Pubkey,
     magic: &MagicAccounts<'info>,
 ) -> Result<()> {
     #[cfg(feature = "inline-mock-magic")]
     {
-        let _ = (payer, outbox, owner, magic);
+        let _ = (payer, source, outbox, owner, magic);
     }
     #[cfg(not(feature = "inline-mock-magic"))]
     {
@@ -608,6 +626,7 @@ fn schedule_release<'info>(
             magic.magic_context.to_account_info(),
             magic.magic_program.to_account_info(),
         )
+        .commit(std::slice::from_ref(source))
         .commit_and_undelegate(std::slice::from_ref(outbox))
         .add_post_undelegate_actions([release])
         .build_and_invoke()?;
@@ -1347,6 +1366,10 @@ pub struct Withdraw<'info> {
     /// Pays the intent.
     #[account(mut)]
     pub owner: Signer<'info>,
+    /// CHECK: the owner's Player, by its seeds, committed here; the handler checks this program owns
+    /// it. Unchecked so Anchor does not write it back after the scheduling CPI.
+    #[account(mut, seeds = [b"player", owner.key().as_ref()], bump)]
+    pub player: UncheckedAccount<'info>,
     /// CHECK: read by hand (see `read_funded_outbox`); its address is the owner's Outbox
     #[account(mut, seeds = [b"outbox", owner.key().as_ref()], bump)]
     pub outbox: UncheckedAccount<'info>,
@@ -1380,8 +1403,10 @@ pub struct ClaimFees<'info> {
     /// Pays the intent.
     #[account(mut)]
     pub admin: Signer<'info>,
-    #[account(seeds = [b"config"], bump = config.bump, has_one = admin @ HorizonError::NotAdmin)]
-    pub config: Account<'info, Config>,
+    /// CHECK: committed here, so read by hand (see `require_admin`, which checks the address and the
+    /// admin); Anchor must not write a typed Config back after the scheduling CPI
+    #[account(mut)]
+    pub config: UncheckedAccount<'info>,
     /// CHECK: read by hand (see `read_funded_outbox`); its address is the treasury Outbox
     #[account(mut, seeds = [b"outbox", config.key().as_ref()], bump)]
     pub outbox: UncheckedAccount<'info>,

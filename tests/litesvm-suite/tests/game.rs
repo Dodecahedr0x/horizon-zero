@@ -1535,9 +1535,10 @@ fn fund_outbox_ix(env: &Env, owner: &Keypair, amount: u64) -> Instruction {
     ix(env.program, accounts, disc("fund_outbox", &amount.to_le_bytes()))
 }
 
-/// `withdraw`: the signer, the Outbox, then the magic context and program.
+/// `withdraw`: the signer, their Player (committed), the Outbox, then the magic context and program.
 fn withdraw_ix(env: &Env, signer: &Keypair, outbox: Address) -> Instruction {
-    let accounts = vec![meta(signer.pubkey(), true, true), meta(outbox, true, false), meta(MAGIC_CONTEXT, true, false), meta(MAGIC, false, false)];
+    let player = player_pda(env, &signer.pubkey());
+    let accounts = vec![meta(signer.pubkey(), true, true), meta(player, true, false), meta(outbox, true, false), meta(MAGIC_CONTEXT, true, false), meta(MAGIC, false, false)];
     ix(env.program, accounts, disc("withdraw", &[]))
 }
 
@@ -1547,9 +1548,11 @@ fn release_ix(env: &Env, outbox: Address, owner: Address) -> Instruction {
 }
 
 /// `init_treasury_outbox`, `fund_treasury_outbox` and `claim_fees` take the signer, Config and the
-/// treasury Outbox; the first adds the system program, the last the magic accounts.
+/// treasury Outbox; the first adds the system program, the last the magic accounts. The last two
+/// take Config writable: one moves its fees, the other commits it.
 fn treasury_ix(env: &Env, signer: &Keypair, name: &str) -> Instruction {
-    let mut accounts = vec![meta(signer.pubkey(), true, true), meta(env.config, name == "fund_treasury_outbox", false), meta(treasury_outbox(env), true, false)];
+    let writable = name != "init_treasury_outbox";
+    let mut accounts = vec![meta(signer.pubkey(), true, true), meta(env.config, writable, false), meta(treasury_outbox(env), true, false)];
     match name {
         "init_treasury_outbox" => accounts.push(meta(SYSTEM, false, false)),
         "claim_fees" => accounts.extend([meta(MAGIC_CONTEXT, true, false), meta(MAGIC, false, false)]),
@@ -1617,11 +1620,16 @@ fn withdraw_takes_free_then_winnings_then_budget_and_release_pays_the_owner() {
     assert_eq!(env.balance(&outbox), outbox_rent + first);
     assert_eq!(outbox_state(&env, &outbox), (owner.pubkey(), first));
 
-    // `withdraw` reads the Outbox by hand and refuses one this program does not own.
+    // `withdraw` reads the Outbox by hand and refuses one this program does not own, and commits
+    // only a Player this program owns.
     let funded = env.svm.get_account(&outbox).unwrap();
     env.svm.set_account(outbox, Account { owner: SYSTEM, ..funded.clone() }).unwrap();
     send_expect_reason_with(&mut env, &owner, |env| vec![withdraw_ix(env, &owner, outbox)], "BadPda");
     env.svm.set_account(outbox, funded).unwrap();
+    let stored = env.svm.get_account(&player).unwrap();
+    env.svm.set_account(player, Account { owner: SYSTEM, ..stored.clone() }).unwrap();
+    send_expect_reason_with(&mut env, &owner, |env| vec![withdraw_ix(env, &owner, outbox)], "BadPda");
+    env.svm.set_account(player, stored).unwrap();
 
     // One withdrawal at a time, until the Outbox is released.
     send_expect_reason_with(&mut env, &owner, |env| vec![fund_outbox_ix(env, &owner, 1)], "OutboxBusy");
