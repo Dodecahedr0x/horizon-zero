@@ -260,6 +260,8 @@ pub struct Battle {
     pub race_b: u8,
     /// Config's fee rate when the battle opened; `settle_match` charges it.
     pub fee_bps: u16,
+    /// Clock `unix_timestamp` when `lock_army` opened the battle; `cancel_match` waits from it.
+    pub opened_at: i64,
     pub bump: u8,
 }
 
@@ -314,7 +316,7 @@ mod layout_tests {
         assert_eq!(8 + Behavior::INIT_SPACE, 119);
         assert_eq!(8 + Battleground::INIT_SPACE, 576);
         assert_eq!(8 + Army::INIT_SPACE, 1360);
-        assert_eq!(8 + Battle::INIT_SPACE, 2147); // + fee_bps 2
+        assert_eq!(8 + Battle::INIT_SPACE, 2155); // fee_bps at 2144, opened_at at 2146, bump at 2154
         assert_eq!(8 + Config::INIT_SPACE, 83); // admin 32, fee_bps 2, fees 8, validator 32, bump 1
                                                 // owner 32, budget 8, winnings 8, locked 8, segregate 1, fighting 2, bump 1
         assert_eq!(8 + Player::INIT_SPACE, 68);

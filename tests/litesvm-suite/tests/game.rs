@@ -6,6 +6,7 @@ use horizon_litesvm_tests::{sha256, sighash, PROGRAM_ID, VRF_ID};
 use litesvm::LiteSVM;
 use solana_account::Account;
 use solana_address::{address, Address};
+use solana_clock::Clock;
 use solana_instruction::{account_meta::AccountMeta, Instruction};
 use solana_keypair::Keypair;
 use solana_message::Message;
@@ -36,7 +37,7 @@ const DEPOSIT: u64 = 200_000_000;
 /// Free lamports `cover_stake` leaves on a Player for a battle's rent.
 const BATTLE_ROOM: u64 = 20_000_000;
 const PLAYER_LEN: usize = 68;
-const BATTLE_LEN: usize = 2147;
+const BATTLE_LEN: usize = 2155;
 
 struct Env {
     svm: LiteSVM,
@@ -874,6 +875,90 @@ fn a_second_settle_fails() {
 }
 
 #[test]
+fn an_unseeded_battle_cancels_after_the_wait_and_refunds_both_stakes() {
+    let mut env = setup();
+    let hold = env.behavior(&still_body());
+    let (first, second) = (Keypair::new(), Keypair::new());
+    env.fund(&first);
+    env.fund(&second);
+    let army_a = env.army(&first, 0, 0, AshbornKind::Guard.id(), hold);
+    let army_b = env.army(&second, 0, 0, AshbornKind::Guard.id(), hold);
+    queue(&mut env, &first, army_a, hold);
+    let (ground, _) = pda(&[b"battleground", &[0]], &env.program);
+    cover_stake(&mut env, &second, &ground);
+    let (player_a, player_b) = (player_pda(&env, &first.pubkey()), player_pda(&env, &second.pubkey()));
+    let before = (player_state(&env, &first.pubkey()), player_state(&env, &second.pubkey()));
+    let held = (env.balance(&player_a), env.balance(&player_b));
+    set_time(&mut env, 1_792_000_000);
+    // The lock opens the battle; the VRF callback never comes.
+    let battle = battle_pda(&env, 0, 0);
+    let lock = lock_ix(&env, &second, ground, army_b, battle, &[hold], vec![meta(army_a, true, false), meta(player_a, true, false)]);
+    send(&mut env.svm, &second, &[cu_limit(), lock]);
+    assert_eq!(opened_at(&env, &battle), 1_792_000_000, "the battle records when it opened");
+    assert_eq!(env.svm.get_account(&battle).unwrap().data[2108], 0, "awaiting");
+    let cancel = cancel_ix(&env, &battle);
+    let settle_call = settle_ix(&env, &battle);
+    let caller = Keypair::new();
+    env.fund(&caller);
+
+    // Not before the wait is over, by even one second.
+    send_expect_reason(&mut env.svm, &caller, std::slice::from_ref(&cancel), "TooEarly");
+    set_time(&mut env, 1_792_000_000 + 599);
+    send_expect_reason(&mut env.svm, &caller, std::slice::from_ref(&cancel), "TooEarly");
+    set_time(&mut env, 1_792_000_000 + 600);
+    // The Players must be the battle's.
+    let mut swapped = cancel.clone();
+    swapped.accounts.swap(3, 4);
+    send_expect_reason(&mut env.svm, &caller, &[swapped], "BadPda");
+
+    // Anyone cancels: both stakes go back to the budgets, the armies are Idle, the battle is closed
+    // and its rent is back on the locker's Player.
+    let logs = send(&mut env.svm, &caller, std::slice::from_ref(&cancel));
+    assert!(logs.iter().any(|line| line.contains(&format!("HZ_MATCH_CANCELLED {battle}"))));
+    assert_eq!((player_state(&env, &first.pubkey()), player_state(&env, &second.pubkey())), before);
+    assert_eq!((env.balance(&player_a), env.balance(&player_b)), held);
+    assert_eq!(env.svm.get_account(&army_a).unwrap().data[1358], 0);
+    assert_eq!(env.svm.get_account(&army_b).unwrap().data[1358], 0);
+    assert!(env.svm.get_account(&battle).is_none_or(|account| account.data.is_empty() && account.lamports == 0));
+
+    // A late VRF callback finds no battle and changes nothing; settling or cancelling again finds
+    // nothing either.
+    let scoped_key = scoped(&env);
+    env.svm.set_account(scoped_key, Account { lamports: 1_000_000, data: vec![], owner: SYSTEM, executable: false, rent_epoch: 0 }).unwrap();
+    let late = mock_fulfill(&env, &battle, &caller.pubkey(), &sha256(battle.as_ref()));
+    send_expect_err(&mut env.svm, &caller, &[cu_limit(), late]);
+    assert!(env.svm.get_account(&battle).is_none_or(|account| account.data.is_empty()));
+    send_expect_reason(&mut env.svm, &caller, &[cu_limit(), settle_call], "AlreadyResolved");
+    send_expect_reason(&mut env.svm, &caller, &[cancel], "AlreadyResolved");
+    assert_eq!((player_state(&env, &first.pubkey()), player_state(&env, &second.pubkey())), before);
+
+    // Both armies can fight again.
+    queue(&mut env, &first, army_a, hold);
+    let logs = lock_match(&mut env, &second, army_b, hold, army_a, &first);
+    assert_eq!(resolved(&logs).0, 3);
+}
+
+#[test]
+fn a_seeded_battle_cannot_be_cancelled() {
+    let mut env = setup();
+    let hold = env.behavior(&still_body());
+    let (first, second) = (Keypair::new(), Keypair::new());
+    env.fund(&first);
+    env.fund(&second);
+    let army_a = env.army(&first, 0, 0, AshbornKind::Guard.id(), hold);
+    let army_b = env.army(&second, 0, 0, AshbornKind::Guard.id(), hold);
+    queue(&mut env, &first, army_a, hold);
+    let (battle, _) = lock_and_seed(&mut env, 0, &second, army_b, hold, army_a, &first, None);
+    let at = opened_at(&env, &battle);
+    set_time(&mut env, at + 10 * 600);
+    // Its outcome is fixed by the seed: the loser could replay it and cancel. Settle it instead.
+    let cancel = cancel_ix(&env, &battle);
+    send_expect_reason(&mut env.svm, &first, &[cancel], "AlreadySeeded");
+    let logs = settle(&mut env, &battle);
+    assert_eq!(resolved(&logs), (3, 0));
+}
+
+#[test]
 fn a_player_does_not_match_their_own_army_or_another_battleground() {
     let mut env = setup();
     let hold = env.behavior(&still_body());
@@ -1365,6 +1450,26 @@ fn settle_ix(env: &Env, battle: &Address) -> Instruction {
         meta(MAGIC, false, false),
     ];
     ix(env.program, accounts, disc("settle_match", &[]))
+}
+
+/// `cancel_match` for an open battle: `settle_match`'s accounts without Config.
+fn cancel_ix(env: &Env, battle: &Address) -> Instruction {
+    let mut call = settle_ix(env, battle);
+    call.accounts.remove(5);
+    call.data = disc("cancel_match", &[]);
+    call
+}
+
+/// Sets the clock's `unix_timestamp`.
+fn set_time(env: &mut Env, unix_timestamp: i64) {
+    let mut clock: Clock = env.svm.get_sysvar();
+    clock.unix_timestamp = unix_timestamp;
+    env.svm.set_sysvar(&clock);
+}
+
+/// The battle's `opened_at`.
+fn opened_at(env: &Env, battle: &Address) -> i64 {
+    i64::from_le_bytes(env.svm.get_account(battle).unwrap().data[2146..2154].try_into().unwrap())
 }
 
 /// Settles the battle from a fresh wallet, with a compute limit first, as any client may. Returns

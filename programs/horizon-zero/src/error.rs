@@ -70,4 +70,8 @@ pub enum HorizonError {
     BadValidator,
     #[msg("Only the program's upgrade authority may initialize")]
     NotUpgradeAuthority,
+    #[msg("Battle cannot be cancelled before its wait is over")]
+    TooEarly,
+    #[msg("Battle is seeded: settle it instead")]
+    AlreadySeeded,
 }

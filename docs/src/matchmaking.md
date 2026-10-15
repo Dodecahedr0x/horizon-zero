@@ -23,16 +23,23 @@ sequenceDiagram
     Program->>Program: ephemeral Battle created, rent from the locker's Player free lamports
     Note over Program: army A is the queued opponent, army B is the locker, both Fighting
     Program->>Program: both Players: budget -= stake, locked += stake, fighting += 1
-    Program->>Program: battle copies config.fee_bps
+    Program->>Program: battle copies config.fee_bps and records opened_at (clock unix_timestamp)
     Program->>VRF: scoped request, data byte 10, caller seed sha256(battle)
     VRF-->>Oracle: request sits on the oracle queue
-    Oracle->>Program: seed_match(randomness), signed by the scoped identity
-    Program->>Program: store the seed, battle Seeded
-    Anyone->>Program: settle_match
-    Program->>Program: simulate(snapshots, geometry, seed)
-    Program->>Program: close the battle, its rent back to the locker's Player
-    Program->>Program: loser's Player pays the winner and the fee, or a draw unlocks both stakes
-    Program->>Program: both armies Idle
+    alt the seed arrives
+      Oracle->>Program: seed_match(randomness), signed by the scoped identity
+      Program->>Program: store the seed, battle Seeded
+      Anyone->>Program: settle_match
+      Program->>Program: simulate(snapshots, geometry, seed)
+      Program->>Program: close the battle, its rent back to the locker's Player
+      Program->>Program: loser's Player pays the winner and the fee, or a draw unlocks both stakes
+      Program->>Program: both armies Idle
+    else no seed by opened_at + 600 s
+      Anyone->>Program: cancel_match (battle still Awaiting, else AlreadySeeded or TooEarly)
+      Program->>Program: close the battle, its rent back to the locker's Player
+      Program->>Program: both Players: locked -= stake, budget += stake, fighting -= 1
+      Program->>Program: both armies Idle (HZ_MATCH_CANCELLED)
+    end
   end
 ```
 
@@ -75,7 +82,7 @@ A won payout goes back to the Player. With `segregate` off, the default, it goes
 
 A match creates the battle as an ephemeral account sponsored by the locker's Player, which must have the rent free (`RentShort`). `settle_match` closes the battle and refunds that rent to the locker's Player, so a battle costs the locker nothing once it settles.
 
-There is no timeout instruction. Until the callback lands and someone settles, both armies stay Fighting and both stakes stay locked on their Players.
+Until the callback lands and someone settles, both armies stay Fighting and both stakes stay locked on their Players. If the seed never arrives, anyone may send `cancel_match` once `CANCEL_AFTER_SECS` (600 seconds) have passed since `lock_army` opened the battle (`opened_at`, the clock's `unix_timestamp`). It returns both stakes to their budgets, sets both armies Idle, and closes the battle with its rent back to the locker's Player (`HZ_MATCH_CANCELLED <battle>`). Only an Awaiting battle can be cancelled. A Seeded battle fails with `AlreadySeeded`: its outcome is already fixed and anyone can replay it off-chain, so a loser who could cancel would never lose. Anyone may settle it instead. A VRF callback that arrives after the cancel finds no battle and fails without effect.
 
 ## Money in and out
 
@@ -185,7 +192,7 @@ The `HZ_MATCH_RESOLVED` log carries the outcome and the fee, because the battle 
 
 ## Callback compute
 
-The oracle sends `provide_randomness` in a transaction capped at 300 000 compute units, and the VRF program spends about 54 000 of it before it invokes the callback, so the callback has roughly 246 000. The request has no field that raises that cap. `seed_match` uses about 42 000 CU, most of it reading and writing back the 2147-byte battle and checking its address.
+The oracle sends `provide_randomness` in a transaction capped at 300 000 compute units, and the VRF program spends about 54 000 of it before it invokes the callback, so the callback has roughly 246 000. The request has no field that raises that cap. `seed_match` uses about 42 000 CU, most of it reading and writing back the 2155-byte battle and checking its address.
 
 The battle itself runs in `settle_match`, in its own transaction with up to 1 400 000 CU. The LiteSVM test `full_armies_resolve_on_every_battleground` measures full-budget armies that approach, cast, and attack:
 

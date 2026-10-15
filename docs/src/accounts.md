@@ -64,7 +64,7 @@ Behavior, Army and Battle are ephemeral accounts: they exist only in the MagicBl
 | --- | --- | --- | --- | --- |
 | Behavior | creator's Player | 119 | 5 728 | never |
 | Army | owner's Player | 1360 | 45 440 | `close_army` |
-| Battle | locker's (player B's) Player | 2147 | 70 624 | `settle_match` |
+| Battle | locker's (player B's) Player | 2155 | 70 880 | `settle_match` or `cancel_match` |
 
 The rent comes only from the sponsor's free lamports (see [Player](#player--68-bytes)). If they do not cover it, the create fails with `RentShort`, so storage never spends a budget, winnings, or a locked stake.
 
@@ -97,15 +97,17 @@ stateDiagram-v2
   Queued --> Fighting: chosen as opponent
   Idle --> Fighting: lock_army finds an opponent
   Fighting --> Idle: settle_match
+  Fighting --> Idle: cancel_match (unseeded battle, after the wait)
   Idle --> [*]: close_army
 ```
 
-`update_army` and `close_army` are legal only in Idle. No instruction leaves Fighting except `settle_match`.
+`update_army` and `close_army` are legal only in Idle. Only `settle_match` and `cancel_match` leave Fighting.
 
 ```mermaid
 stateDiagram-v2
   [*] --> Awaiting: lock_army finds an opponent
   Awaiting --> Seeded: seed_match (VRF callback) stores the seed
+  Awaiting --> [*]: cancel_match (anyone), CANCEL_AFTER_SECS after opened_at, refunds and closes it
   Seeded --> [*]: settle_match (anyone) pays out and closes it
 ```
 
@@ -239,7 +241,7 @@ Each `ArmyUnit` is 128 bytes:
 
 `col` and `row` are zone-local. The body is the canonical sequence copied from the behavior account. Cost, hp, atk, attack range, speed, the eight cast bytes, and `actions` are copied from `stats_for(race, kind)` when the army is saved. The cast bytes follow the battle rules chapter. Unused slots are zero. `status` is at offset 1358 because the unit array is fixed. `race` is the catalog id. Kind ids belong to that race.
 
-### Battle — 2147 bytes
+### Battle — 2155 bytes
 
 | offset | field |
 | --- | --- |
@@ -262,9 +264,10 @@ Each `ArmyUnit` is 128 bytes:
 | 2142 | `race_a` |
 | 2143 | `race_b` |
 | 2144 | `fee_bps` u16, Config's rate when the battle opened |
-| 2146 | `bump` |
+| 2146 | `opened_at` i64, the clock's `unix_timestamp` when `lock_army` opened the battle |
+| 2154 | `bump` |
 
-Each snapshot unit is 96 bytes: `kind`, `len`, `body` (77 bytes), `col`, `row`, `cost` u16, `hp`, `atk`, `range`, `speed`, then cast `damage`, `range`, `aoe`, `effect`, `aim`, `power`, `rounds`, and `cooldown`, then `actions`. `col` and `row` are the zone-local position copied from the army, and `body` is that unit's canonical behavior. The stats and the cast are the same bytes the army stored. Side A is the army that was already queued. Side B is the army that called `lock_army` and opened the match. `race_a` and `race_b` are those armies' race ids. `cols` and `rows` are copied from the battleground so `settle_match` can call `simulate` without another account. `seed` is zero until `seed_match`. `simulate` reads the stored stats and cast. It does not look the kind up in the catalog. `fee_bps` is what `settle_match` charges, so a `set_fee` after the lock does not change an open battle.
+Each snapshot unit is 96 bytes: `kind`, `len`, `body` (77 bytes), `col`, `row`, `cost` u16, `hp`, `atk`, `range`, `speed`, then cast `damage`, `range`, `aoe`, `effect`, `aim`, `power`, `rounds`, and `cooldown`, then `actions`. `col` and `row` are the zone-local position copied from the army, and `body` is that unit's canonical behavior. The stats and the cast are the same bytes the army stored. Side A is the army that was already queued. Side B is the army that called `lock_army` and opened the match. `race_a` and `race_b` are those armies' race ids. `cols` and `rows` are copied from the battleground so `settle_match` can call `simulate` without another account. `seed` is zero until `seed_match`. `simulate` reads the stored stats and cast. It does not look the kind up in the catalog. `fee_bps` is what `settle_match` charges, so a `set_fee` after the lock does not change an open battle. `opened_at` is what `cancel_match` waits from.
 
 ## Instructions
 
@@ -401,7 +404,7 @@ Log: `HZ_ARMY_CLOSE <army>`.
 
 The VRF callback. `#[vrf_callback]` inserts the scoped VRF identity as the first account. It must be a signer and must equal `[b"identity", program_id]` derived under the VRF program. The only other account is the battle, writable.
 
-The battle must be Awaiting, and its address must be `[b"match", battleground, seq]` with the stored bump. The instruction stores `randomness` in `seed` and sets the battle Seeded. A second call fails with `AlreadyResolved`.
+The battle must be Awaiting, and its address must be `[b"match", battleground, seq]` with the stored bump. The instruction stores `randomness` in `seed` and sets the battle Seeded. A second call fails with `AlreadyResolved`. A callback that arrives after `cancel_match` closed the battle fails when Anchor loads the battle, which no longer exists, and changes nothing. A battle address is never reused, since `match_seq` only grows.
 
 Log: `HZ_MATCH_SEEDED <battle> <seed hex>`.
 
@@ -422,6 +425,18 @@ The battle account is read by hand, because the instruction closes it. An accoun
 A credit goes to `budget`, or to `winnings` when the winner's `segregate` is on. For both Players, `locked -= stake` and `fighting` drops by one. Every counter change is checked: an overflow fails with `BalanceShort`, and a `locked` or `fighting` that would go below zero fails with `NoStake`. Both armies return to Idle. `programs/horizon-zero/src/fees.rs` (`win_payout`) holds the arithmetic.
 
 Log: `HZ_MATCH_RESOLVED <battle> <outcome> <fee> <seed hex> <player_b>`. The outcome byte is the `Outcome` id. `player_b` is the locker's wallet, whose Player got the battle rent back.
+
+### `cancel_match`
+
+Permissionless. No instruction arguments. Accounts, in order: battle, army A, army B, player A's Player, player B's Player (all writable), vault (writable), magic program. These are `settle_match`'s accounts without Config.
+
+Ends a battle whose VRF seed never arrived. The battle is read and checked as in `settle_match`: no data fails with `AlreadyResolved`, an account this program does not own with `BadPda`, and the address, both armies (Fighting) and both Players must be the battle's (`BadPda`, `BadStatus`). A Seeded battle fails with `AlreadySeeded`, and any status other than Awaiting with `AlreadyResolved`. The clock's `unix_timestamp` must be at least `opened_at + CANCEL_AFTER_SECS`, which is 600 seconds (`TooEarly`).
+
+The battle is closed and its rent goes back to player B's Player, which sponsored it. For both Players, `locked -= stake`, `budget += stake` and `fighting` drops by one, each checked (`NoStake` below zero, `BalanceShort` on overflow). No lamports move between Players and no fee is taken. Both armies return to Idle. A later `settle_match` or `cancel_match` fails with `AlreadyResolved`, and a late VRF callback fails without effect.
+
+A seeded battle cannot be cancelled. Its outcome is fixed by the stored seed, and anyone can replay it off-chain before deciding what to send. If a seeded battle could be cancelled, its loser would cancel instead of losing. Anyone may settle a seeded battle instead.
+
+Logs: `HZ_PLAYER …` for both Players, then `HZ_MATCH_CANCELLED <battle>`.
 
 ### `fund_outbox(amount: u64)`
 

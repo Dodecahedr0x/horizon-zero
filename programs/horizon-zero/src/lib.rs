@@ -35,6 +35,9 @@ pub const MAGIC_CONTEXT: Pubkey = Pubkey::new_from_array(ephemeral_rollups_sdk::
 pub const DELEGATION_PROGRAM: Pubkey =
     Pubkey::new_from_array(ephemeral_rollups_sdk::consts::DELEGATION_PROGRAM_ID.to_bytes());
 
+/// How long a battle waits for its VRF seed before `cancel_match` may end it, in seconds.
+pub const CANCEL_AFTER_SECS: i64 = 600;
+
 #[cfg(feature = "inline-mock-vrf")]
 fn program_identity_bump() -> u8 {
     Pubkey::find_program_address(&[b"identity"], &ID).1
@@ -307,13 +310,16 @@ pub mod horizon_zero {
         let (head, tail) = (&battle.head, &battle.tail);
         require!(tail.status != BattleStatus::Awaiting, HorizonError::NotSeeded);
         require!(tail.status == BattleStatus::Seeded, HorizonError::AlreadyResolved);
-        battle_seeds(&head.battleground, head.seq, tail.bump, &battle_key)?;
-        require_keys_eq!(ctx.accounts.army_a.key(), head.army_a, HorizonError::BadPda);
-        require_keys_eq!(ctx.accounts.army_b.key(), head.army_b, HorizonError::BadPda);
-        verify_pda(&[b"player", head.player_a.as_ref()], &ctx.accounts.player_a.key(), ctx.accounts.player_a.bump)?;
-        verify_pda(&[b"player", head.player_b.as_ref()], &ctx.accounts.player_b.key(), ctx.accounts.player_b.bump)?;
-        require!(ctx.accounts.army_a.status == ArmyStatus::Fighting, HorizonError::BadStatus);
-        require!(ctx.accounts.army_b.status == ArmyStatus::Fighting, HorizonError::BadStatus);
+        let accounts = &ctx.accounts;
+        check_parties(
+            head,
+            tail.bump,
+            &battle_key,
+            &accounts.army_a,
+            &accounts.army_b,
+            &accounts.player_a,
+            &accounts.player_b,
+        )?;
 
         let side_a = combat_units(&battle.units_a, head.count_a)?;
         let side_b = combat_units(&battle.units_b, head.count_b)?;
@@ -367,6 +373,59 @@ pub mod horizon_zero {
         ctx.accounts.army_a.status = ArmyStatus::Idle;
         ctx.accounts.army_b.status = ArmyStatus::Idle;
         msg!("HZ_MATCH_RESOLVED {} {} {} {} {}", battle_key, outcome as u8, fee, hex32(&tail.seed), head.player_b);
+        Ok(())
+    }
+
+    /// Permissionless: ends a battle whose VRF seed never arrived. Allowed only while the battle is
+    /// still Awaiting and at least `CANCEL_AFTER_SECS` after `lock_army` opened it. Both stakes go
+    /// back to their budgets, both armies become Idle, and the battle's rent goes back to the
+    /// locker's Player, which sponsored it.
+    ///
+    /// A seeded battle cannot be cancelled. Its outcome is fixed by the stored seed, and anyone can
+    /// replay it off-chain before settling: a loser who could cancel would cancel every lost battle.
+    /// Anyone may settle a seeded battle instead. A VRF callback that arrives after the cancel finds
+    /// no battle and fails without effect.
+    pub fn cancel_match(ctx: Context<CancelMatch>) -> Result<()> {
+        let info = ctx.accounts.battle.to_account_info();
+        let battle_key = info.key();
+        // A cancelled or settled battle is closed.
+        require!(!info.data_is_empty(), HorizonError::AlreadyResolved);
+        require_keys_eq!(*info.owner, ID, HorizonError::BadPda);
+        let battle = read_battle(&info.try_borrow_data()?)?;
+        let (head, tail) = (&battle.head, &battle.tail);
+        require!(tail.status != BattleStatus::Seeded, HorizonError::AlreadySeeded);
+        require!(tail.status == BattleStatus::Awaiting, HorizonError::AlreadyResolved);
+        let now = Clock::get()?.unix_timestamp;
+        require!(now >= tail.opened_at.saturating_add(CANCEL_AFTER_SECS), HorizonError::TooEarly);
+        let accounts = &ctx.accounts;
+        check_parties(
+            head,
+            tail.bump,
+            &battle_key,
+            &accounts.army_a,
+            &accounts.army_b,
+            &accounts.player_a,
+            &accounts.player_b,
+        )?;
+
+        // Close first, as in `settle_match`: in the rollup the close is a CPI.
+        let sponsor_bump = [ctx.accounts.player_b.bump];
+        eph::close(
+            &ctx.accounts.player_b.to_account_info(),
+            &[b"player", head.player_b.as_ref(), &sponsor_bump],
+            &info,
+            &ctx.accounts.ephemeral.vault,
+        )?;
+        let stake = head.stake;
+        for player in [&mut ctx.accounts.player_a, &mut ctx.accounts.player_b] {
+            player.locked = player.locked.checked_sub(stake).ok_or(HorizonError::NoStake)?;
+            player.budget = player.budget.checked_add(stake).ok_or(HorizonError::BalanceShort)?;
+            player.fighting = player.fighting.checked_sub(1).ok_or(HorizonError::NoStake)?;
+            log_player(&player.key(), player);
+        }
+        ctx.accounts.army_a.status = ArmyStatus::Idle;
+        ctx.accounts.army_b.status = ArmyStatus::Idle;
+        msg!("HZ_MATCH_CANCELLED {}", battle_key);
         Ok(())
     }
 
@@ -665,6 +724,7 @@ struct BattleBack {
     _race_a: u8,
     _race_b: u8,
     fee_bps: u16,
+    opened_at: i64,
     bump: u8,
 }
 
@@ -709,6 +769,27 @@ fn create_sponsored<'info>(
     let info = player.to_account_info();
     let bump = [player.bump];
     eph::create(&info, &[b"player", player.owner.as_ref(), &bump], account, account_seeds, vault, space)
+}
+
+/// What `settle_match` and `cancel_match` check before they touch a battle's parties: the battle's
+/// address, each army is the battle's and Fighting, and each Player is the battle's wallet's.
+fn check_parties(
+    head: &BattleFront,
+    bump: u8,
+    key: &Pubkey,
+    army_a: &Account<Army>,
+    army_b: &Account<Army>,
+    player_a: &Account<Player>,
+    player_b: &Account<Player>,
+) -> Result<()> {
+    battle_seeds(&head.battleground, head.seq, bump, key)?;
+    require_keys_eq!(army_a.key(), head.army_a, HorizonError::BadPda);
+    require_keys_eq!(army_b.key(), head.army_b, HorizonError::BadPda);
+    verify_pda(&[b"player", head.player_a.as_ref()], &player_a.key(), player_a.bump)?;
+    verify_pda(&[b"player", head.player_b.as_ref()], &player_b.key(), player_b.bump)?;
+    require!(army_a.status == ArmyStatus::Fighting, HorizonError::BadStatus);
+    require!(army_b.status == ArmyStatus::Fighting, HorizonError::BadStatus);
+    Ok(())
 }
 
 /// Checks the battle address against its stored canonical bump (lock_army created it with that
@@ -765,6 +846,7 @@ fn open_matched<'info>(
             cols: ctx.accounts.battleground.cols,
             rows: ctx.accounts.battleground.rows,
             fee_bps: ctx.accounts.config.fee_bps,
+            opened_at: Clock::get()?.unix_timestamp,
             bump: battle_bump,
         };
         write_battle(&mut data, &head, &opponent_army, &ctx.accounts.army)?;
@@ -973,6 +1055,7 @@ struct BattleHead {
     cols: u8,
     rows: u8,
     fee_bps: u16,
+    opened_at: i64,
     bump: u8,
 }
 
@@ -1001,6 +1084,7 @@ fn write_battle(data: &mut [u8], head: &BattleHead, army_a: &Army, army_b: &Army
     army_a.race.serialize(&mut out)?;
     army_b.race.serialize(&mut out)?;
     head.fee_bps.serialize(&mut out)?;
+    head.opened_at.serialize(&mut out)?;
     head.bump.serialize(&mut out)?;
     Ok(())
 }
@@ -1346,6 +1430,24 @@ pub struct SettleMatch<'info> {
     pub ephemeral: EphAccounts<'info>,
 }
 
+/// Permissionless. The same accounts as `settle_match` but Config, checked the same way.
+#[derive(Accounts)]
+pub struct CancelMatch<'info> {
+    /// CHECK: closed here, so read by hand and checked against its derivation
+    #[account(mut)]
+    pub battle: UncheckedAccount<'info>,
+    #[account(mut)]
+    pub army_a: Box<Account<'info, Army>>,
+    #[account(mut)]
+    pub army_b: Box<Account<'info, Army>>,
+    #[account(mut)]
+    pub player_a: Box<Account<'info, Player>>,
+    /// Sponsored the battle; gets its rent back.
+    #[account(mut)]
+    pub player_b: Box<Account<'info, Player>>,
+    pub ephemeral: EphAccounts<'info>,
+}
+
 /// What scheduling a commit needs.
 #[derive(Accounts)]
 pub struct MagicAccounts<'info> {
@@ -1620,6 +1722,7 @@ mod battle_layout_tests {
             race_a: 1,
             race_b: 2,
             fee_bps: 777,
+            opened_at: -1_234_567_890_123,
             bump: 253,
         });
         let mut data = Vec::new();
@@ -1640,7 +1743,12 @@ mod battle_layout_tests {
         assert_eq!(read.units_b.len(), 7);
         read.units_a.iter().zip(&battle.units_a).for_each(|(got, want)| assert_eq!(bytes(got), bytes(want)));
         read.units_b.iter().zip(&battle.units_b).for_each(|(got, want)| assert_eq!(bytes(got), bytes(want)));
-        assert_eq!((tail.status, tail.seed, tail.fee_bps, tail.bump), (BattleStatus::Seeded, [9; 32], 777, 253));
+        assert_eq!(
+            (tail.status, tail.seed, tail.fee_bps, tail.opened_at, tail.bump),
+            (BattleStatus::Seeded, [9; 32], 777, -1_234_567_890_123, 253)
+        );
+        assert_eq!(i64::from_le_bytes(data[2146..2154].try_into().unwrap()), -1_234_567_890_123, "opened_at offset");
+        assert_eq!((u16::from_le_bytes([data[2144], data[2145]]), data[2154]), (777, 253), "fee_bps and bump offsets");
         assert!(read_battle(&data[8..]).is_err(), "a missing discriminator does not read");
     }
 
@@ -1658,6 +1766,7 @@ mod battle_layout_tests {
             cols: 12,
             rows: 10,
             fee_bps: 500,
+            opened_at: 1_792_016_933,
             bump: 250,
         };
         let mut data = vec![0u8; 8 + Battle::INIT_SPACE];
@@ -1673,6 +1782,7 @@ mod battle_layout_tests {
         );
         assert_eq!((battle.status, battle.seed, battle.outcome), (BattleStatus::Awaiting, [0; 32], Outcome::Pending));
         assert_eq!((battle.race_a, battle.race_b, battle.fee_bps, battle.bump), (army_a.race, army_b.race, 500, 250));
+        assert_eq!(battle.opened_at, 1_792_016_933);
         for (army, units) in [(&army_a, &battle.units_a), (&army_b, &battle.units_b)] {
             for (at, snapshot) in units.iter().enumerate() {
                 if at < army.unit_count as usize {
