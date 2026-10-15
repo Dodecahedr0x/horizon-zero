@@ -68,4 +68,6 @@ pub enum HorizonError {
     NothingToWithdraw,
     #[msg("Validator identity must be set")]
     BadValidator,
+    #[msg("Only the program's upgrade authority may initialize")]
+    NotUpgradeAuthority,
 }

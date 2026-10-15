@@ -148,17 +148,11 @@ fn setup_on(svm: LiteSVM) -> Env {
     let queue = Address::new_unique();
     svm.set_account(queue, Account { lamports: 1_000_000_000, data: vec![0; 256], owner: vrf, executable: false, rent_epoch: 0 }).unwrap();
 
+    // `add_program` deploys through the upgradeable loader with no upgrade authority; the admin
+    // becomes it, as the deployer would be, so `initialize` accepts the admin.
+    set_upgrade_authority(&mut svm, &program, Some(&admin.pubkey()));
     let (config, _) = pda(&[b"config"], &program);
-    let identity = pda(&[b"identity"], &program).0;
-    send(
-        &mut svm,
-        &admin,
-        &[ix(
-            program,
-            vec![meta(admin.pubkey(), true, true), meta(config, true, false), meta(identity, true, false), meta(SYSTEM, false, false)],
-            disc("initialize", &[&500u16.to_le_bytes()[..], VALIDATOR.as_ref()].concat()),
-        )],
-    );
+    send(&mut svm, &admin, &[initialize_ix(&program, &admin.pubkey(), &program, VALIDATOR)]);
 
     let mut env = Env { svm, program, vrf, queue, admin, config };
     env.create_battleground(0, BUDGET, STAKE, 8, 6);
@@ -167,6 +161,37 @@ fn setup_on(svm: LiteSVM) -> Env {
     let admin = env.admin.insecure_clone();
     register(&mut env, &admin, 1_000_000_000);
     env
+}
+
+/// The upgradeable loader, which owns each program's ProgramData `[program_id]`.
+const UPGRADEABLE_LOADER: Address = address!("BPFLoaderUpgradeab1e11111111111111111111111");
+
+fn program_data(program: &Address) -> Address {
+    pda(&[program.as_ref()], &UPGRADEABLE_LOADER).0
+}
+
+/// Rewrites a deployed program's ProgramData upgrade authority: the metadata is the `u32` state
+/// tag 3, the `u64` deploy slot, then an `Option<Pubkey>` (tag byte at 12, key at 13..45).
+fn set_upgrade_authority(svm: &mut LiteSVM, program: &Address, authority: Option<&Address>) {
+    let key = program_data(program);
+    let mut account = svm.get_account(&key).unwrap();
+    assert_eq!(u32::from_le_bytes(account.data[0..4].try_into().unwrap()), 3, "ProgramData");
+    account.data[12] = authority.is_some() as u8;
+    account.data[13..45].copy_from_slice(authority.map(|key| key.as_ref()).unwrap_or(&[0; 32]));
+    svm.set_account(key, account).unwrap();
+}
+
+/// `initialize(500, validator)` signed by `admin`, with `data_of`'s ProgramData as the program's.
+fn initialize_ix(program: &Address, admin: &Address, data_of: &Address, validator: Address) -> Instruction {
+    let accounts = vec![
+        meta(*admin, true, true),
+        meta(pda(&[b"config"], program).0, true, false),
+        meta(pda(&[b"identity"], program).0, true, false),
+        meta(SYSTEM, false, false),
+        meta(*program, false, false),
+        meta(program_data(data_of), false, false),
+    ];
+    ix(*program, accounts, disc("initialize", &[&500u16.to_le_bytes()[..], validator.as_ref()].concat()))
 }
 
 impl Env {
@@ -398,14 +423,51 @@ fn initialize_needs_a_validator_identity() {
     for key in [env.config, identity] {
         env.svm.set_account(key, Account::default()).unwrap();
     }
-    let init = |env: &Env, admin: &Keypair, validator: Address| {
-        let accounts = vec![meta(admin.pubkey(), true, true), meta(env.config, true, false), meta(identity, true, false), meta(SYSTEM, false, false)];
-        ix(env.program, accounts, disc("initialize", &[&500u16.to_le_bytes()[..], validator.as_ref()].concat()))
-    };
+    let init = |env: &Env, admin: &Keypair, validator: Address| initialize_ix(&env.program, &admin.pubkey(), &env.program, validator);
     let admin = env.admin.insecure_clone();
     send_expect_reason_with(&mut env, &admin, |env| vec![init(env, &admin, Address::default())], "BadValidator");
     send_with(&mut env, &admin, |env| vec![init(env, &admin, VALIDATOR)]);
     assert_eq!(Address::try_from(&env.svm.get_account(&env.config).unwrap().data[50..82]).unwrap(), VALIDATOR);
+}
+
+#[test]
+fn only_the_upgrade_authority_initializes_and_a_funded_identity_does_not_block_it() {
+    let mut env = setup();
+    let identity = pda(&[b"identity"], &env.program).0;
+    for key in [env.config, identity] {
+        env.svm.set_account(key, Account::default()).unwrap();
+    }
+    let admin = env.admin.insecure_clone();
+    let stranger = Keypair::new();
+    env.fund(&stranger);
+    // A signer that is not the upgrade authority, with the real ProgramData.
+    send_expect_reason_with(&mut env, &stranger, |env| vec![initialize_ix(&env.program, &stranger.pubkey(), &env.program, VALIDATOR)], "NotUpgradeAuthority");
+    // Another program's ProgramData whose authority is the stranger: not this program's.
+    let vrf = env.vrf;
+    set_upgrade_authority(&mut env.svm, &vrf, Some(&stranger.pubkey()));
+    send_expect_reason_with(&mut env, &stranger, |env| vec![initialize_ix(&env.program, &stranger.pubkey(), &env.vrf, VALIDATOR)], "NotUpgradeAuthority");
+    // A program with no upgrade authority (made immutable) cannot be initialized by anyone.
+    let program = env.program;
+    set_upgrade_authority(&mut env.svm, &program, None);
+    send_expect_reason_with(&mut env, &admin, |env| vec![initialize_ix(&env.program, &admin.pubkey(), &env.program, VALIDATOR)], "NotUpgradeAuthority");
+    set_upgrade_authority(&mut env.svm, &program, Some(&admin.pubkey()));
+    assert!(env.svm.get_account(&env.config).is_none_or(|account| account.data.is_empty()), "no failed call made a Config");
+
+    // Lamports sent to the identity address beforehand, short of its rent, are topped up.
+    env.svm.set_account(identity, Account { lamports: 1_000, data: vec![], owner: SYSTEM, executable: false, rent_epoch: 0 }).unwrap();
+    send_with(&mut env, &admin, |env| vec![initialize_ix(&env.program, &admin.pubkey(), &env.program, VALIDATOR)]);
+    let stored = env.svm.get_account(&identity).unwrap();
+    assert_eq!((stored.owner, stored.data.len(), stored.lamports), (env.program, 0, env.svm.minimum_balance_for_rent_exemption(0)));
+    assert_eq!(&env.svm.get_account(&env.config).unwrap().data[8..40], admin.pubkey().as_ref());
+
+    // More than its rent already there: nothing is added.
+    for key in [env.config, identity] {
+        env.svm.set_account(key, Account::default()).unwrap();
+    }
+    env.svm.set_account(identity, Account { lamports: 5_000_000, data: vec![], owner: SYSTEM, executable: false, rent_epoch: 0 }).unwrap();
+    send_with(&mut env, &admin, |env| vec![initialize_ix(&env.program, &admin.pubkey(), &env.program, VALIDATOR)]);
+    assert_eq!(env.balance(&identity), 5_000_000);
+    assert_eq!(env.svm.get_account(&identity).unwrap().owner, env.program);
 }
 
 #[test]

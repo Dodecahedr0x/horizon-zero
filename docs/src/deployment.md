@@ -51,7 +51,7 @@ Without `VITE_RPC_URL`, `VITE_ER_RPC_URL` and `VITE_ORACLE_QUEUE`, `vite dev` us
 `app/scripts/bootstrap.mjs --url <solana rpc> --er-url <rollup rpc> --keypair <file>` makes a cluster playable on its rollup and is safe to repeat. Each step is skipped when it is already done:
 
 1. with `--espl-rent` (local stack only): creates the eSPL program's `[b"rent"]` PDA `4RvdEGaUyChj3AketeBZoY1EotNtPveMFUXL8DVetrAp` with `initRentPdaIx` and funds it with 1 SOL. It pays the temporary account behind every top-up; `mb-stack` ships the program but not the PDA, and without it a top-up fails with "insufficient lamports 300000, need 890880". MagicBlock runs it on devnet and mainnet;
-2. `initialize(500, validator)`: the keypair becomes the admin. `validator` is `--validator`, or the rollup's `getIdentity` (`mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev` locally). On a later run, a Config pinned to another validator stops the script;
+2. `initialize(500, validator)`: the keypair becomes the admin. It must be the program's upgrade authority, or `initialize` fails with `NotUpgradeAuthority` (see [`initialize`](accounts.md#initializefee_bps-u16-validator-pubkey)). `validator` is `--validator`, or the rollup's `getIdentity` (`mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev` locally). On a later run, a Config pinned to another validator stops the script;
 3. `create_battleground` for each battleground in `content/catalog.json`: Outpost 0.01 SOL, Garrison 0.05 SOL, Citadel 0.1 SOL;
 4. `init_treasury_outbox`;
 5. `delegate_config`, `delegate_battleground` for each, and `delegate_treasury_outbox` (skipped while it holds an unreleased claim);

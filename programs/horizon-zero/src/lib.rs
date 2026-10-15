@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_lang::system_program::{self, CreateAccount};
+use anchor_lang::system_program;
 #[cfg(not(feature = "inline-mock-magic"))]
 use ephemeral_rollups_sdk::anchor::{delegate, ephemeral};
 use ephemeral_vrf_sdk::anchor::{vrf, vrf_callback};
@@ -49,6 +49,8 @@ pub mod horizon_zero {
     use super::*;
 
     /// `validator` is the rollup validator every delegate instruction delegates to. Nothing changes it.
+    /// Only the program's upgrade authority may call it (see `Initialize`), so nobody can front-run
+    /// the deployer and become the admin.
     pub fn initialize(ctx: Context<Initialize>, fee_bps: u16, validator: Pubkey) -> Result<()> {
         require!(fee_bps <= fees::MAX_FEE_BPS, HorizonError::FeeTooHigh);
         require!(validator != Pubkey::default(), HorizonError::BadValidator);
@@ -59,12 +61,7 @@ pub mod horizon_zero {
         ctx.accounts.config.bump = ctx.bumps.config;
         let (identity, bump) = Pubkey::find_program_address(&[b"identity"], &ID);
         require_keys_eq!(identity, ctx.accounts.identity.key(), HorizonError::BadPda);
-        create_program_account(
-            ctx.accounts.admin.to_account_info(),
-            ctx.accounts.identity.to_account_info(),
-            0,
-            &[b"identity", &[bump]],
-        )?;
+        create_identity(&ctx.accounts.admin, &ctx.accounts.identity.to_account_info(), &[b"identity", &[bump]])?;
         Ok(())
     }
 
@@ -1098,18 +1095,20 @@ fn account_by_key<'a>(accounts: &'a [AccountInfo<'a>], key: &Pubkey) -> Result<A
         .ok_or_else(|| error!(HorizonError::MissingAccount))
 }
 
-fn create_program_account<'info>(
-    payer: AccountInfo<'info>,
-    account: AccountInfo<'info>,
-    space: usize,
-    signer_seeds: &[&[u8]],
-) -> Result<()> {
-    system_program::create_account(
-        CpiContext::new_with_signer(system_program::ID, CreateAccount { from: payer, to: account }, &[signer_seeds]),
-        Rent::get()?.minimum_balance(space),
-        space as u64,
-        &ID,
-    )
+/// Creates the program identity PDA with space 0, owned by this program. Anyone can send lamports
+/// to its address beforehand, which would make a system `create_account` fail, so it tops the
+/// account up to rent from `payer` when short, then assigns it signed by its seeds.
+fn create_identity<'info>(payer: &Signer<'info>, identity: &AccountInfo<'info>, seeds: &[&[u8]]) -> Result<()> {
+    use anchor_lang::solana_program::{program::invoke_signed, system_instruction};
+    let rent = Rent::get()?.minimum_balance(0);
+    let short = rent.saturating_sub(identity.lamports());
+    if short > 0 {
+        transfer_sol(payer, identity, short)?;
+    }
+    // With space 0 there is nothing to allocate; assign fails unless the account is still the
+    // system program's with no data, so an identity that already exists is refused.
+    invoke_signed(&system_instruction::assign(identity.key, &ID), std::slice::from_ref(identity), &[seeds])?;
+    Ok(())
 }
 
 fn transfer_sol<'info>(from: &Signer<'info>, to: &AccountInfo<'info>, lamports: u64) -> Result<()> {
@@ -1164,6 +1163,13 @@ pub struct Initialize<'info> {
     #[account(mut)]
     pub identity: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
+    /// This program's account; it must point at `program_data`.
+    #[account(constraint = program.programdata_address()? == Some(program_data.key()) @ HorizonError::NotUpgradeAuthority)]
+    pub program: Program<'info, crate::program::HorizonZero>,
+    /// The program's ProgramData `[program_id]` under the upgradeable loader. Its upgrade authority
+    /// must be the signer.
+    #[account(constraint = program_data.upgrade_authority_address == Some(admin.key()) @ HorizonError::NotUpgradeAuthority)]
+    pub program_data: Account<'info, ProgramData>,
 }
 
 #[derive(Accounts)]
