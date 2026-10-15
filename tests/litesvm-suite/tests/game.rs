@@ -1917,6 +1917,12 @@ fn only_the_admin_claims_fees_and_release_pays_the_admin() {
     assert_eq!(outbox_state(&env, &outbox), (admin.pubkey(), FEE));
     send_expect_reason_with(&mut env, &admin, |env| vec![treasury_ix(env, &admin, "fund_treasury_outbox")], "OutboxBusy");
     send_expect_reason_with(&mut env, &stranger, |env| vec![treasury_ix(env, &stranger, "claim_fees")], "NotAdmin");
+    // claim_fees commits Config, so it must be this program's: the same bytes owned by the system
+    // program are refused.
+    let config_account = env.svm.get_account(&env.config).unwrap();
+    env.svm.set_account(env.config, Account { owner: SYSTEM, ..config_account.clone() }).unwrap();
+    send_expect_reason_with(&mut env, &admin, |env| vec![treasury_ix(env, &admin, "claim_fees")], "BadPda");
+    env.svm.set_account(env.config, config_account).unwrap();
 
     let wallet = env.balance(&admin.pubkey());
     send_expect_reason_with(&mut env, &stranger, |env| vec![release_ix(env, outbox, stranger.pubkey())], "ConstraintAddress");
