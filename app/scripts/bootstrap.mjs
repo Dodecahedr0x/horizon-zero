@@ -54,7 +54,6 @@ export async function send(connection, payer, instructions) {
   return signature;
 }
 
-/** The identity a rollup signs with: the validator Config pins and every delegation names. */
 /**
  * The program's upgrade authority from its ProgramData (UpgradeableLoaderState::ProgramData: tag 3
  * u32, slot u64, then an Option<Pubkey>), or null when it has none or the program is not upgradeable.
@@ -65,6 +64,7 @@ export async function upgradeAuthority(base) {
   return new PublicKey(info.data.subarray(13, 45));
 }
 
+/** The identity a rollup signs with: the validator Config pins and every delegation names. */
 export async function rollupIdentity(er) {
   const response = await er._rpcRequest("getIdentity", []);
   if (!response.result?.identity) throw new Error(`the rollup at ${er.rpcEndpoint} did not return its identity`);

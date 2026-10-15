@@ -106,9 +106,25 @@ const payer = output("solana-keygen", ["pubkey", keypair]);
 const balance = output("solana", ["balance", payer, "--url", url]);
 process.stdout.write(`[deploy] ${cluster} via ${url}, payer ${payer} (${balance})\n`);
 
-// An upgrade needs the upgrade authority, and the bootstrap's initialize needs it as the admin.
-const shown = spawnSync("solana", ["program", "show", PROGRAM_ID, "--url", url, "--output", "json"], { cwd: root, encoding: "utf8" });
-if (shown.status === 0) {
+// An upgrade needs the upgrade authority, and the bootstrap's initialize needs it as the admin. Ask
+// the RPC whether the program account exists first: only a confirmed "no account" skips the check,
+// and any RPC failure stops here rather than deploying blind.
+let existing;
+try {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getAccountInfo", params: [PROGRAM_ID, { encoding: "base64" }] }),
+  });
+  const json = await response.json();
+  if (json.error || !json.result) throw new Error(JSON.stringify(json.error ?? json));
+  existing = json.result.value;
+} catch (err) {
+  fail(`getAccountInfo ${PROGRAM_ID} on ${url} failed: ${err.message}`);
+}
+if (existing) {
+  const shown = spawnSync("solana", ["program", "show", PROGRAM_ID, "--url", url, "--output", "json"], { cwd: root, encoding: "utf8" });
+  if (shown.status !== 0) fail(`solana program show ${PROGRAM_ID} failed: ${(shown.stderr || shown.stdout).trim()}`);
   let authority = null;
   try {
     authority = JSON.parse(shown.stdout).authority ?? null;
