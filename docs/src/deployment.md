@@ -67,11 +67,15 @@ It does not create standard behaviors: behaviors live in the rollup and a Player
 2. Unless `--skip-bootstrap`, `--er-url <rollup rpc>` and `--validator <identity>` are required. Before anything is built or any SOL is spent, the script calls `getIdentity` on `--er-url`, prints it, and stops unless `--validator` equals it: the first bootstrap pins that validator in Config for good.
 3. The program keypair `target/deploy/horizon_zero-keypair.json` must be `Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c`, the `declare_id!`. Keep that file; without it the program cannot be upgraded at the same address.
 4. `cargo-build-sbf` with default features, recorded as below. `--skip-build` reuses `target/deploy/horizon_zero.so` only when it is the recorded default build, and stops otherwise. `inline-mock-vrf` and `inline-mock-magic` never reach a real cluster.
-5. When the program is already deployed, its upgrade authority (from `solana program show`) must be the `--keypair` wallet, or the script stops before sending anything.
+5. The script asks the RPC (`getAccountInfo`) whether the program exists, and stops if that call fails. When it exists, its upgrade authority (from `solana program show`, which must succeed) must be the `--keypair` wallet, or the script stops before sending anything.
 6. `solana program deploy` with `--keypair` (default `~/.config/solana/id.json`) as payer and `--upgrade-authority`, and `--with-compute-unit-price` when `--priority` is given.
 7. The bootstrap above with `--er-url`, `--validator` and the same `--keypair`, unless `--skip-bootstrap`. That wallet is the upgrade authority, so `initialize` accepts it and it becomes the admin.
 
 It ends by printing the build variables for the game (`VITE_DEV_MODE=false`, `VITE_RPC_URL`, `VITE_ER_RPC_URL`, and `VITE_ORACLE_QUEUE` = `5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc`) and the indexer's `SOLANA_RPC_URL`, the same rollup URL. `render.yaml` lists `VITE_RPC_URL` and `VITE_ER_RPC_URL` (set them in the dashboard) and `VITE_ORACLE_QUEUE` for the game service, and `SOLANA_RPC_URL` (the rollup) for the indexer.
+
+### Upgrading a live program
+
+An upgrade in place keeps every account, but the Battle layout is now 2155 bytes (`opened_at` at offset 2146). A battle opened by an earlier build is 2147 bytes: the new program cannot read it, so it can no longer be seeded, settled or cancelled, and both stakes stay locked with both armies Fighting. Upgrade only when no battle is open (every battle settled or closed, no army Fighting), or deploy fresh to a new cluster state. The indexer reads only 2155-byte battles too.
 
 ## Build guard
 
