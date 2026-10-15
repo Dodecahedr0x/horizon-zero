@@ -33,6 +33,12 @@ import {
   VRF_PROGRAM_ID,
   battlegroundPda,
   claimFeesIx,
+  BPF_LOADER_UPGRADEABLE_ID,
+  CANCEL_AFTER_SECS,
+  cancelMatchIx,
+  cancellable,
+  cancelledMatch,
+  programDataPda,
   configPda,
   decodeBattle,
   decodeConfig,
@@ -124,7 +130,10 @@ test("the admin's Solana instructions follow the program's account order", () =>
     [configPda(), false, true],
     [identityPda(), false, true],
     [SystemProgram.programId, false, false],
+    [PROGRAM_ID, false, false],
+    [pda([PROGRAM_ID.toBuffer()], BPF_LOADER_UPGRADEABLE_ID), false, false],
   ], Buffer.concat([fee, validator.toBuffer()]));
+  assert.equal(programDataPda().toBase58(), pda([PROGRAM_ID.toBuffer()], new PublicKey("BPFLoaderUpgradeab1e11111111111111111111111")).toBase58());
   const args = Buffer.alloc(13);
   args[0] = 1;
   args.writeUInt16LE(16, 1);
@@ -168,6 +177,7 @@ test("fund_outbox then withdraw, and the treasury pair", () => {
   ], u64(7));
   expect(withdrawIx(owner), "withdraw", [
     [owner, true, true],
+    [playerPda(owner), false, true],
     [outboxPda(owner), false, true],
     [MAGIC_CONTEXT_ID, false, true],
     [MAGIC_PROGRAM_ID, false, false],
@@ -179,7 +189,7 @@ test("fund_outbox then withdraw, and the treasury pair", () => {
   ]);
   expect(claimFeesIx(owner), "claim_fees", [
     [owner, true, true],
-    [configPda(), false, false],
+    [configPda(), false, true],
     [treasuryOutboxPda(), false, true],
     [MAGIC_CONTEXT_ID, false, true],
     [MAGIC_PROGRAM_ID, false, false],
@@ -231,18 +241,33 @@ test("lock_army passes the VRF accounts, then behaviors, candidates and each own
   assert.deepEqual(metas(queues)[5], [matchPda(ground, 9).toBase58(), false, false]);
 });
 
-test("a lock opens a match only when a candidate owner's Player covers the stake", () => {
-  const player = (budget) => {
+test("a lock opens a match only for a Queued army of another wallet whose owner's Player covers the stake", () => {
+  const rival = key(5);
+  const player = (budget, who = rival) => {
     const data = Buffer.alloc(68);
-    owner.toBuffer().copy(data, 8);
+    who.toBuffer().copy(data, 8);
     data.writeBigUInt64LE(BigInt(budget), 40);
     return { owner: PROGRAM_ID, data };
   };
-  assert.equal(lockOpens([], 10n), false, "no candidate: the lock queues");
-  assert.equal(lockOpens([null, player(9)], 10n), false, "a missing Player or a short budget does not match");
-  assert.equal(lockOpens([player(9), player(10)], 10n), true, "one owner whose budget covers the stake is enough");
-  assert.equal(lockOpens([{ ...player(10), owner: SystemProgram.programId }], 10n), false, "a Player the program does not own is ignored");
-  assert.equal(lockOpens([{ owner: PROGRAM_ID, data: Buffer.alloc(49) }], 10n), false, "an account that is not a Player is ignored");
+  const army = (status, who = rival) => {
+    const data = Buffer.alloc(1360);
+    who.toBuffer().copy(data, 8);
+    data[1358] = status;
+    return { owner: PROGRAM_ID, data };
+  };
+  const opens = (armies, players) => lockOpens({ locker: owner, stake: 10n, armies, players });
+  assert.equal(opens([], []), false, "no candidate: the lock queues");
+  assert.equal(opens([army(1)], [null]), false, "a missing Player does not match");
+  assert.equal(opens([army(1)], [player(9)]), false, "a short budget does not match");
+  assert.equal(opens([army(1)], [player(9), player(10)]), true, "one owner whose budget covers the stake is enough");
+  assert.equal(opens([army(1)], [{ ...player(10), owner: SystemProgram.programId }]), false, "a Player the program does not own is ignored");
+  assert.equal(opens([army(1)], [{ owner: PROGRAM_ID, data: Buffer.alloc(49) }]), false, "an account that is not a Player is ignored");
+  assert.equal(opens([army(0)], [player(10)]), false, "an Idle army is not matched");
+  assert.equal(opens([army(2)], [player(10)]), false, "a Fighting army is not matched");
+  assert.equal(opens([army(1, owner)], [player(10, owner)]), false, "the locker's own army is not matched");
+  assert.equal(opens([null, { ...army(1), owner: SystemProgram.programId }], [player(10)]), false, "a missing or foreign army is ignored");
+  assert.equal(opens([army(1, key(6))], [player(10)]), false, "the funded Player must be the army owner's");
+  assert.equal(opens([army(0), army(1)], [player(10)]), true, "a later Queued candidate still matches");
 });
 
 test("settle_match passes the battle, both armies, both Players, Config and the ephemeral accounts", () => {
@@ -257,6 +282,34 @@ test("settle_match passes the battle, both armies, both Players, Config and the 
     [EPHEMERAL_VAULT_ID, false, true],
     [MAGIC_PROGRAM_ID, false, false],
   ]);
+});
+
+test("cancel_match passes the battle, both armies, both Players and the ephemeral accounts", () => {
+  const match = { pubkey: key(8).toBase58(), armyA: key(9).toBase58(), armyB: key(10).toBase58(), playerA: key(11).toBase58(), playerB: key(12).toBase58() };
+  expect(cancelMatchIx(match), "cancel_match", [
+    [key(8), false, true],
+    [key(9), false, true],
+    [key(10), false, true],
+    [playerPda(key(11)), false, true],
+    [playerPda(key(12)), false, true],
+    [EPHEMERAL_VAULT_ID, false, true],
+    [MAGIC_PROGRAM_ID, false, false],
+  ]);
+});
+
+test("a battle is cancellable only while Awaiting, CANCEL_AFTER_SECS after it opened", () => {
+  assert.equal(CANCEL_AFTER_SECS, 600);
+  const opened = 1_792_016_933;
+  assert.equal(cancellable({ status: 0, openedAt: opened }, opened + 599), false, "too early");
+  assert.equal(cancellable({ status: 0, openedAt: opened }, opened + 600), true, "the program's own bound");
+  assert.equal(cancellable({ status: 2, openedAt: opened }, opened + 9_999), false, "seeded: settle instead");
+  assert.equal(cancellable({ status: 1, openedAt: opened }, opened + 9_999), false, "resolved");
+  assert.equal(cancellable({ status: 3, openedAt: opened }, opened + 9_999), false, "already cancelled");
+  assert.equal(cancellable({ status: 0, openedAt: null }, opened), false, "unknown open time");
+  assert.equal(cancellable({ status: 0 }, opened), false, "no open time");
+  const battle = key(8).toBase58();
+  assert.equal(cancelledMatch([`Program log: HZ_PLAYER ${battle}`, `Program log: HZ_MATCH_CANCELLED ${battle}`], battle), true);
+  assert.equal(cancelledMatch([`Program log: HZ_MATCH_CANCELLED ${key(9).toBase58()}`], battle), false);
 });
 
 test("decoders read the documented offsets", () => {
@@ -282,7 +335,7 @@ test("decoders read the documented offsets", () => {
   outbox.writeBigUInt64LE(7n, 40);
   assert.deepEqual(decodeOutbox(outbox), { owner: owner.toBase58(), amount: "7" });
 
-  const battle = Buffer.alloc(2147);
+  const battle = Buffer.alloc(2155);
   [8, 40, 72, 104, 136].forEach((at, i) => key(20 + i).toBuffer().copy(battle, at));
   battle.writeBigUInt64LE(10_000_000n, 168);
   battle.writeBigUInt64LE(3n, 176);
@@ -304,7 +357,11 @@ test("decoders read the documented offsets", () => {
   battle.fill(0xab, 2109, 2141);
   battle[2142] = 1;
   battle.writeUInt16LE(500, 2144);
+  battle.writeBigInt64LE(1_792_016_933n, 2146);
+  battle[2154] = 253;
   const decoded = decodeBattle(key(30), battle);
+  assert.equal(decoded.openedAt, 1_792_016_933);
+  assert.equal(decodeBattle(key(30), Buffer.alloc(2147)), null, "the layout before opened_at is not read");
   assert.equal(decoded.battleground, key(20).toBase58());
   assert.equal(decoded.playerB, key(24).toBase58());
   assert.equal(decoded.stake, "10000000");

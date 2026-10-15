@@ -43,8 +43,10 @@ function programFail(name) {
   return err;
 }
 
-// The program's `fees.rs`.
-export const DEFAULT_FEE_BPS = 500;
+// The fee rate the dev Config row starts at. The program has no default: `initialize` takes one, and
+// app/scripts/bootstrap.mjs passes its FEE_BPS (also 500), so dev mode starts where a fresh cluster does.
+export const DEV_INITIAL_FEE_BPS = 500;
+// The program's `fees::MAX_FEE_BPS`.
 export const MAX_FEE_BPS = 1000;
 const U64_MAX = 2n ** 64n - 1n;
 
@@ -241,7 +243,7 @@ export function createLedger(dbPath, options = {}) {
       }
       const user = identity("user");
       // The local user is the dev admin: it is the only one who can sign in dev mode.
-      db.prepare("INSERT OR IGNORE INTO config (id, admin, fee_bps, fees) VALUES (0, ?, ?, '0')").run(user.id, DEFAULT_FEE_BPS);
+      db.prepare("INSERT OR IGNORE INTO config (id, admin, fee_bps, fees) VALUES (0, ?, ?, '0')").run(user.id, DEV_INITIAL_FEE_BPS);
       const insertGround = db.prepare(`INSERT OR IGNORE INTO battlegrounds
         (id, pubkey, name, budget, stake, cols, rows, queue, match_seq)
         VALUES (?, ?, ?, ?, ?, ?, ?, '[]', 0)`);

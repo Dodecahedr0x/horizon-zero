@@ -7,6 +7,7 @@ import {
   PLAYER_LEN,
   PROGRAM_ID,
   armyPda,
+  cancelMatchIx,
   claimFeesIx,
   closeArmyIx,
   computeBudgetIx,
@@ -155,6 +156,13 @@ async function until<T>(ms: number, check: () => Promise<T | null>) {
     if (Date.now() >= end) return null;
     await sleep(POLL_MS);
   }
+}
+
+/** An indexer match row: its `openAt` is the battle's `opened_at` (or, failing that, when it was first seen). */
+type IndexedMatch = Match & { openAt?: number | null };
+
+function fromIndexer(row: IndexedMatch): Match {
+  return { ...row, openedAt: row.openedAt ?? row.openAt ?? null };
 }
 
 type UnitRow = { kind: number; behavior: string; body?: number[]; elements?: ElementSpec[]; col: number; row: number };
@@ -411,8 +419,8 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
   /** The settled match. An unknown outcome comes from the indexer, or stays 0 (pending) until it has the row. */
   async function resolved(match: Match, outcome: number | null): Promise<Match> {
     if (outcome !== null) return { ...match, status: 1, outcome };
-    const indexed = await read<Match | null>(`/matches/${match.pubkey}`).catch(() => null);
-    return indexed || { ...match, status: 1 };
+    const indexed = await read<IndexedMatch | null>(`/matches/${match.pubkey}`).catch(() => null);
+    return indexed ? fromIndexer(indexed) : { ...match, status: 1 };
   }
 
   /** Polls a new battle until VRF seeds it, then settles it. Returns it still Awaiting if the seed is late. */
@@ -462,6 +470,7 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
     const queued = state.queue.map((key) => new PublicKey(key));
     const heads = queued.length ? await er.getMultipleAccountsInfo(queued) : [];
     const candidates: { army: PublicKey; owner: PublicKey }[] = [];
+    const candidateInfos: (AccountInfo<Buffer> | null)[] = [];
     const owners = new Set<string>();
     for (const [i, info] of heads.entries()) {
       const head = info ? decodeArmyHead(info.data) : null;
@@ -469,13 +478,14 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
       const added = owners.has(head.owner) ? 1 : 2;
       if (LOCK_FIXED_ACCOUNTS + behaviors.length + candidates.length + owners.size + added > LOCK_ACCOUNT_LIMIT) break;
       candidates.push({ army: queued[i], owner: new PublicKey(head.owner) });
+      candidateInfos.push(info);
       owners.add(head.owner);
     }
     // The program matches a candidate whose owner's budget covers the stake. Only then does the
     // lock create the battle, and only then may the battle be passed writable (see lockArmyIx).
     const ownerKeys = [...owners].map((key) => playerPda(new PublicKey(key)));
     const players = ownerKeys.length ? await er.getMultipleAccountsInfo(ownerKeys) : [];
-    const opens = lockOpens(players, lamports(state.stake));
+    const opens = lockOpens({ locker: owner, stake: lamports(state.stake), armies: candidateInfos, players });
     await send(er, computeBudgetIx(), lockArmyIx({
       player: owner,
       battlegroundId: state.battlegroundId,
@@ -657,6 +667,15 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
     async settle(match) {
       await settleOnce(match);
     },
+    async cancel(match) {
+      // Read the battle as the rollup holds it: the indexer's row may lag a seed that just landed.
+      const key = new PublicKey(match.pubkey);
+      const info = await er.getAccountInfo(key);
+      const live = info ? decodeBattle(key, info.data) : null;
+      if (!live) throw new Error("This battle is no longer open: it was settled or cancelled already");
+      if (live.status === 2) throw new Error("The seed has landed: settle this battle instead");
+      await send(er, cancelMatchIx(live));
+    },
     async admin() {
       const info = await er.getAccountInfo(configPda());
       const state = info ? decodeConfig(info.data) : null;
@@ -677,12 +696,12 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
       await send(er, setFeeIx(me(), bps));
     },
     async matches(owner) {
-      const all = await read<Match[]>("/matches");
-      return all.filter((item) => item.playerA === owner || item.playerB === owner).slice(0, 20);
+      const all = await read<IndexedMatch[]>("/matches");
+      return all.filter((item) => item.playerA === owner || item.playerB === owner).slice(0, 20).map(fromIndexer);
     },
     async match(pubkey) {
-      const indexed = await read<Match | null>(`/matches/${pubkey}`).catch(() => null);
-      if (indexed) return indexed;
+      const indexed = await read<IndexedMatch | null>(`/matches/${pubkey}`).catch(() => null);
+      if (indexed) return fromIndexer(indexed);
       // A battle the indexer has not seen yet, still open in the rollup.
       const key = new PublicKey(pubkey);
       const info = await er.getAccountInfo(key);

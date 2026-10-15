@@ -490,6 +490,7 @@ button, input, select { font: inherit; color: inherit; }
 .log__row--defeat .log__outcome { color: var(--cold); }
 .log__row--draw .log__outcome { color: var(--bone-dim); }
 .log__row--pending .log__outcome { color: var(--muted); font: italic 500 15px var(--text); }
+.log__row--cancelled .log__outcome { color: var(--muted); }
 
 .log__row--victory { background: linear-gradient(90deg, rgba(232, 118, 58, 0.1), transparent 45%); }
 

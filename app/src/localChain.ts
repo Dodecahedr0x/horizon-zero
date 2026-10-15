@@ -97,6 +97,10 @@ export function createLocalChain(): LocalChain {
     },
     // The ledger settles a battle inside `lock`, so there is never a Seeded battle to settle.
     async settle() {},
+    // Nor an Awaiting one to cancel. The UI never offers it in dev mode; a call is a bug, so say so.
+    async cancel() {
+      throw new Error("Dev mode settles every battle as it opens; there is nothing to cancel");
+    },
     admin() {
       return request<ProtocolConfig>("GET", "/config");
     },

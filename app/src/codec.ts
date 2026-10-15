@@ -36,6 +36,9 @@ export const VRF_PROGRAM_ID = new PublicKey("Vrf1RNUjXmQGjmQrQLvJHs9SNkvDJEsRVFP
 export const DEFAULT_EPHEMERAL_QUEUE = new PublicKey("5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc");
 export const EPHEMERAL_TEST_QUEUE = new PublicKey("Sc9MJUngNbQXSXGP3F67KvKwVnhaYn6kcioxXNVowYT");
 export const SLOT_HASHES = new PublicKey("SysvarS1otHashes111111111111111111111111111");
+export const BPF_LOADER_UPGRADEABLE_ID = new PublicKey("BPFLoaderUpgradeab1e11111111111111111111111");
+/** The program's `CANCEL_AFTER_SECS`: how long a battle waits for its VRF seed before anyone may cancel it. */
+export const CANCEL_AFTER_SECS = 600;
 export { DELEGATION_PROGRAM_ID, EPHEMERAL_VAULT_ID, MAGIC_CONTEXT_ID, MAGIC_PROGRAM_ID };
 
 export type CastSpec = { damage: number; range: number; aoe: number; effect: number; aim: number; power: number; rounds: number; cooldown: number };
@@ -162,12 +165,17 @@ export function identityPda() {
   return PublicKey.findProgramAddressSync([Buffer.from("identity")], PROGRAM_ID)[0];
 }
 
+/** The program's ProgramData `[program_id]` under the upgradeable loader; it records the upgrade authority. */
+export function programDataPda() {
+  return PublicKey.findProgramAddressSync([PROGRAM_ID.toBuffer()], BPF_LOADER_UPGRADEABLE_ID)[0];
+}
+
 export const PLAYER_LEN = 68;
 export const CONFIG_LEN = 83;
 export const OUTBOX_LEN = 49;
 export const BATTLEGROUND_LEN = 576;
 export const ARMY_LEN = 1360;
-export const BATTLE_LEN = 2147;
+export const BATTLE_LEN = 2155;
 
 function view(data: Uint8Array) {
   return new DataView(data.buffer, data.byteOffset, data.byteLength);
@@ -253,7 +261,10 @@ function snapshotUnit(data: Uint8Array, at: number, race: number) {
   };
 }
 
-/** `Battle`, shaped like the indexer's match rows. `status` 0 Awaiting, 2 Seeded; `seed` is hex. */
+/**
+ * `Battle`, shaped like the indexer's match rows. `status` 0 Awaiting, 2 Seeded; `seed` is hex.
+ * `openedAt` is the Clock unix time `lock_army` opened it (offset 2146), which `cancel_match` waits from.
+ */
 export function decodeBattle(pubkey: PublicKey, data: Uint8Array) {
   if (data.length !== BATTLE_LEN) return null;
   const v = view(data);
@@ -278,6 +289,7 @@ export function decodeBattle(pubkey: PublicKey, data: Uint8Array) {
     seed: hex(data.subarray(2109, 2141)),
     outcome: data[2141],
     feeBps: v.getUint16(2144, true),
+    openedAt: Number(v.getBigInt64(2146, true)),
   };
 }
 
@@ -295,6 +307,19 @@ export function resolvedMatch(logs: readonly string[], battle: string) {
   return null;
 }
 
+/** `HZ_MATCH_CANCELLED <battle>` for `battle`: true when a log line has it. */
+export function cancelledMatch(logs: readonly string[], battle: string) {
+  return logs.some((line) => {
+    const at = line.indexOf("HZ_MATCH_CANCELLED ");
+    return at >= 0 && line.slice(at).split(" ")[1] === battle;
+  });
+}
+
+/** Whether `cancel_match` may end `match` at unix time `now`: Awaiting, and `CANCEL_AFTER_SECS` after it opened. */
+export function cancellable(match: { status: number; openedAt?: number | null }, now: number) {
+  return match.status === 0 && typeof match.openedAt === "number" && match.openedAt > 0 && now >= match.openedAt + CANCEL_AFTER_SECS;
+}
+
 /** The outcome byte of `resolvedMatch`, or null. */
 export function resolvedOutcome(logs: readonly string[], battle: string) {
   return resolvedMatch(logs, battle)?.outcome ?? null;
@@ -309,7 +334,7 @@ export const PROGRAM_ERRORS: readonly (readonly [name: string, message: string])
   ["TooManyUnits", "An army can have at most 10 units"],
   ["BadRace", "Race is not in the catalog"],
   ["BadStatus", "Army cannot be changed in its current status"],
-  ["NotAdmin", "Battleground admin signature is required"],
+  ["NotAdmin", "Config admin signature is required"],
   ["OwnArmy", "You cannot match your own army"],
   ["NoStake", "Account does not hold the stake"],
   ["AlreadyResolved", "Match is already resolved"],
@@ -327,7 +352,7 @@ export const PROGRAM_ERRORS: readonly (readonly [name: string, message: string])
   ["DuplicatePosition", "Two units in one army cannot share a tile"],
   ["FeeTooHigh", "Fee rate is above the cap"],
   ["BudgetTooLow", "Player budget does not cover the battleground stake"],
-  ["PlayerBusy", "Player has battles that have not settled"],
+  ["PlayerBusy", "Player has too many battles that have not settled"],
   ["BalanceShort", "Player holds less than the amount asked for"],
   ["RentShort", "Player free balance does not cover the account rent"],
   ["OutboxBusy", "Outbox still holds an unreleased withdrawal"],
@@ -335,6 +360,9 @@ export const PROGRAM_ERRORS: readonly (readonly [name: string, message: string])
   ["NotSeeded", "Battle has no VRF seed yet"],
   ["NothingToWithdraw", "There is nothing to withdraw"],
   ["BadValidator", "Validator identity must be set"],
+  ["NotUpgradeAuthority", "Only the program's upgrade authority may initialize"],
+  ["TooEarly", "Battle cannot be cancelled before its wait is over"],
+  ["AlreadySeeded", "Battle is seeded: settle it instead"],
 ];
 
 /** The program error for an Anchor custom code, or null for any other code. */
@@ -418,12 +446,26 @@ function delegateIx(name: string, signerKey: PublicKey, account: PublicKey) {
   return ix(name, [signer(signerKey), readonly(configPda()), ...head, ...tail]);
 }
 
-/** Solana, once. The signer becomes the admin; `validator` is the rollup every delegation goes to. */
+/**
+ * Solana, once. The signer becomes the admin and must be the program's upgrade authority (the
+ * program checks ProgramData); `validator` is the rollup every delegation goes to.
+ */
 export function initializeIx(admin: PublicKey, feeBps: number, validator: PublicKey) {
   const rest = new Uint8Array(34);
   new DataView(rest.buffer).setUint16(0, feeBps, true);
   rest.set(validator.toBytes(), 2);
-  return ix("initialize", [signer(admin), writable(configPda()), writable(identityPda()), readonly(SystemProgram.programId)], rest);
+  return ix(
+    "initialize",
+    [
+      signer(admin),
+      writable(configPda()),
+      writable(identityPda()),
+      readonly(SystemProgram.programId),
+      readonly(PROGRAM_ID),
+      readonly(programDataPda()),
+    ],
+    rest,
+  );
 }
 
 /** Solana, admin. */
@@ -500,9 +542,12 @@ export function fundOutboxIx(owner: PublicKey, lamports: bigint) {
   return ix("fund_outbox", [signer(owner, false), writable(playerPda(owner)), writable(outboxPda(owner))], u64(lamports));
 }
 
-/** Rollup. Schedules the funded Outbox's commit-and-undelegate; `release_outbox` then pays the wallet on Solana. */
+/**
+ * Rollup. Schedules one bundle: a commit of the owner's Player (it stays delegated) and the funded
+ * Outbox's commit-and-undelegate; `release_outbox` then pays the wallet on Solana.
+ */
 export function withdrawIx(owner: PublicKey) {
-  return ix("withdraw", [signer(owner), writable(outboxPda(owner)), ...magic()]);
+  return ix("withdraw", [signer(owner), writable(playerPda(owner)), writable(outboxPda(owner)), ...magic()]);
 }
 
 /** Solana, permissionless. Pays an undelegated Outbox's amount to its recorded owner. */
@@ -522,9 +567,9 @@ export function fundTreasuryOutboxIx(admin: PublicKey) {
   return ix("fund_treasury_outbox", [signer(admin, false), writable(configPda()), writable(treasuryOutboxPda())]);
 }
 
-/** Rollup, admin. `withdrawIx` for the treasury Outbox. */
+/** Rollup, admin. `withdrawIx` for the treasury Outbox: commits Config with it. */
 export function claimFeesIx(admin: PublicKey) {
-  return ix("claim_fees", [signer(admin), readonly(configPda()), writable(treasuryOutboxPda()), ...magic()]);
+  return ix("claim_fees", [signer(admin), writable(configPda()), writable(treasuryOutboxPda()), ...magic()]);
 }
 
 /** Rollup, permissionless. Pays out a Seeded battle and closes it. */
@@ -536,6 +581,21 @@ export function settleMatchIx(match: { pubkey: string; armyA: string; armyB: str
     writable(playerPda(new PublicKey(match.playerA))),
     writable(playerPda(new PublicKey(match.playerB))),
     writable(configPda()),
+    ...ephemeral(),
+  ]);
+}
+
+/**
+ * Rollup, permissionless. Ends an Awaiting battle `CANCEL_AFTER_SECS` after it opened: both stakes
+ * go back to their budgets, both armies become Idle, and the battle's rent goes to side B's Player.
+ */
+export function cancelMatchIx(match: { pubkey: string; armyA: string; armyB: string; playerA: string; playerB: string }) {
+  return ix("cancel_match", [
+    writable(new PublicKey(match.pubkey)),
+    writable(new PublicKey(match.armyA)),
+    writable(new PublicKey(match.armyB)),
+    writable(playerPda(new PublicKey(match.playerA))),
+    writable(playerPda(new PublicKey(match.playerB))),
     ...ephemeral(),
   ]);
 }
@@ -629,16 +689,27 @@ export function lockArmyIx(args: {
   return ix("lock_army", keys);
 }
 
+type Fetched = { owner: PublicKey; data: Uint8Array } | null;
+
 /**
  * Whether a `lock_army` offering these candidates opens a match, and so must pass the battle
- * writable (see `lockArmyIx`): the program matches a candidate whose owner's Player, owned by this
- * program, has a budget that covers the stake. `players` are the candidates' owners' Player
- * accounts as the rollup returned them, null when missing.
+ * writable (see `lockArmyIx`). It mirrors the program's `queued_opponents`: a candidate counts only
+ * when its army, owned by this program, is Queued and not the locker's own, and its owner's Player,
+ * owned by this program, has a budget that covers the stake. `armies` are the candidate armies and
+ * `players` their owners' Player accounts as the rollup returned them, null when missing.
  */
-export function lockOpens(players: readonly ({ owner: PublicKey; data: Uint8Array } | null)[], stake: bigint) {
-  return players.some((info) => {
+export function lockOpens(args: { locker: PublicKey; stake: bigint; armies: readonly Fetched[]; players: readonly Fetched[] }) {
+  const budgets = new Map<string, bigint>();
+  for (const info of args.players) {
     const player = info && info.owner.equals(PROGRAM_ID) ? decodePlayer(info.data) : null;
-    return player !== null && BigInt(player.budget) >= stake;
+    if (player) budgets.set(player.owner, BigInt(player.budget));
+  }
+  const locker = args.locker.toBase58();
+  return args.armies.some((info) => {
+    const army = info && info.owner.equals(PROGRAM_ID) ? decodeArmyHead(info.data) : null;
+    if (!army || army.status !== 1 || army.owner === locker) return false;
+    const budget = budgets.get(army.owner);
+    return budget !== undefined && budget >= args.stake;
   });
 }
 

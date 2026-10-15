@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { Board, type Piece } from "./board";
-import { BATTLEGROUNDS, RACES, STANDARDS, ZONE_DEPTH, behaviorLabel, encodeBehavior, raceById, unitSpec, type ElementSpec } from "./codec";
+import { BATTLEGROUNDS, CANCEL_AFTER_SECS, RACES, STANDARDS, ZONE_DEPTH, behaviorLabel, cancellable, encodeBehavior, raceById, unitSpec, type ElementSpec } from "./codec";
 import type { Army, Behavior, ChainAdapter, DraftUnit, Match, PlayerBalance, ProtocolConfig } from "./devChain";
 import { randomSeed, replay, simulateTrial } from "./replay";
 import { chronicle, cueFor, healthAt, HealthBar } from "./battleParts";
@@ -36,12 +36,14 @@ function groundOf(match: Pick<Match, "cols" | "rows">) {
 }
 
 function outcomeFor(match: Match, side: number) {
+  if (match.status === 3) return "cancelled";
   if (match.status === 0 || !match.outcome) return "pending";
   if (match.outcome === 3) return "draw";
   return match.outcome === side + 1 ? "victory" : "defeat";
 }
 
-const OUTCOME_LABEL: Record<string, string> = { victory: "Victory", defeat: "Defeat", draw: "Draw", pending: "Awaiting the seed" };
+const OUTCOME_LABEL: Record<string, string> = { victory: "Victory", defeat: "Defeat", draw: "Draw", pending: "Awaiting the seed", cancelled: "Cancelled" };
+const CANCEL_TITLE = `The seed never came. ${CANCEL_AFTER_SECS / 60} minutes after the battle opened anyone may cancel it: both stakes go back to their budgets and both armies come home.`;
 
 function Section({ title, aside, children, tour }: { title: string; aside?: ReactNode; children: ReactNode; tour?: string }) {
   return (
@@ -108,6 +110,8 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
   const [touring, setTouring] = useState(false);
   const [doomed, setDoomed] = useState("");
   const [busy, setBusy] = useState(false);
+  // The clock the battle log compares open times with, to offer Cancel once a seed is overdue.
+  const [now, setNow] = useState(() => Date.now());
   // undefined until the first read; null when the wallet has no Player yet.
   const [player, setPlayer] = useState<PlayerBalance | null | undefined>(undefined);
   const [config, setConfig] = useState<ProtocolConfig | null>(null);
@@ -176,6 +180,11 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
     }, 15_000);
     return () => window.clearInterval(timer);
   }, [connected, chain]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 15_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     window.scrollTo(0, 0);
@@ -589,7 +598,9 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
                       </span>
                       {item.status === 2
                         ? <button type="button" className="hz-button mini" disabled={busy} title="The seed has landed; settle the battle to pay the stakes" onClick={() => run(() => chain.settle(item))}>Settle</button>
-                        : <button type="button" className="hz-button mini quiet" disabled={outcome === "pending"} onClick={() => watch(item)}>Watch</button>}
+                        : !devMode && cancellable(item, Math.floor(now / 1000))
+                          ? <button type="button" className="hz-button mini" disabled={busy} title={CANCEL_TITLE} aria-label={`Cancel: ${CANCEL_TITLE}`} onClick={() => run(async () => { await chain.cancel(item); setNotice("The battle is cancelled. Both stakes are back in their budgets."); })}>Cancel</button>
+                          : <button type="button" className="hz-button mini quiet" disabled={outcome === "pending" || outcome === "cancelled"} onClick={() => watch(item)}>Watch</button>}
                     </li>
                   );
                 })}

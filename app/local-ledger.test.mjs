@@ -477,8 +477,8 @@ test("setFee and claimFees are admin only, setFee is capped, and a claim zeroes 
 
     const admin = t.api("GET", "/config").admin;
     t.raw((db) => db.prepare("UPDATE config SET admin = 'someone-else'").run());
-    refused(() => t.api("POST", "/config/claim"), "NotAdmin", "Battleground admin signature is required");
-    refused(() => t.api("POST", "/config/fee", { bps: 100 }), "NotAdmin", "Battleground admin signature is required");
+    refused(() => t.api("POST", "/config/claim"), "NotAdmin", "Config admin signature is required");
+    refused(() => t.api("POST", "/config/fee", { bps: 100 }), "NotAdmin", "Config admin signature is required");
     t.raw((db) => db.prepare("UPDATE config SET admin = ?").run(admin));
 
     assert.deepEqual(t.api("POST", "/config/claim"), { admin, feeBps: 1000, fees: "0" });

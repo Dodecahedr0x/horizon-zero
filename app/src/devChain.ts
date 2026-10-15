@@ -55,6 +55,12 @@ export type MatchUnit = {
   cast?: CastSpec;
   race?: number;
 };
+/**
+ * A battle. `status`: 0 Awaiting its VRF seed, 1 Resolved, 2 Seeded (ready to settle), 3 Cancelled
+ * (the indexer's value for a battle `cancel_match` closed; the chain account is gone then).
+ * `openedAt` is the unix time `lock_army` opened it, when known: `cancel_match` waits
+ * `CANCEL_AFTER_SECS` from it.
+ */
 export type Match = {
   pubkey: string;
   battleground: string;
@@ -70,6 +76,7 @@ export type Match = {
   status: number;
   seed: string;
   outcome: number;
+  openedAt?: number | null;
 };
 
 export interface ChainAdapter {
@@ -104,6 +111,12 @@ export interface ChainAdapter {
   setSegregation(segregate: boolean): Promise<void>;
   /** Settles a Seeded battle. Anyone may. */
   settle(match: Match): Promise<void>;
+  /**
+   * Cancels an Awaiting battle whose seed never came, `CANCEL_AFTER_SECS` after it opened: both
+   * stakes go back to their budgets. Anyone may. Dev mode settles every battle inside `lock`, so
+   * there it always throws.
+   */
+  cancel(match: Match): Promise<void>;
   /** Config, or null before `initialize`. */
   admin(): Promise<ProtocolConfig | null>;
   /** Admin only: pays every claimable fee to the admin wallet through the treasury Outbox. */
