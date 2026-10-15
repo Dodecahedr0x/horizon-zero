@@ -12,16 +12,24 @@ flowchart TB
   end
   Ledger["local ledger sqlite"]
   subgraph chain [On-chain program Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c]
-    Config["Config"]
-    Battleground["Battleground"]
-    Behavior["Behavior"]
-    Army["Army"]
-    Player["Player"]
-    Battle["Battle"]
-    Identity["program identity"]
+    subgraph rollup [Rollup: delegated and ephemeral accounts]
+      Config["Config"]
+      Battleground["Battleground"]
+      Player["Player"]
+      Outbox["Outbox"]
+      Treasury["treasury Outbox"]
+      Behavior["Behavior, ephemeral"]
+      Army["Army, ephemeral"]
+      Battle["Battle, ephemeral"]
+    end
+    subgraph solana [Solana]
+      Identity["program identity"]
+      Release["release_outbox"]
+    end
   end
+  Wallet["owner or admin wallet"]
   subgraph vrfbox [VRF Vrf1RNUjXmQGjmQrQLvJHs9SNkvDJEsRVFPkfSQUwGz]
-    Queue["oracle queue"]
+    Queue["ephemeral oracle queue"]
     Scoped["scoped identity"]
   end
   Indexer["Carbon indexer sqlite"]
@@ -35,11 +43,16 @@ flowchart TB
   App --> Army
   Army --> Battleground
   Army --> Behavior
-  App --> Player
+  App -->|"register and delegate on Solana, top up"| Player
   Player -->|"sponsors"| Army
   Player -->|"sponsors"| Battle
   Battle -->|"settle_match pays"| Player
   Battle -->|"fee"| Config
+  Player -->|"fund_outbox"| Outbox
+  Config -->|"fund_treasury_outbox"| Treasury
+  Outbox -->|"withdraw: commit the Player,<br/>commit and undelegate the Outbox"| Release
+  Treasury -->|"claim_fees: commit Config,<br/>commit and undelegate the treasury Outbox"| Release
+  Release -->|"amount"| Wallet
   Battleground --> Battle
   Battle --> Queue
   Identity --> Queue
@@ -66,7 +79,7 @@ The program does not hardcode battleground names, budgets, stakes, or grid sizes
 | 1 | Garrison | 16 | 50,000,000 | 0.05 | 10×8 |
 | 2 | Citadel | 32 | 100,000,000 | 0.1 | 12×10 |
 
-Stakes stay on the Players until `settle_match`. The winner of a resolved battle gets the pot, `2 * stake`, less a protocol fee of `fee_bps` basis points of the pot (at most `1000`; `DEFAULT_FEE_BPS` is `500`, 5%): the loser's Player sends `stake - fee` to the winner's Player and `fee` to Config, where it counts toward `config.fees`. The admin sets the rate with `set_fee`. A draw takes no fee and returns each stake to its budget. A win credits the winner's budget, or their separate winnings when the owner turned segregation on. `settle_match` closes the battle account and refunds its rent to the Player that paid it.
+Stakes stay on the Players until `settle_match`. The winner of a resolved battle gets the pot, `2 * stake`, less a protocol fee of `fee_bps` basis points of the pot (at most `1000`; the bootstrap sets `500`, 5%): the loser's Player sends `stake - fee` to the winner's Player and `fee` to Config, where it counts toward `config.fees`. The admin sets the rate with `set_fee`. A draw takes no fee and returns each stake to its budget. A win credits the winner's budget, or their separate winnings when the owner turned segregation on. `settle_match` closes the battle account and refunds its rent to the Player that paid it.
 
 A player registers once with `register_player`, which creates their Player account and deposits lamports into it, and moves lamports into the budget with `fund_budget`. Behaviors, armies and battles are ephemeral rollup accounts whose rent the Player's free lamports pay. A queued army can `unlock_army`; it holds no stake, so nothing moves. A fighting army cannot. `settle_match` sets both armies back to Idle. An Idle army can be deleted with `close_army`, which returns its rent to the owner's Player.
 

@@ -49,6 +49,8 @@ The program reads `SlotHashes`. When the account has at least 48 bytes and the l
 
 `pick` is the first 8 bytes of that hash as a little-endian `u64`, modulo the candidate count. Candidates stay in queue order.
 
+The locker chooses which queued armies to pass, and only passed armies are candidates (see [`lock_army`](accounts.md#lock_army)). A locker can therefore pass a single army and meet exactly that opponent, or leave out armies they would rather not face. The slot hash picks only among what the locker offered. This is a known property of the design, not a check the program makes: every queued army accepted the battleground's stake by queuing, and the outcome still depends on the VRF seed, which neither player controls.
+
 ## Stakes
 
 A player registers once with `register_player`, which creates their Player and moves a deposit into it. `fund_budget` moves free lamports into the budget. The player then locks as many armies as they like, on any battleground. Every one of them stakes from that one budget, and none of them holds lamports while it waits. When a locker matches, the program picks among the queued armies of other players whose budget still covers a stake, so a player never fights their own armies and never stakes more than the budget holds. Locking itself is refused unless the locker's own budget covers one stake.
@@ -203,3 +205,9 @@ The battle itself runs in `settle_match`, in its own transaction with up to 1 40
 | Citadel | 10 v 10 | about 781 000 CU |
 
 The worst battle in the compute benchmark ([Testing](testing.md#compute-benchmark)) uses about 880 000 CU, under two thirds of the transaction limit. Its Citadel armies now fill up to 10 units; with the old cap of 6 the worst battle used about 653 000 CU. The settlement reads only the battle's filled snapshot slots onto the heap: the SBF heap is 32 KB and the simulation needs most of it. The engine work described under [On-chain cost](battle.md#on-chain-cost) brought Citadel down from more than 1 270 000 CU, which did not fit even a whole transaction.
+
+## Known limitations
+
+- **No way out for a Player.** The program has no instruction that undelegates a Player. Money leaves through the Outbox, but the Player account itself stays delegated to the validator pinned in Config. If that rollup stops serving it, the Player's latest balance is only in the rollup, and Solana holds the copy from its last withdrawal (or from its delegation). An escape hatch that undelegates a Player is deferred.
+- **A seeded battle that cannot settle strands its stakes.** `cancel_match` refuses a Seeded battle, so its stakes stay locked and its armies stay Fighting until `settle_match` succeeds. A battle whose settlement cannot run, for example one that needs more than the 1 400 000 CU a transaction can have, would hold both stakes for good. The compute benchmark keeps the worst known battle well under that limit (see [Callback compute](#callback-compute)).
+- **Everything depends on the rollup validator.** Gameplay, top-ups reaching the budget, settlement, withdrawals and fee claims all run in the rollup that serves the validator `initialize` pinned in Config, and nothing changes that validator. While the rollup is down nothing moves; a withdrawal already scheduled pays out only when the validator sends its Solana transaction, and the client's `release_outbox` fallback needs the Outbox undelegated first.
