@@ -16,7 +16,7 @@ pub enum HorizonError {
     BadRace,
     #[msg("Army cannot be changed in its current status")]
     BadStatus,
-    #[msg("Battleground admin signature is required")]
+    #[msg("Config admin signature is required")]
     NotAdmin,
     #[msg("You cannot match your own army")]
     OwnArmy,
@@ -52,7 +52,7 @@ pub enum HorizonError {
     FeeTooHigh,
     #[msg("Player budget does not cover the battleground stake")]
     BudgetTooLow,
-    #[msg("Player has battles that have not settled")]
+    #[msg("Player has too many battles that have not settled")]
     PlayerBusy,
     #[msg("Player holds less than the amount asked for")]
     BalanceShort,

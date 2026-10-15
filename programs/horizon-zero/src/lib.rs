@@ -68,7 +68,9 @@ pub mod horizon_zero {
         Ok(())
     }
 
-    /// Admin only: the fee rate battles opened from now on charge. Open battles keep their own.
+    /// Rollup, admin only: the fee rate battles opened from now on charge. Open battles keep their
+    /// own. Config is a typed account here, so it runs where Config is writable: in the rollup once
+    /// Config is delegated (on Solana before that).
     pub fn set_fee(ctx: Context<AdminConfig>, fee_bps: u16) -> Result<()> {
         require!(fee_bps <= fees::MAX_FEE_BPS, HorizonError::FeeTooHigh);
         ctx.accounts.config.fee_bps = fee_bps;
@@ -974,10 +976,8 @@ fn load_units(race: u8, units: &[UnitInput], accounts: &[AccountInfo], budget: u
 
 fn recheck_behaviors(army: &Army, accounts: &[AccountInfo]) -> Result<()> {
     for unit in army.units.iter().take(army.unit_count as usize) {
-        let account = accounts
-            .iter()
-            .find(|account| account.key.to_string() == unit.behavior.to_string())
-            .ok_or(HorizonError::MissingBehavior)?;
+        let account =
+            accounts.iter().find(|account| *account.key == unit.behavior).ok_or(HorizonError::MissingBehavior)?;
         let behavior = Behavior::try_deserialize(&mut &account.try_borrow_data()?[..])?;
         let bytes = behavior_bytes(&behavior)?;
         require!(bytes == &unit.body[..unit.len as usize], HorizonError::HashMismatch);
@@ -1171,12 +1171,7 @@ fn recent_slot_hash(slot_hashes: &AccountInfo) -> Result<[u8; 32]> {
 }
 
 fn account_by_key<'a>(accounts: &'a [AccountInfo<'a>], key: &Pubkey) -> Result<AccountInfo<'a>> {
-    let want = key.to_string();
-    accounts
-        .iter()
-        .find(|account| account.key.to_string() == want)
-        .cloned()
-        .ok_or_else(|| error!(HorizonError::MissingAccount))
+    accounts.iter().find(|account| account.key == key).cloned().ok_or_else(|| error!(HorizonError::MissingAccount))
 }
 
 /// Creates the program identity PDA with space 0, owned by this program. Anyone can send lamports

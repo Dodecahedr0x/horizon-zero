@@ -125,7 +125,7 @@ Sizes include the 8-byte discriminator. The indexer decodes an account only when
 | 50 | `validator` pubkey, the rollup validator identity every delegate instruction delegates to |
 | 82 | `bump` |
 
-The account's lamports are its rent plus `fees`. `fee_bps` is at most `1000` (`MAX_FEE_BPS`); `DEFAULT_FEE_BPS` in `programs/horizon-zero/src/fees.rs` is `500`. The indexer does not store Config.
+The account's lamports are its rent plus `fees`. Only `fees` can be claimed: `fund_treasury_outbox` moves exactly `config.fees` and keeps the rest, so lamports sent to Config directly stay there for good. `fee_bps` is at most `1000` (`MAX_FEE_BPS` in `programs/horizon-zero/src/fees.rs`); the program has no default, and the bootstrap passes `500`. The indexer does not store Config.
 
 ### Player — 68 bytes
 
@@ -185,7 +185,7 @@ for each element:
 
 | offset | field |
 | --- | --- |
-| 8 | `admin` pubkey |
+| 8 | `admin` pubkey, informational: Config's admin at creation; nothing reads it |
 | 40 | `battleground_id` u8 |
 | 41 | `budget` u16 |
 | 43 | `stake_lamports` u64 |
@@ -281,9 +281,9 @@ Only the program's upgrade authority may call it. The program account must name 
 
 ### `set_fee(fee_bps: u16)`
 
-Accounts: admin signer, config writable.
+Rollup once Config is delegated. Accounts: admin signer, config writable `[b"config"]`.
 
-The signer must be `config.admin` (`NotAdmin`), and `fee_bps` must be at most `1000` (`FeeTooHigh`). Battles already open keep the rate they copied at `lock_army`.
+Config is a typed account here, not read by hand, so the instruction runs where Config is writable by this program: in the rollup once Config is delegated, or on Solana before `delegate_config`. The signer must be `config.admin` (`NotAdmin`), and `fee_bps` must be at most `1000` (`FeeTooHigh`). Battles already open keep the rate they copied at `lock_army`.
 
 Log: `HZ_FEE <fee_bps>`.
 

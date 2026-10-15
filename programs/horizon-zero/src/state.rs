@@ -72,6 +72,8 @@ pub struct Behavior {
 #[account]
 #[derive(InitSpace)]
 pub struct Battleground {
+    /// Informational: Config's admin when the battleground was created. Nothing reads it; admin
+    /// checks read Config. Kept so the layout stays put.
     pub admin: Pubkey,
     pub battleground_id: u8,
     pub budget: u16,

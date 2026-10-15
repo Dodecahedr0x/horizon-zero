@@ -1,6 +1,5 @@
 //! The protocol fee on a won battle. A draw pays no fee.
 
-pub const DEFAULT_FEE_BPS: u16 = 500;
 /// `initialize` and `set_fee` reject a higher rate.
 pub const MAX_FEE_BPS: u16 = 1_000;
 
