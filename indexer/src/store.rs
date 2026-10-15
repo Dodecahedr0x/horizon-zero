@@ -14,6 +14,13 @@ use crate::decode::{
     HorizonAccount,
 };
 
+/// `matches.status`: the program's Awaiting 0, Resolved 1 and Seeded 2, plus the indexer's own
+/// Cancelled 3 for a battle `cancel_match` closed (the program has no such status: it closes the
+/// account).
+pub const STATUS_AWAITING: u8 = 0;
+pub const STATUS_CANCELLED: u8 = 3;
+const ZERO_SEED: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS behaviors (
     pubkey TEXT PRIMARY KEY,
@@ -83,6 +90,11 @@ CREATE TABLE IF NOT EXISTS resolutions (
     fee TEXT NOT NULL,
     resolved_at INTEGER,
     seed TEXT
+);
+
+CREATE TABLE IF NOT EXISTS cancellations (
+    pubkey TEXT PRIMARY KEY,
+    cancelled_at INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS users (
@@ -440,6 +452,12 @@ fn record_army(conn: &Connection, pubkey: &str, army: &ArmyAccount) -> rusqlite:
 /// would take a seeded row back to zeros is a stale snapshot and is skipped. A different non-zero
 /// seed is a new battle at a reused address (seq restarts after a ledger reset): its row starts over.
 /// The stored resolution with the same seed, if any, settles the row.
+///
+/// `open_at` is the battle's own `opened_at` (the program's Clock) when it has one, else the block
+/// time of the first Awaiting observation. A Cancelled row is never seeded again: an Awaiting
+/// snapshot with the same open time is stale and skipped, and one with another open time is a new
+/// battle at the address. A cancellation stored before its row (see `cancel`) applies to an
+/// Awaiting battle that opened no later than the cancel.
 fn record_battle(
     conn: &Connection,
     pubkey: &str,
@@ -449,24 +467,44 @@ fn record_battle(
     let tx = conn.unchecked_transaction()?;
     let existing = tx
         .query_row(
-            "SELECT open_at, seed FROM matches WHERE pubkey = ?1",
+            "SELECT open_at, seed, status FROM matches WHERE pubkey = ?1",
             [pubkey],
-            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?)),
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?, row.get::<_, u8>(2)?)),
         )
         .optional()?;
     let seeded = !is_zero_seed(&battle.seed);
+    let chain_open = (battle.opened_at > 0).then_some(battle.opened_at);
     let mut open_at = None;
-    if let Some((stored_open, stored_seed)) = existing {
+    if let Some((stored_open, stored_seed, stored_status)) = existing {
         if !is_zero_seed(&stored_seed) && !seeded {
+            return Ok(());
+        }
+        if stored_status == STATUS_CANCELLED && !seeded && (chain_open.is_none() || chain_open == stored_open) {
             return Ok(());
         }
         if is_zero_seed(&stored_seed) || stored_seed == battle.seed {
             open_at = stored_open;
         }
     }
-    // The first observation while Awaiting supplies the open time. A later write does not replace it.
-    if battle.status == 0 && open_at.is_none() {
+    if chain_open.is_some() {
+        open_at = chain_open;
+    } else if battle.status == STATUS_AWAITING && open_at.is_none() {
+        // The first observation while Awaiting supplies the open time. A later write does not replace it.
         open_at = unix;
+    }
+    let mut cancelled_at = None;
+    let pending: Option<Option<i64>> = tx
+        .query_row("SELECT cancelled_at FROM cancellations WHERE pubkey = ?1", [pubkey], |row| row.get(0))
+        .optional()?;
+    if let Some(at) = pending {
+        match (at, open_at) {
+            (Some(at), Some(open)) if !seeded && battle.status == STATUS_AWAITING && open <= at => cancelled_at = Some(at),
+            // A battle opened after the cancel, or a seeded one (never cancellable): an older battle's.
+            (Some(at), Some(open)) if seeded || open > at => {
+                tx.execute("DELETE FROM cancellations WHERE pubkey = ?1", [pubkey])?;
+            }
+            _ => {}
+        }
     }
     let mut resolution = None;
     if seeded {
@@ -484,9 +522,10 @@ fn record_battle(
             }
         }
     }
-    let (status, outcome, fee, resolved_at) = match resolution {
-        Some((outcome, fee, resolved_at)) => (1, outcome, Some(fee), resolved_at),
-        None => (battle.status, battle.outcome, None, None),
+    let (status, outcome, fee, resolved_at) = match (resolution, cancelled_at) {
+        (Some((outcome, fee, resolved_at)), _) => (1, outcome, Some(fee), resolved_at),
+        (None, Some(at)) => (STATUS_CANCELLED, 0, None, Some(at)),
+        (None, None) => (battle.status, battle.outcome, None, None),
     };
     let units_a: Vec<BattleUnitOut> = battle.units_a.iter().map(|unit| battle_unit_out(unit, battle.race_a)).collect();
     let units_b: Vec<BattleUnitOut> = battle.units_b.iter().map(|unit| battle_unit_out(unit, battle.race_b)).collect();
@@ -584,6 +623,28 @@ pub fn resolve(
             resolved_date = ?5
          WHERE pubkey = ?1 AND seed = ?6",
         params![pubkey, outcome, fee.to_string(), resolved_at, resolved_at.and_then(utc_day), seed],
+    )?;
+    tx.commit()
+}
+
+/// Records `HZ_MATCH_CANCELLED`. `cancel_match` closes the battle, so the log is the only sign of it.
+/// The row becomes Cancelled (3) only while it is still Awaiting with a zero seed and opened no later
+/// than the cancel (`unix`, the log's block time; unknown times do not block it). A seeded battle
+/// cannot be cancelled, and a battle opened after the cancel is a newer one at a reused address, so
+/// neither is touched. The cancellation is also kept, so a log that arrives before its battle's row
+/// applies when the row does (see `record_battle`). `resolved_at` holds the cancel time.
+pub fn cancel(conn: &Connection, pubkey: &str, unix: Option<i64>) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO cancellations (pubkey, cancelled_at) VALUES (?1, ?2)
+         ON CONFLICT(pubkey) DO UPDATE SET cancelled_at = excluded.cancelled_at",
+        params![pubkey, unix],
+    )?;
+    tx.execute(
+        "UPDATE matches SET status = ?2, resolved_at = ?3, resolved_date = ?4
+         WHERE pubkey = ?1 AND status = ?5 AND seed = ?6
+           AND (?3 IS NULL OR open_at IS NULL OR open_at <= ?3)",
+        params![pubkey, STATUS_CANCELLED, unix, unix.and_then(utc_day), STATUS_AWAITING, ZERO_SEED],
     )?;
     tx.commit()
 }
@@ -776,7 +837,8 @@ pub fn stats(conn: &Connection, now: i64) -> rusqlite::Result<StatsOut> {
             "SELECT COUNT(*) FROM matches WHERE status = 1 AND resolved_at >= ?1",
             &[&(now - 86_400)],
         )?,
-        battles_awaiting: count("SELECT COUNT(*) FROM matches WHERE status != 1", &[])?,
+        // Awaiting or Seeded: neither settled nor cancelled.
+        battles_awaiting: count("SELECT COUNT(*) FROM matches WHERE status IN (0, 2)", &[])?,
         draws: count("SELECT COUNT(*) FROM matches WHERE status = 1 AND outcome = 3", &[])?,
         players: count("SELECT COUNT(*) FROM users", &[])?,
         behaviors: count("SELECT COUNT(*) FROM behaviors", &[])?,
@@ -1293,6 +1355,94 @@ mod tests {
         let row = battle(&conn, "battle-5").expect("read").expect("row");
         assert_eq!((row.status, row.outcome, row.fee.as_deref()), (1, 3, Some("0")));
         assert_eq!(row.resolved_date.as_deref(), Some("2026-10-08"));
+        drop(conn);
+        cleanup(&path);
+    }
+
+    /// An Awaiting battle that `lock_army` opened at `opened_at`, or Seeded with `seed` when non-zero.
+    fn battle_opened(opened_at: i64, seed: u8) -> HorizonAccount {
+        let mut battle = fixture("Battle", BATTLE_LEN);
+        battle[104..136].copy_from_slice(pubkey(3).as_ref());
+        battle[136..168].copy_from_slice(pubkey(4).as_ref());
+        battle[168..176].copy_from_slice(&50u64.to_le_bytes());
+        battle[BATTLE_STATUS] = if seed == 0 { 0 } else { 2 };
+        battle[BATTLE_STATUS + 1..BATTLE_OUTCOME].fill(seed);
+        battle[BATTLE_OUTCOME + 5..BATTLE_OUTCOME + 13].copy_from_slice(&opened_at.to_le_bytes());
+        decode_account_data(&battle).expect("battle")
+    }
+
+    #[test]
+    fn a_cancel_log_ends_an_awaiting_row_and_a_stale_snapshot_does_not_undo_it() {
+        let (conn, path) = temp_db();
+        let opened = noon("2026-10-05");
+        record(&conn, "battle-c1", &battle_opened(opened, 0), Some(opened + 3)).expect("awaiting");
+        let row = battle(&conn, "battle-c1").expect("read").expect("row");
+        assert_eq!((row.status, row.open_at), (0, Some(opened)), "open_at is the battle's own opened_at");
+        assert_eq!(stats(&conn, opened).expect("stats").battles_awaiting, 1);
+
+        cancel(&conn, "battle-c1", Some(opened + 700)).expect("cancel");
+        let row = battle(&conn, "battle-c1").expect("read").expect("row");
+        assert_eq!((row.status, row.outcome, row.fee.as_deref(), row.resolved_at), (3, 0, None, Some(opened + 700)));
+        let json = serde_json::to_value(&row).expect("json");
+        assert_eq!(json["status"], 3);
+        let counts = stats(&conn, opened + 700).expect("stats");
+        assert_eq!((counts.battles_awaiting, counts.battles_fought), (0, 0));
+
+        // An Awaiting snapshot read before the cancel lands after it; a repeated log changes nothing.
+        record(&conn, "battle-c1", &battle_opened(opened, 0), Some(opened + 5)).expect("stale");
+        cancel(&conn, "battle-c1", Some(opened + 900)).expect("again");
+        let row = battle(&conn, "battle-c1").expect("read").expect("row");
+        assert_eq!((row.status, row.resolved_at), (3, Some(opened + 700)));
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_cancel_never_touches_a_seeded_row_or_a_newer_battle_at_the_address() {
+        let (conn, path) = temp_db();
+        let opened = noon("2026-10-05");
+        // A seeded battle cannot be cancelled: such a log is not this battle's.
+        record(&conn, "battle-c2", &battle_opened(opened, 7), None).expect("seeded");
+        cancel(&conn, "battle-c2", Some(opened + 700)).expect("cancel");
+        assert_eq!(battle(&conn, "battle-c2").expect("read").expect("row").status, 2);
+
+        // An old battle cancelled; a ledger reset reuses the address for a battle opened later.
+        record(&conn, "battle-c3", &battle_opened(opened, 0), None).expect("old awaiting");
+        cancel(&conn, "battle-c3", Some(opened + 700)).expect("old cancel");
+        let later = opened + 86_400;
+        record(&conn, "battle-c3", &battle_opened(later, 0), Some(later)).expect("new awaiting");
+        let row = battle(&conn, "battle-c3").expect("read").expect("row");
+        assert_eq!((row.status, row.open_at, row.resolved_at), (0, Some(later), None));
+        // The old log replayed does not cancel the new battle; nor does a later snapshot of it.
+        cancel(&conn, "battle-c3", Some(opened + 700)).expect("replayed old log");
+        record(&conn, "battle-c3", &battle_opened(later, 0), Some(later)).expect("new awaiting again");
+        assert_eq!(battle(&conn, "battle-c3").expect("read").expect("row").status, 0);
+        // The new battle seeds and resolves as usual.
+        record(&conn, "battle-c3", &battle_opened(later, 4), None).expect("new seeded");
+        resolve(&conn, "battle-c3", 2, 8, &seed(4), Some(later + 60)).expect("resolve");
+        assert_eq!(battle(&conn, "battle-c3").expect("read").expect("row").status, 1);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_cancel_seen_before_its_battle_applies_only_to_a_battle_opened_before_it() {
+        let (conn, path) = temp_db();
+        let opened = noon("2026-10-05");
+        cancel(&conn, "battle-c4", Some(opened + 650)).expect("cancel first");
+        assert!(battle(&conn, "battle-c4").expect("read").is_none());
+        record(&conn, "battle-c4", &battle_opened(opened, 0), None).expect("awaiting");
+        let row = battle(&conn, "battle-c4").expect("read").expect("row");
+        assert_eq!((row.status, row.resolved_at), (3, Some(opened + 650)));
+
+        // A stored cancel older than the battle is another battle's: it is dropped.
+        cancel(&conn, "battle-c5", Some(opened - 10)).expect("old cancel");
+        record(&conn, "battle-c5", &battle_opened(opened, 0), None).expect("newer awaiting");
+        assert_eq!(battle(&conn, "battle-c5").expect("read").expect("row").status, 0);
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cancellations WHERE pubkey = 'battle-c5'", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(left, 0);
         drop(conn);
         cleanup(&path);
     }

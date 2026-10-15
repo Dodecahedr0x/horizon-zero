@@ -161,8 +161,8 @@ async fn run(config: Config) -> Result<(), String> {
     served
 }
 
-/// Applies each `HZ_MATCH_RESOLVED` the program logged. The resolution time is the block time of
-/// the log's slot, or null when the RPC has none.
+/// Applies each `HZ_MATCH_RESOLVED` and `HZ_MATCH_CANCELLED` the program logged. The resolution or
+/// cancel time is the block time of the log's slot, or null when the RPC has none.
 async fn record_resolutions(
     db: Arc<Mutex<rusqlite::Connection>>,
     rpc_url: String,
@@ -175,13 +175,14 @@ async fn record_resolutions(
     while let Some(batch) = logs.recv().await {
         if batch.logs.last().is_some_and(|line| line == "Log truncated") {
             log::warn!(
-                "logs of {} at slot {} are truncated; a resolution past the cut is lost",
+                "logs of {} at slot {} are truncated; a resolution or cancellation past the cut is lost",
                 batch.signature,
                 batch.slot
             );
         }
         let found = decode::resolutions(&batch.logs, &program);
-        if found.is_empty() {
+        let cancelled = decode::cancellations(&batch.logs, &program);
+        if found.is_empty() && cancelled.is_empty() {
             continue;
         }
         let unix = block_time(&rpc, batch.slot).await;
@@ -189,12 +190,21 @@ async fn record_resolutions(
             for (battle, outcome, fee, _) in &found {
                 log::error!("resolution {battle} (outcome {outcome} fee {fee}) dropped: sqlite lock poisoned");
             }
+            for battle in &cancelled {
+                log::error!("cancellation {battle} dropped: sqlite lock poisoned");
+            }
             continue;
         };
         for (battle, outcome, fee, seed) in found {
             match store::resolve(&conn, &battle, outcome, fee, &seed, unix) {
                 Ok(()) => log::info!("battle {battle} resolved: outcome {outcome} fee {fee}"),
                 Err(err) => log::error!("resolution {battle} (outcome {outcome} fee {fee}) dropped: {err}"),
+            }
+        }
+        for battle in cancelled {
+            match store::cancel(&conn, &battle, unix) {
+                Ok(()) => log::info!("battle {battle} cancelled"),
+                Err(err) => log::error!("cancellation {battle} dropped: {err}"),
             }
         }
     }

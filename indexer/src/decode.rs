@@ -12,7 +12,9 @@ pub const PROGRAM_ID: &str = "Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c";
 pub(crate) const BEHAVIOR_LEN: usize = 119;
 pub(crate) const BATTLEGROUND_LEN: usize = 576;
 pub(crate) const ARMY_LEN: usize = 1360;
-pub(crate) const BATTLE_LEN: usize = 2147;
+/// Only the current layout (with `opened_at`) is read. The 2147-byte layout before it is not: the
+/// program writes only 2155-byte battles, and a local stack resets its ledger.
+pub(crate) const BATTLE_LEN: usize = 2155;
 const BODY_CAP: usize = 77;
 const ARMY_UNIT: usize = 128;
 const BATTLE_UNIT: usize = 96;
@@ -26,6 +28,7 @@ const BATTLE_UNITS_B: usize = BATTLE_UNITS_A + BATTLE_UNIT * MAX_UNITS;
 pub(crate) const BATTLE_STATUS: usize = BATTLE_UNITS_B + BATTLE_UNIT * MAX_UNITS;
 pub(crate) const BATTLE_OUTCOME: usize = BATTLE_STATUS + 1 + 32;
 const BATTLE_FEE_BPS: usize = BATTLE_OUTCOME + 3;
+const BATTLE_OPENED_AT: usize = BATTLE_FEE_BPS + 2;
 
 const MOVE_KINDS: [&str; 4] = ["Approach", "Flee", "Flank left", "Flank right"];
 const EXTREMA: [&str; 2] = ["Lowest", "Highest"];
@@ -138,6 +141,8 @@ pub struct BattleAccount {
     pub race_a: u8,
     pub race_b: u8,
     pub fee_bps: u16,
+    /// Clock `unix_timestamp` when `lock_army` opened the battle; `cancel_match` waits from it.
+    pub opened_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,15 +215,38 @@ pub fn parse_resolved(line: &str) -> Option<(String, u8, u64, String)> {
     Some((battle.to_string(), outcome, fee, seed.to_ascii_lowercase()))
 }
 
+/// `HZ_MATCH_CANCELLED <battle>`, logged by `cancel_match` as it closes an Awaiting battle.
+pub fn parse_cancelled(line: &str) -> Option<String> {
+    let mut words = line.split(' ');
+    if words.next()? != "HZ_MATCH_CANCELLED" {
+        return None;
+    }
+    let battle = words.next()?.parse::<Pubkey>().ok()?;
+    if words.next().is_some() {
+        return None;
+    }
+    Some(battle.to_string())
+}
+
 /// The resolutions in one transaction's logs. A line counts only while `program` is the innermost
 /// program invoked, so another program in the same transaction cannot log a resolution for it.
 pub fn resolutions(logs: &[String], program: &str) -> Vec<(String, u8, u64, String)> {
+    program_lines(logs, program).into_iter().filter_map(parse_resolved).collect()
+}
+
+/// The cancellations in one transaction's logs, under the same innermost-program rule.
+pub fn cancellations(logs: &[String], program: &str) -> Vec<String> {
+    program_lines(logs, program).into_iter().filter_map(parse_cancelled).collect()
+}
+
+/// The `Program log:` lines `program` wrote while it was the innermost program invoked.
+fn program_lines<'a>(logs: &'a [String], program: &str) -> Vec<&'a str> {
     let mut stack: Vec<&str> = Vec::new();
     let mut found = Vec::new();
     for line in logs {
         if let Some(text) = line.strip_prefix("Program log: ") {
             if stack.last() == Some(&program) {
-                found.extend(parse_resolved(text));
+                found.push(text);
             }
             continue;
         }
@@ -384,6 +412,7 @@ fn decode_battle(data: &[u8]) -> Option<BattleAccount> {
         race_a: data[BATTLE_OUTCOME + 1],
         race_b: data[BATTLE_OUTCOME + 2],
         fee_bps: read_u16(data, BATTLE_FEE_BPS),
+        opened_at: i64::from_le_bytes(data[BATTLE_OPENED_AT..BATTLE_OPENED_AT + 8].try_into().ok()?),
     })
 }
 
@@ -757,17 +786,49 @@ mod tests {
     }
 
     #[test]
-    fn battle_carries_its_fee_rate() {
-        let mut battle = fixture("Battle", 2147);
+    fn battle_carries_its_fee_rate_and_open_time() {
+        let mut battle = fixture("Battle", 2155);
         battle[2144..2146].copy_from_slice(&500u16.to_le_bytes());
-        battle[2146] = 254;
+        battle[2146..2154].copy_from_slice(&1_792_016_933i64.to_le_bytes());
+        battle[2154] = 254;
         let HorizonAccount::Battle(battle) = decode_account_data(&battle).expect("battle") else {
             panic!("expected battle");
         };
         assert_eq!(battle.fee_bps, 500);
+        assert_eq!(battle.opened_at, 1_792_016_933);
         assert_eq!(battle.status, 0);
-        // The layout before fee_bps no longer matches.
+        // The layouts before opened_at (2147) and before fee_bps (2145) no longer match.
+        assert!(decode_account_data(&fixture("Battle", 2147)).is_none());
         assert!(decode_account_data(&fixture("Battle", 2145)).is_none());
+    }
+
+    #[test]
+    fn cancelled_log_names_the_battle_and_only_the_program_s_own_line_counts() {
+        let battle = pubkey(5).to_string();
+        let forged = pubkey(7).to_string();
+        let other = pubkey(9).to_string();
+        assert_eq!(parse_cancelled(&format!("HZ_MATCH_CANCELLED {battle}")), Some(battle.clone()));
+        for bad in [
+            String::new(),
+            "HZ_MATCH_CANCELLED".to_string(),
+            "HZ_MATCH_CANCELLED nope".to_string(),
+            format!("HZ_MATCH_CANCELLED {battle} extra"),
+            format!("HZ_MATCH_RESOLVED {battle}"),
+        ] {
+            assert_eq!(parse_cancelled(&bad), None, "{bad}");
+        }
+        let program = PROGRAM_ID;
+        let logs: Vec<String> = vec![
+            format!("Program {program} invoke [1]"),
+            format!("Program log: HZ_PLAYER {battle}"),
+            format!("Program {other} invoke [2]"),
+            format!("Program log: HZ_MATCH_CANCELLED {forged}"),
+            format!("Program {other} success"),
+            format!("Program log: HZ_MATCH_CANCELLED {battle}"),
+            format!("Program {program} success"),
+        ];
+        assert_eq!(cancellations(&logs, program), vec![battle]);
+        assert!(resolutions(&logs, program).is_empty());
     }
 
     #[test]
