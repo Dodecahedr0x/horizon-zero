@@ -223,7 +223,117 @@ new IntersectionObserver(([entry], observer) => {
   if (!entry.isIntersecting) return;
   rite.classList.add("lit");
   observer.disconnect();
-}, { threshold: 0.35 }).observe(rite);
+}, { threshold: 0, rootMargin: "0px 0px -25% 0px" }).observe(rite);
+
+// ---------------------------------------------------------------- the reel
+
+// The trailer plays once, muted, the first time it is mostly on screen, pauses while scrolled away,
+// and stops on its title frame. The corner cue turns the narrator on, then offers one more viewing.
+// With reduced motion nothing plays until the cue is pressed. Pause holds it until Play, wherever
+// the page scrolls.
+function reel(video) {
+  const pause = video.parentElement.querySelector(".reel-pause");
+  const cue = video.parentElement.querySelector(".reel-cue:not(.reel-pause)");
+  let state = "idle";
+  const label = () => {
+    video.parentElement.dataset.state = state;
+    if (state === "ended") cue.textContent = "Again";
+    else if (state === "idle" && reduceMotion) cue.textContent = "Play";
+    else cue.textContent = "Sound";
+    // A toggle while the reel runs; "Play" and "Again" are plain buttons.
+    if (cue.textContent === "Sound") cue.setAttribute("aria-pressed", String(!video.muted));
+    else cue.removeAttribute("aria-pressed");
+    pause.hidden = !["playing", "paused", "held"].includes(state);
+    pause.textContent = state === "held" ? "Play" : "Pause";
+  };
+  const load = () => {
+    if (!video.getAttribute("src")) {
+      video.src = "/trailer/trailer.mp4";
+      video.preload = "auto";
+    }
+  };
+  const play = () => {
+    load();
+    state = "playing";
+    label();
+    video.play().catch((err) => {
+      // Autoplay refused: leave the poster up and let the cue start it. An AbortError is our own
+      // pause (scrolled away, or Pause pressed) cutting a start short, and keeps its state.
+      if (state !== "playing" || err.name !== "NotAllowedError") return;
+      state = "idle";
+      label();
+    });
+  };
+
+  cue.hidden = false;
+  label();
+  pause.addEventListener("click", () => {
+    if (state === "held") {
+      state = "paused";
+      sync();
+    } else {
+      state = "held";
+      video.pause();
+    }
+    label();
+  });
+  cue.addEventListener("click", () => {
+    if (state === "ended") {
+      video.currentTime = 0;
+      play();
+    } else if (state === "idle") {
+      video.muted = false;
+      play();
+    } else {
+      video.muted = !video.muted;
+      label();
+    }
+  });
+  video.addEventListener("ended", () => {
+    state = "ended";
+    label();
+  });
+
+  // Start buffering a little before the reel arrives, so the first frames are ready. Not for a
+  // viewer who will not see it play by itself, or who asked to save data.
+  if (!reduceMotion && !navigator.connection?.saveData) {
+    new IntersectionObserver(([entry], observer) => {
+      if (!entry.isIntersecting) return;
+      observer.disconnect();
+      load();
+    }, { rootMargin: "600px 0px" }).observe(video);
+  }
+
+  // Half on screen plays; less than half pauses. `isIntersecting` alone is true for any sliver.
+  let inView = false;
+  function sync() {
+    const wanted = inView && document.visibilityState === "visible";
+    if (wanted && state === "idle" && !reduceMotion) play();
+    else if (wanted && state === "paused") {
+      state = "playing";
+      label();
+      video.play().catch(() => {});
+    } else if (!wanted && state === "playing") {
+      state = "paused";
+      label();
+      video.pause();
+    }
+  }
+  new IntersectionObserver(([entry]) => {
+    inView = entry.intersectionRatio >= 0.5;
+    sync();
+  }, { threshold: [0, 0.5] }).observe(video);
+  document.addEventListener("visibilitychange", sync);
+  // The browser may pause on its own (a hidden tab, a media key); follow it so a return resumes.
+  video.addEventListener("pause", () => {
+    if (state === "playing" && !video.ended) {
+      state = "paused";
+      label();
+    }
+  });
+}
+
+reel(document.querySelector(".reel-video"));
 
 // ---------------------------------------------------------------- the field
 
@@ -547,9 +657,13 @@ function board(canvas) {
     }
   }
 
+  let rolls = 0;
   async function reseed(replay = true) {
+    const roll = ++rolls;
     const seed = crypto.getRandomValues(new Uint8Array(32));
     const rubble = await blockedTiles(ground.cols, ground.rows, seed);
+    // A later roll (another battleground picked meanwhile) owns the board now.
+    if (roll !== rolls) return;
     // Two different races face each other on every roll.
     const [mine, foe] = [...races].sort(() => Math.random() - 0.5);
     const theirs = sampleArmy(ground.budget, foe);

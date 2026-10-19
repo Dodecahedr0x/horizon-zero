@@ -1,6 +1,5 @@
 import { lamportsDelegatedTransferIx } from "@magicblock-labs/ephemeral-rollups-sdk";
 import { Connection, PublicKey, Transaction, type AccountInfo, type TransactionInstruction } from "@solana/web3.js";
-import type { WalletContextState } from "@solana/wallet-adapter-react";
 import {
   BATTLEGROUNDS,
   DELEGATION_PROGRAM_ID,
@@ -45,9 +44,8 @@ import {
   unlockArmyIx,
   withdrawIx,
   type ElementSpec,
-} from "./codec";
-import type { ChainAdapter, Match } from "./devChain";
-import { ER_RPC_URL, ORACLE_QUEUE, RPC_URL } from "./network";
+} from "../src/codec.ts";
+import type { ChainAdapter, Match } from "../src/devChain.ts";
 
 const POLL_MS = 500;
 // How long to wait for a confirmation, for the rollup to see a delegation, for a VRF seed, for an
@@ -60,7 +58,7 @@ const ACTION_WAIT_MS = 5_000;
 // How many army indexes past the indexer's highest createArmy checks in the rollup.
 const ARMY_INDEX_PROBE = 64;
 // A legacy transaction fits about 33 distinct accounts. lock_army's fixed accounts, the program and
-// the compute-budget program take 15; behaviors, candidates and their Players share the rest.
+// the compute-budget program take 15; candidates and their Players share the rest.
 const LOCK_ACCOUNT_LIMIT = 32;
 const LOCK_FIXED_ACCOUNTS = 15;
 
@@ -104,11 +102,15 @@ export class PendingError extends Error {
   }
 }
 
-async function read<T>(path: string): Promise<T> {
-  const response = await fetch(`/api${path}`);
-  if (!response.ok) throw new Error(`indexer ${response.status}`);
-  return response.json();
-}
+/** Where the server reaches Solana, the rollup and the indexer, and the VRF queue lock_army asks. */
+export type ChainConfig = { rpcUrl: string; erRpcUrl: string; oracleQueue: PublicKey; indexerUrl: string };
+
+/**
+ * The wallet a call acts for. The server builds every transaction with `owner` as the fee payer;
+ * `sign` hands it to the browser and resolves with the wallet's signed copy. `owner` is null for a
+ * read made before a wallet connects.
+ */
+export type Signer = { owner: PublicKey | null; sign(tx: Transaction): Promise<Transaction> };
 
 function groundName(id: number) {
   return BATTLEGROUNDS.find((ground) => ground.id === id)?.name || `Battleground ${id}`;
@@ -201,28 +203,49 @@ type OutboxTarget = {
   flush: () => TransactionInstruction;
 };
 
+/** The server's connections, kept for the life of the process and shared by every call. */
+export type SolanaNet = {
+  base: Connection;
+  er: Connection;
+  oracleQueue: PublicKey;
+  read<T>(path: string): Promise<T>;
+  rent(): Promise<number>;
+};
+
+export function connectSolana(config: ChainConfig): SolanaNet {
+  const base = new Connection(config.rpcUrl, "confirmed");
+  const indexer = config.indexerUrl.endsWith("/") ? config.indexerUrl : `${config.indexerUrl}/`;
+  let playerRent: Promise<number> | null = null;
+  return {
+    base,
+    er: new Connection(config.erRpcUrl, "confirmed"),
+    oracleQueue: config.oracleQueue,
+    async read<T>(path: string): Promise<T> {
+      const response = await fetch(new URL(path.slice(1), indexer));
+      if (!response.ok) throw new Error(`indexer ${response.status}`);
+      return response.json();
+    },
+    rent() {
+      playerRent ??= base.getMinimumBalanceForRentExemption(PLAYER_LEN).catch((err) => {
+        playerRent = null;
+        throw err;
+      });
+      return playerRent;
+    },
+  };
+}
+
 /**
  * Solana holds the Player, the Outbox and their delegations; the rollup holds the live Player,
  * Config, battlegrounds, armies, behaviors and battles. Each transaction goes to one of the two
- * connections, with that connection's blockhash, signed by the wallet.
+ * connections, with that connection's blockhash, signed by the wallet. Made for one call.
  */
-export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
-  if (!ER_RPC_URL) throw new Error("VITE_ER_RPC_URL is not set: name the rollup that serves Config's validator");
-  const base = new Connection(RPC_URL, "confirmed");
-  const er = new Connection(ER_RPC_URL, "confirmed");
-  let playerRent: Promise<number> | null = null;
+export function createSolanaChain(wallet: Signer, net: SolanaNet): ChainAdapter {
+  const { base, er, read, rent } = net;
 
   function me() {
-    if (!wallet.publicKey) throw new Error("Connect a wallet");
-    return wallet.publicKey;
-  }
-
-  function rent() {
-    playerRent ??= base.getMinimumBalanceForRentExemption(PLAYER_LEN).catch((err) => {
-      playerRent = null;
-      throw err;
-    });
-    return playerRent;
+    if (!wallet.owner) throw new Error("Connect a wallet");
+    return wallet.owner;
   }
 
   /**
@@ -270,16 +293,9 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
       tx.recentBlockhash = blockhash;
       let signature: string;
       try {
-        // Sign, then send through our own connection: a wallet that sends for itself would send a
-        // rollup transaction to Solana.
-        if (wallet.signTransaction) {
-          const signed = await wallet.signTransaction(tx);
-          signature = await connection.sendRawTransaction(signed.serialize());
-        } else if (connection === base && wallet.sendTransaction) {
-          signature = await wallet.sendTransaction(tx, connection);
-        } else {
-          throw new Error("This wallet cannot sign transactions for the rollup");
-        }
+        // The wallet only signs; the server sends, so a rollup transaction never goes to Solana.
+        const signed = await wallet.sign(tx);
+        signature = await connection.sendRawTransaction(signed.serialize());
       } catch (err) {
         // A rollup blockhash can expire while the wallet waits for approval: sign again once.
         if (attempt === 0 && /blockhash not found/i.test((err as Error)?.message ?? "")) continue;
@@ -459,12 +475,11 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
   }
 
   /** Sends lock_army against the battleground as the rollup holds it now. */
-  async function sendLock(owner: PublicKey, army: { pubkey: string; battleground: string; units: { behavior: string }[] }) {
+  async function sendLock(owner: PublicKey, army: { pubkey: string; battleground: string }) {
     const ground = new PublicKey(army.battleground);
     const groundInfo = await er.getAccountInfo(ground);
     const state = groundInfo ? decodeBattleground(groundInfo.data) : null;
     if (!state) throw new Error("Battleground is missing");
-    const behaviors = [...new Set(army.units.map((unit) => unit.behavior))].map((key) => new PublicKey(key));
     // Offer the queued armies of other wallets, in queue order, with their owners' Players so the
     // program can match a funded one and evict an unfunded one.
     const queued = state.queue.map((key) => new PublicKey(key));
@@ -476,7 +491,7 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
       const head = info ? decodeArmyHead(info.data) : null;
       if (!head || head.status !== 1 || head.owner === owner.toBase58()) continue;
       const added = owners.has(head.owner) ? 1 : 2;
-      if (LOCK_FIXED_ACCOUNTS + behaviors.length + candidates.length + owners.size + added > LOCK_ACCOUNT_LIMIT) break;
+      if (LOCK_FIXED_ACCOUNTS + candidates.length + owners.size + added > LOCK_ACCOUNT_LIMIT) break;
       candidates.push({ army: queued[i], owner: new PublicKey(head.owner) });
       candidateInfos.push(info);
       owners.add(head.owner);
@@ -490,8 +505,7 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
       player: owner,
       battlegroundId: state.battlegroundId,
       army: new PublicKey(army.pubkey),
-      behaviors,
-      queue: ORACLE_QUEUE,
+      queue: net.oracleQueue,
       seq: state.matchSeq,
       candidates,
       opens,
@@ -512,7 +526,7 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
     },
     battlegrounds,
     async armies(owner) {
-      const indexed = await read<ArmyRow[]>(`/armies?owner=${owner}`);
+      const indexed = await read<ArmyRow[]>(`/armies?owner=${new PublicKey(owner).toBase58()}`);
       const known = await battlegrounds();
       // The indexer learns of a closed army or a new status late; the rollup knows at once.
       const live = indexed.length ? await er.getMultipleAccountsInfo(indexed.map((row) => new PublicKey(row.pubkey))) : [];
@@ -696,14 +710,14 @@ export function createSolanaChain(wallet: WalletContextState): ChainAdapter {
       await send(er, setFeeIx(me(), bps));
     },
     async matches(owner) {
-      const all = await read<IndexedMatch[]>("/matches");
-      return all.filter((item) => item.playerA === owner || item.playerB === owner).slice(0, 20).map(fromIndexer);
+      const mine = await read<IndexedMatch[]>(`/matches?player=${new PublicKey(owner).toBase58()}&limit=20`);
+      return mine.map(fromIndexer);
     },
     async match(pubkey) {
-      const indexed = await read<IndexedMatch | null>(`/matches/${pubkey}`).catch(() => null);
+      const key = new PublicKey(pubkey);
+      const indexed = await read<IndexedMatch | null>(`/matches/${key.toBase58()}`).catch(() => null);
       if (indexed) return fromIndexer(indexed);
       // A battle the indexer has not seen yet, still open in the rollup.
-      const key = new PublicKey(pubkey);
       const info = await er.getAccountInfo(key);
       return info ? decodeBattle(key, info.data) : null;
     },

@@ -199,7 +199,7 @@ for each element:
 
 `MAX_QUEUE` is 16. `enqueue` appends. `remove` swap-removes and clears the vacated slot. A 17th enqueue fails with `QueueFull`.
 
-Zone A is rows `0..zone_depth`, every column. Zone B is rows `rows-zone_depth..rows`, every column. The instruction does not take a tile list. `cols` must be `1..=32` and `rows` must be `4..=32`, which is `horizon_combat::Geometry::playable`. A grid outside that range fails with `BadGrid`.
+Zone A is rows `0..zone_depth`, every column. Zone B is rows `rows-zone_depth..rows`, every column. The instruction does not take a tile list. `cols` must be `1..=32`, `rows` must be `4..=10`, and `cols * rows` must be at most 120, which is `horizon_combat::Geometry::playable` (see [Battle](battle.md)). A grid outside that range fails with `BadGrid`.
 
 ### Army — 1360 bytes
 
@@ -362,11 +362,10 @@ No instruction arguments. Account order after the `#[vrf]` macro expands `LockAr
 11. VRF program
 12. `SysvarS1otHashes111111111111111111111111111`
 13. system program
-14. remaining: each distinct behavior on the army, readonly
 
 To open a match the client then passes, in any order, each queued army it offers as a candidate (writable) and each of their owners' Players once (writable). With no candidates it passes nothing more.
 
-The player must own the army. The army must belong to this battleground, be Idle, and have `unit_count > 0`. Each stored behavior is loaded again and its canonical bytes must still match the army. The lock copies each unit's kind, behavior body, zone-local position, stats, and cast into the battle snapshot, copies `cols` and `rows` onto the battle, stores each army's race as `race_a` and `race_b`, and copies `config.fee_bps`. The program writes the new battle into its account field by field, in `Battle`'s order, and reads the opponent's army onto the heap: a `Battle` value with two 10-slot snapshots would not fit the 4 KB SBF stack frame.
+The player must own the army. The army must belong to this battleground and be Idle. The lock passes no behavior accounts: `create_army` and `update_army` already checked each body against its behavior's hash and copied it into the army, refused an empty roster, and a behavior is never changed or closed. The lock copies each unit's kind, behavior body, zone-local position, stats, and cast into the battle snapshot, copies `cols` and `rows` onto the battle, stores each army's race as `race_a` and `race_b`, and copies `config.fee_bps`. The program writes the new battle into its account field by field, in `Battle`'s order, and reads the opponent's army onto the heap: a `Battle` value with two 10-slot snapshots would not fit the 4 KB SBF stack frame.
 
 The player's Player must have a `budget` of at least `stake_lamports` (`BudgetTooLow`), whether the army queues or matches.
 
@@ -386,7 +385,7 @@ The client and the tests prepend a compute-budget instruction that sets the unit
 
 ### `unlock_army`
 
-Accounts: player signer writable, battleground writable, army writable.
+Accounts: player signer, battleground writable, army writable.
 
 The player must own the army. Status must be Queued and the army must still sit in the battleground queue. The instruction removes the army from the queue and sets Idle. No lamports move: a queued army holds no stake of its own.
 

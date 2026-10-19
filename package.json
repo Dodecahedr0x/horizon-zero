@@ -13,5 +13,8 @@
     "studio": "pnpm --filter asset-studio start",
     "trailer": "node tools/trailer/generate.mjs",
     "indexer": "pnpm --filter indexer start"
+  },
+  "engines": {
+    "node": ">=22.18"
   }
 }

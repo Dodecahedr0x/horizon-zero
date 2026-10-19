@@ -21,11 +21,13 @@ const jobs = [
       HORIZON_VITE_CLEAR_SCREEN: "0",
       VITE_DEV_MODE: chain ? "false" : "true",
       // Solana, the rollup, and the ephemeral test queue whose oracle the stack runs on the rollup.
+      // Vite's /chain backend (app/chain/http.mjs) reads them; the page never sees them.
       ...(chain
         ? {
-            VITE_RPC_URL: "http://127.0.0.1:8899",
-            VITE_ER_RPC_URL: "http://127.0.0.1:7799",
-            VITE_ORACLE_QUEUE: "Sc9MJUngNbQXSXGP3F67KvKwVnhaYn6kcioxXNVowYT",
+            RPC_URL: "http://127.0.0.1:8899",
+            ER_RPC_URL: "http://127.0.0.1:7799",
+            ORACLE_QUEUE: "Sc9MJUngNbQXSXGP3F67KvKwVnhaYn6kcioxXNVowYT",
+            INDEXER_URL: `http://127.0.0.1:${indexerListenPort()}`,
           }
         : {}),
     },

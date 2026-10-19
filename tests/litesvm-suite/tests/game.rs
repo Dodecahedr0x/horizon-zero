@@ -622,7 +622,7 @@ fn budget_unknown_behavior_and_wrong_owner_fail() {
     let other = Keypair::new();
     env.fund(&other);
     cover_stake(&mut env, &other, &ground);
-    let lock = lock_ix(&env, &other, ground, army, Address::new_unique(), &[hold], vec![]);
+    let lock = lock_ix(&env, &other, ground, army, Address::new_unique(), vec![]);
     send_expect_reason(&mut env.svm, &other, &[cu_limit(), lock], "NotOwner");
 }
 
@@ -685,7 +685,7 @@ fn locking_needs_a_budget_that_covers_the_stake_and_unlock_dequeues() {
     env.fund(&player);
     let army = env.army(&player, 0, 0, AshbornKind::Guard.id(), hold);
     let (ground, _) = pda(&[b"battleground", &[0]], &env.program);
-    let lock = |env: &Env| lock_ix(env, &player, ground, army, Address::new_unique(), &[hold], vec![]);
+    let lock = |env: &Env| lock_ix(env, &player, ground, army, Address::new_unique(), vec![]);
 
     // An empty budget, then a budget one lamport short of the stake.
     send_expect_reason_with(&mut env, &player, |env| vec![cu_limit(), lock(env)], "BudgetTooLow");
@@ -726,7 +726,7 @@ fn close_army_needs_the_owner_and_an_idle_army() {
     let call = [close_army_ix(&env, &stranger, army)];
     send_expect_reason(&mut env.svm, &stranger, &call, "NotOwner");
 
-    queue(&mut env, &player, army, hold);
+    queue(&mut env, &player, army);
     let call = [close_army_ix(&env, &player, army)];
     send_expect_reason(&mut env.svm, &player, &call, "BadStatus");
 
@@ -758,11 +758,11 @@ fn match_pays_the_simulated_winner_and_a_draw_refunds() {
     env.fund(&second);
     let army_a = env.army(&first, 0, 0, AshbornKind::Guard.id(), advance);
     let army_b = env.army(&second, 0, 0, AshbornKind::Guard.id(), advance);
-    queue(&mut env, &first, army_a, advance);
+    queue(&mut env, &first, army_a);
     cover_stake(&mut env, &second, &ground);
     let (player_a, player_b) = (player_pda(&env, &first.pubkey()), player_pda(&env, &second.pubkey()));
     let (held_a, held_b, config_held) = (env.balance(&player_a), env.balance(&player_b), env.balance(&env.config));
-    let (battle, logs) = lock_and_seed(&mut env, 0, &second, army_b, advance, army_a, &first, None);
+    let (battle, logs) = lock_and_seed(&mut env, 0, &second, army_b, army_a, &first, None);
     // Locking moves no stake: each Player locks one stake of its budget and counts one unsettled
     // battle, and the locker's Player paid the battle's rent.
     let battle_rent = env.svm.minimum_balance_for_rent_exemption(BATTLE_LEN);
@@ -825,11 +825,11 @@ fn match_pays_the_simulated_winner_and_a_draw_refunds() {
     env.fund(&fourth);
     let hold_a = env.army(&third, 0, 1, AshbornKind::Guard.id(), hold);
     let hold_b = env.army(&fourth, 0, 1, AshbornKind::Guard.id(), hold);
-    queue(&mut env, &third, hold_a, hold);
+    queue(&mut env, &third, hold_a);
     cover_stake(&mut env, &fourth, &ground);
     let (player_c, player_d) = (player_pda(&env, &third.pubkey()), player_pda(&env, &fourth.pubkey()));
     let (held_c, held_d) = (env.balance(&player_c), env.balance(&player_d));
-    let logs = lock_match(&mut env, &fourth, hold_b, hold, hold_a, &third);
+    let logs = lock_match(&mut env, &fourth, hold_b, hold_a, &third);
     assert_eq!(resolved(&logs), (3, 0));
     // A draw takes no fee and moves no lamports: each stake goes back to its budget.
     assert_eq!(player_state(&env, &third.pubkey()), (STAKE, 0, 0, false, 0));
@@ -848,12 +848,12 @@ fn a_second_settle_fails() {
     env.fund(&second);
     let army_a = env.army(&first, 0, 0, AshbornKind::Guard.id(), hold);
     let army_b = env.army(&second, 0, 0, AshbornKind::Guard.id(), hold);
-    queue(&mut env, &first, army_a, hold);
+    queue(&mut env, &first, army_a);
     // Before the VRF callback the battle has no seed to settle on.
     let (ground, _) = pda(&[b"battleground", &[0]], &env.program);
     cover_stake(&mut env, &second, &ground);
     let battle = battle_pda(&env, 0, 0);
-    let lock = lock_ix(&env, &second, ground, army_b, battle, &[hold], vec![meta(army_a, true, false), meta(player_pda(&env, &first.pubkey()), true, false)]);
+    let lock = lock_ix(&env, &second, ground, army_b, battle, vec![meta(army_a, true, false), meta(player_pda(&env, &first.pubkey()), true, false)]);
     send(&mut env.svm, &second, &[cu_limit(), lock]);
     let early = settle_ix(&env, &battle);
     send_expect_reason(&mut env.svm, &first, &[cu_limit(), early], "NotSeeded");
@@ -883,7 +883,7 @@ fn an_unseeded_battle_cancels_after_the_wait_and_refunds_both_stakes() {
     env.fund(&second);
     let army_a = env.army(&first, 0, 0, AshbornKind::Guard.id(), hold);
     let army_b = env.army(&second, 0, 0, AshbornKind::Guard.id(), hold);
-    queue(&mut env, &first, army_a, hold);
+    queue(&mut env, &first, army_a);
     let (ground, _) = pda(&[b"battleground", &[0]], &env.program);
     cover_stake(&mut env, &second, &ground);
     let (player_a, player_b) = (player_pda(&env, &first.pubkey()), player_pda(&env, &second.pubkey()));
@@ -892,7 +892,7 @@ fn an_unseeded_battle_cancels_after_the_wait_and_refunds_both_stakes() {
     set_time(&mut env, 1_792_000_000);
     // The lock opens the battle; the VRF callback never comes.
     let battle = battle_pda(&env, 0, 0);
-    let lock = lock_ix(&env, &second, ground, army_b, battle, &[hold], vec![meta(army_a, true, false), meta(player_a, true, false)]);
+    let lock = lock_ix(&env, &second, ground, army_b, battle, vec![meta(army_a, true, false), meta(player_a, true, false)]);
     send(&mut env.svm, &second, &[cu_limit(), lock]);
     assert_eq!(opened_at(&env, &battle), 1_792_000_000, "the battle records when it opened");
     assert_eq!(env.svm.get_account(&battle).unwrap().data[2108], 0, "awaiting");
@@ -933,8 +933,8 @@ fn an_unseeded_battle_cancels_after_the_wait_and_refunds_both_stakes() {
     assert_eq!((player_state(&env, &first.pubkey()), player_state(&env, &second.pubkey())), before);
 
     // Both armies can fight again.
-    queue(&mut env, &first, army_a, hold);
-    let logs = lock_match(&mut env, &second, army_b, hold, army_a, &first);
+    queue(&mut env, &first, army_a);
+    let logs = lock_match(&mut env, &second, army_b, army_a, &first);
     assert_eq!(resolved(&logs).0, 3);
 }
 
@@ -947,8 +947,8 @@ fn a_seeded_battle_cannot_be_cancelled() {
     env.fund(&second);
     let army_a = env.army(&first, 0, 0, AshbornKind::Guard.id(), hold);
     let army_b = env.army(&second, 0, 0, AshbornKind::Guard.id(), hold);
-    queue(&mut env, &first, army_a, hold);
-    let (battle, _) = lock_and_seed(&mut env, 0, &second, army_b, hold, army_a, &first, None);
+    queue(&mut env, &first, army_a);
+    let (battle, _) = lock_and_seed(&mut env, 0, &second, army_b, army_a, &first, None);
     let at = opened_at(&env, &battle);
     set_time(&mut env, at + 10 * 600);
     // Its outcome is fixed by the seed: the loser could replay it and cancel. Settle it instead.
@@ -967,10 +967,10 @@ fn a_player_does_not_match_their_own_army_or_another_battleground() {
     let (ground, _) = pda(&[b"battleground", &[0]], &env.program);
     let first = env.army(&player, 0, 0, AshbornKind::Guard.id(), hold);
     let second = env.army(&player, 0, 1, AshbornKind::Guard.id(), hold);
-    queue(&mut env, &player, first, hold);
+    queue(&mut env, &player, first);
     // The player's own queued army and Player are offered, and still the second army queues.
     let own = player_pda(&env, &player.pubkey());
-    let lock = lock_ix(&env, &player, ground, second, battle_pda(&env, 0, 0), &[hold], vec![meta(first, true, false), meta(own, true, false)]);
+    let lock = lock_ix(&env, &player, ground, second, battle_pda(&env, 0, 0), vec![meta(first, true, false), meta(own, true, false)]);
     let logs = send(&mut env.svm, &player, &[cu_limit(), lock]);
     assert!(logs.iter().any(|line| line.contains("HZ_QUEUED")));
     assert_eq!(env.svm.get_account(&first).unwrap().data[1358], 1);
@@ -988,7 +988,7 @@ fn a_player_does_not_match_their_own_army_or_another_battleground() {
     let elsewhere = env.army(&other, 1, 0, AshbornKind::Guard.id(), hold);
     cover_stake(&mut env, &other, &garrison);
     let rest = vec![meta(first, true, false), meta(second, true, false), meta(own, true, false)];
-    let lock = lock_ix(&env, &other, garrison, elsewhere, battle_pda(&env, 1, 0), &[hold], rest);
+    let lock = lock_ix(&env, &other, garrison, elsewhere, battle_pda(&env, 1, 0), rest);
     let logs = send(&mut env.svm, &other, &[cu_limit(), lock]);
     assert!(logs.iter().any(|line| line.contains("HZ_QUEUED")));
     assert_eq!(env.svm.get_account(&elsewhere).unwrap().data[1358], 1);
@@ -1004,8 +1004,8 @@ fn an_army_whose_owner_cannot_cover_a_stake_is_evicted() {
     env.fund(&owner);
     let stranded = env.army(&owner, 0, 0, AshbornKind::Guard.id(), hold);
     let met = env.army(&owner, 0, 1, AshbornKind::Guard.id(), hold);
-    queue(&mut env, &owner, stranded, hold);
-    queue(&mut env, &owner, met, hold);
+    queue(&mut env, &owner, stranded);
+    queue(&mut env, &owner, met);
     let owner_player = player_pda(&env, &owner.pubkey());
 
     // A locker meets the second army: the owner's one stake is now locked and the budget is empty.
@@ -1013,7 +1013,7 @@ fn an_army_whose_owner_cannot_cover_a_stake_is_evicted() {
     env.fund(&first);
     let army = env.army(&first, 0, 0, AshbornKind::Guard.id(), hold);
     cover_stake(&mut env, &first, &ground);
-    let lock = lock_ix(&env, &first, ground, army, battle_pda(&env, 0, 0), &[hold], vec![meta(met, true, false), meta(owner_player, true, false)]);
+    let lock = lock_ix(&env, &first, ground, army, battle_pda(&env, 0, 0), vec![meta(met, true, false), meta(owner_player, true, false)]);
     send(&mut env.svm, &first, &[cu_limit(), lock]);
     assert_eq!(player_state(&env, &owner.pubkey()), (0, 0, STAKE, false, 1));
     assert_eq!(queued_armies(&env, &ground), vec![stranded]);
@@ -1023,7 +1023,7 @@ fn an_army_whose_owner_cannot_cover_a_stake_is_evicted() {
     env.fund(&second);
     let second_army = env.army(&second, 0, 0, AshbornKind::Guard.id(), hold);
     cover_stake(&mut env, &second, &ground);
-    let lock = lock_ix(&env, &second, ground, second_army, Address::new_unique(), &[hold], vec![meta(stranded, true, false)]);
+    let lock = lock_ix(&env, &second, ground, second_army, Address::new_unique(), vec![meta(stranded, true, false)]);
     let logs = send(&mut env.svm, &second, &[cu_limit(), lock]);
     assert!(!logs.iter().any(|line| line.contains("HZ_EVICT")));
     assert_eq!(queued_armies(&env, &ground), vec![stranded, second_army]);
@@ -1037,7 +1037,7 @@ fn an_army_whose_owner_cannot_cover_a_stake_is_evicted() {
     env.fund(&third);
     let third_army = env.army(&third, 0, 0, AshbornKind::Guard.id(), hold);
     cover_stake(&mut env, &third, &ground);
-    let lock = lock_ix(&env, &third, ground, third_army, Address::new_unique(), &[hold], vec![meta(stranded, true, false), meta(fake, true, false)]);
+    let lock = lock_ix(&env, &third, ground, third_army, Address::new_unique(), vec![meta(stranded, true, false), meta(fake, true, false)]);
     let logs = send(&mut env.svm, &third, &[cu_limit(), lock]);
     assert!(!logs.iter().any(|line| line.contains("HZ_EVICT")));
     assert_eq!(queued_armies(&env, &ground).len(), 3);
@@ -1047,7 +1047,7 @@ fn an_army_whose_owner_cannot_cover_a_stake_is_evicted() {
     env.fund(&fourth);
     let fourth_army = env.army(&fourth, 0, 0, AshbornKind::Guard.id(), hold);
     cover_stake(&mut env, &fourth, &ground);
-    let lock = lock_ix(&env, &fourth, ground, fourth_army, Address::new_unique(), &[hold], vec![meta(stranded, true, false), meta(owner_player, true, false)]);
+    let lock = lock_ix(&env, &fourth, ground, fourth_army, Address::new_unique(), vec![meta(stranded, true, false), meta(owner_player, true, false)]);
     let logs = send(&mut env.svm, &fourth, &[cu_limit(), lock]);
     assert!(logs.iter().any(|line| line.contains(&format!("HZ_EVICT {stranded}"))));
     assert!(logs.iter().any(|line| line.contains("HZ_QUEUED")));
@@ -1092,11 +1092,11 @@ fn each_outcome_moves_exact_lamports_and_counters() {
         env.fund(&second);
         let army_a = env.squad(&first, 0, 0, units_a, behavior_a);
         let army_b = env.squad(&second, 0, 0, units_b, behavior_b);
-        queue(&mut env, &first, army_a, behavior_a);
+        queue(&mut env, &first, army_a);
         cover_stake(&mut env, &second, &ground);
         let (player_a, player_b) = (player_pda(&env, &first.pubkey()), player_pda(&env, &second.pubkey()));
         let (held_a, held_b, config_held) = (env.balance(&player_a), env.balance(&player_b), env.balance(&env.config));
-        let logs = lock_match_seeded(&mut env, 0, &second, army_b, behavior_b, army_a, &first, None);
+        let logs = lock_match_seeded(&mut env, 0, &second, army_b, army_a, &first, None);
         assert_eq!(resolved(&logs), (outcome, if outcome == 3 { 0 } else { FEE }));
         let (lamports_a, lamports_b, state_a, state_b, fee) = match outcome {
             1 => (held_a + TO_WINNER, held_b - STAKE, (CREDIT, 0, 0, false, 0), (0, 0, 0, false, 0), FEE),
@@ -1126,7 +1126,7 @@ fn one_player_backs_many_armies_until_it_runs_dry() {
     send(&mut env.svm, &owner, &ixs);
     let armies: Vec<Address> = (0..3).map(|index| env.army(&owner, 0, index, AshbornKind::Guard.id(), hold)).collect();
     for &army in &armies {
-        queue(&mut env, &owner, army, hold);
+        queue(&mut env, &owner, army);
     }
     assert_eq!(ground_queue_len(&env, &ground), 3);
     let player = player_pda(&env, &owner.pubkey());
@@ -1143,7 +1143,7 @@ fn one_player_backs_many_armies_until_it_runs_dry() {
         cover_stake(&mut env, &locker, &ground);
         let mut rest: Vec<AccountMeta> = queued.iter().map(|&key| meta(key, true, false)).collect();
         rest.push(meta(player, true, false));
-        let lock = lock_ix(&env, &locker, ground, army, battle, &[hold], rest);
+        let lock = lock_ix(&env, &locker, ground, army, battle, rest);
         let logs = send(&mut env.svm, &locker, &[cu_limit(), lock]);
         assert!(logs.iter().any(|line| line.contains("HZ_MATCH_OPEN")), "locker {index} matched");
         let data = env.svm.get_account(&battle).unwrap().data;
@@ -1163,14 +1163,14 @@ fn one_player_backs_many_armies_until_it_runs_dry() {
     let army = env.army(&locker, 0, 0, AshbornKind::Guard.id(), hold);
     cover_stake(&mut env, &locker, &ground);
     let rest = vec![meta(left[0], true, false), meta(player, true, false)];
-    let lock = lock_ix(&env, &locker, ground, army, Address::new_unique(), &[hold], rest);
+    let lock = lock_ix(&env, &locker, ground, army, Address::new_unique(), rest);
     let logs = send(&mut env.svm, &locker, &[cu_limit(), lock]);
     assert!(logs.iter().any(|line| line.contains(&format!("HZ_EVICT {}", left[0]))));
     assert!(logs.iter().any(|line| line.contains("HZ_QUEUED")));
     assert_eq!(queued_armies(&env, &ground), vec![army]);
     assert_eq!(env.svm.get_account(&left[0]).unwrap().data[1358], 0, "the evicted army is Idle");
     let spare = env.army(&owner, 0, 3, AshbornKind::Guard.id(), hold);
-    let lock = lock_ix(&env, &owner, ground, spare, Address::new_unique(), &[hold], vec![]);
+    let lock = lock_ix(&env, &owner, ground, spare, Address::new_unique(), vec![]);
     send_expect_reason(&mut env.svm, &owner, &[cu_limit(), lock], "BudgetTooLow");
 }
 
@@ -1198,7 +1198,7 @@ fn segregated_wins_stay_out_of_the_budget_and_draws_refund_it() {
     assert!(player_state(&env, &first.pubkey()).3);
 
     // The segregated player wins: the payout goes to winnings, which no match stakes.
-    queue(&mut env, &first, army_a, advance);
+    queue(&mut env, &first, army_a);
     let snapshot = |units: &[Placement], body: BehaviorBody| -> Vec<SnapshotUnit> {
         units.iter().map(|&(kind, col, row)| SnapshotUnit::catalog(Race::Ashborn.id(), kind.id(), body, col, row).unwrap()).collect()
     };
@@ -1206,20 +1206,20 @@ fn segregated_wins_stay_out_of_the_budget_and_draws_refund_it() {
     let seed = sha256(battle_pda(&env, 0, 0).as_ref());
     let (winner, _) = simulate(&snapshot(&strong, behavior_march()), &snapshot(&weak, BehaviorBody::parse(&still_body()).unwrap()), seed, Geometry { cols: 8, rows: 6 });
     assert_eq!(winner, Some(Side::A), "the fixture needs side A to win");
-    let logs = lock_match(&mut env, &second, army_b, hold, army_a, &first);
+    let logs = lock_match(&mut env, &second, army_b, army_a, &first);
     assert_eq!(resolved(&logs), (1, FEE));
     assert_eq!(player_state(&env, &first.pubkey()), (0, CREDIT, 0, true, 0));
     assert_eq!(player_state(&env, &second.pubkey()), (0, 0, 0, false, 0));
     // The winnings cannot be staked: locking again needs a fresh budget.
     let ground = pda(&[b"battleground", &[0]], &env.program).0;
-    let lock = lock_ix(&env, &first, ground, army_a, Address::new_unique(), &[advance], vec![]);
+    let lock = lock_ix(&env, &first, ground, army_a, Address::new_unique(), vec![]);
     send_expect_reason(&mut env.svm, &first, &[cu_limit(), lock], "BudgetTooLow");
 
     // A draw returns each stake to its budget, segregated or not.
     let calm_a = env.army(&first, 0, 1, AshbornKind::Guard.id(), hold);
     let calm_b = env.army(&second, 0, 1, AshbornKind::Guard.id(), hold);
-    queue(&mut env, &first, calm_a, hold);
-    let logs = lock_match(&mut env, &second, calm_b, hold, calm_a, &first);
+    queue(&mut env, &first, calm_a);
+    let logs = lock_match(&mut env, &second, calm_b, calm_a, &first);
     assert_eq!(resolved(&logs), (3, 0));
     assert_eq!(player_state(&env, &first.pubkey()), (STAKE, CREDIT, 0, true, 0));
 
@@ -1273,11 +1273,50 @@ fn full_armies_resolve_on_every_battleground() {
         env.fund(&second);
         let army_a = env.squad(&first, ground_id, 0, units, behavior);
         let army_b = env.squad(&second, ground_id, 0, units, behavior);
-        queue(&mut env, &first, army_a, behavior);
-        let logs = lock_match_on(&mut env, ground_id, &second, army_b, behavior, army_a, &first);
+        queue(&mut env, &first, army_a);
+        let logs = lock_match_on(&mut env, ground_id, &second, army_b, army_a, &first);
         println!("ground {ground_id}: settle_match consumed {} CU", program_cost(&env, &logs));
         assert!((1..=3).contains(&resolved(&logs).0));
         assert!(env.svm.get_account(&battle_pda(&env, ground_id, 0)).is_none_or(|account| account.lamports == 0), "settling closed the battle");
+    }
+}
+
+#[test]
+fn the_largest_boards_settle_full_armies_and_one_tile_more_is_refused() {
+    // `MAX_TILES` and `MAX_ROWS`: Citadel's 12 x 10, and the widest board of the same area. Ten
+    // units a side on a budget no real battleground uses, so the battle runs long.
+    let cast_and_strike = BehaviorBody::parse(&[1, 1, 0, 0, 0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0]).unwrap();
+    let kinds = [AshbornKind::Warden, AshbornKind::Vanguard, AshbornKind::Guard, AshbornKind::Archer, AshbornKind::Skirmisher];
+    for (cols, rows) in [(12u8, 10u8), (30, 4)] {
+        assert_eq!(cols as i32 * rows as i32, horizon_combat::MAX_TILES);
+        let mut env = setup();
+        env.create_battleground(3, 50, STAKE, cols, rows);
+        let units: Vec<Placement> = (0..MAX_UNITS as u8).map(|at| (kinds[at as usize % kinds.len()], at % cols, at / cols)).collect();
+        let behavior = env.behavior(&cast_and_strike.canonical_bytes());
+        let first = Keypair::new();
+        let second = Keypair::new();
+        env.fund(&first);
+        env.fund(&second);
+        let army_a = env.squad(&first, 3, 0, &units, behavior);
+        let army_b = env.squad(&second, 3, 0, &units, behavior);
+        queue(&mut env, &first, army_a);
+        let logs = lock_match_on(&mut env, 3, &second, army_b, army_a, &first);
+        println!("{cols} x {rows}: settle_match consumed {} CU", program_cost(&env, &logs));
+        assert!((1..=3).contains(&resolved(&logs).0));
+    }
+
+    let mut env = setup();
+    for (id, cols, rows) in [(3u8, 13u8, 10u8), (4, 12, 11), (5, 11, 11), (6, 8, 15), (7, 31, 4)] {
+        let (ground, _) = pda(&[b"battleground", &[id]], &env.program);
+        let mut data = vec![id];
+        data.extend_from_slice(&50u16.to_le_bytes());
+        data.extend_from_slice(&STAKE.to_le_bytes());
+        data.extend_from_slice(&[cols, rows]);
+        let accounts =
+            vec![meta(env.admin.pubkey(), true, true), meta(env.config, false, false), meta(ground, true, false), meta(SYSTEM, false, false)];
+        let admin = env.admin.insecure_clone();
+        send_expect_reason(&mut env.svm, &admin, &[ix(env.program, accounts, disc("create_battleground", &data))], "BadGrid");
+        assert!(env.svm.get_account(&ground).is_none(), "{cols} x {rows} made no battleground");
     }
 }
 
@@ -1351,8 +1390,8 @@ fn cu_benchmark() {
             env.fund(&second);
             let army_a = env.squad(&first, ground_id, 0, &units_a, behavior_a);
             let army_b = env.squad(&second, ground_id, 0, &units_b, behavior_b);
-            queue(&mut env, &first, army_a, behavior_a);
-            let logs = lock_match_seeded(&mut env, ground_id, &second, army_b, behavior_b, army_a, &first, Some(seed));
+            queue(&mut env, &first, army_a);
+            let logs = lock_match_seeded(&mut env, ground_id, &second, army_b, army_a, &first, Some(seed));
             let cost = program_cost(&env, &logs);
             for line in &logs {
                 let Some(rest) = line.strip_prefix("Program log: ") else { continue };
@@ -1498,19 +1537,19 @@ fn battle_pda(env: &Env, ground_id: u8, seq: u64) -> Address {
 }
 
 /// Queues `army`, first funding its owner's budget with one stake when it holds less.
-fn queue(env: &mut Env, player: &Keypair, army: Address, behavior: Address) {
+fn queue(env: &mut Env, player: &Keypair, army: Address) {
     let stored: [u8; 32] = env.svm.get_account(&army).unwrap().data[40..72].try_into().unwrap();
     let ground = Address::from(stored);
     cover_stake(env, player, &ground);
     let battle = Address::new_unique();
-    let mut lock = lock_ix(env, player, ground, army, battle, &[behavior], vec![]);
+    let mut lock = lock_ix(env, player, ground, army, battle, vec![]);
     // A lock that only queues passes the battle read-only, as the rollup requires.
     lock.accounts.iter_mut().filter(|meta| meta.pubkey == battle).for_each(|meta| meta.is_writable = false);
     send(&mut env.svm, player, &[cu_limit(), lock]);
 }
 
-/// `lock_army`: the fixed accounts, then the army's behaviors, then `rest`.
-fn lock_ix(env: &Env, player: &Keypair, ground: Address, army: Address, battle: Address, behaviors: &[Address], rest: Vec<AccountMeta>) -> Instruction {
+/// `lock_army`: the fixed accounts, then `rest`.
+fn lock_ix(env: &Env, player: &Keypair, ground: Address, army: Address, battle: Address, rest: Vec<AccountMeta>) -> Instruction {
     let mut accounts = vec![
         meta(player.pubkey(), true, true),
         meta(player_pda(env, &player.pubkey()), true, false),
@@ -1526,13 +1565,12 @@ fn lock_ix(env: &Env, player: &Keypair, ground: Address, army: Address, battle: 
         meta(address!("SysvarS1otHashes111111111111111111111111111"), false, false),
         meta(SYSTEM, false, false),
     ];
-    accounts.extend(behaviors.iter().map(|&key| meta(key, false, false)));
     accounts.extend(rest);
     ix(env.program, accounts, disc("lock_army", &[]))
 }
 
 fn unlock_ix(env: &Env, player: &Keypair, ground: Address, army: Address) -> Instruction {
-    ix(env.program, vec![meta(player.pubkey(), true, true), meta(ground, true, false), meta(army, true, false)], disc("unlock_army", &[]))
+    ix(env.program, vec![meta(player.pubkey(), false, true), meta(ground, true, false), meta(army, true, false)], disc("unlock_army", &[]))
 }
 
 /// Funds the owner's budget up to one stake of `ground`, registering the owner first and topping
@@ -1557,14 +1595,14 @@ fn ground_queue_len(env: &Env, ground: &Address) -> u8 {
     env.svm.get_account(ground).unwrap().data[54]
 }
 
-fn lock_match(env: &mut Env, player: &Keypair, army: Address, behavior: Address, opponent: Address, opponent_owner: &Keypair) -> Vec<String> {
-    lock_match_on(env, 0, player, army, behavior, opponent, opponent_owner)
+fn lock_match(env: &mut Env, player: &Keypair, army: Address, opponent: Address, opponent_owner: &Keypair) -> Vec<String> {
+    lock_match_on(env, 0, player, army, opponent, opponent_owner)
 }
 
 /// Locks into a queued opponent and fulfills the VRF in the same transaction, then settles. Returns
 /// the settlement's logs.
-fn lock_match_on(env: &mut Env, ground_id: u8, player: &Keypair, army: Address, behavior: Address, opponent: Address, opponent_owner: &Keypair) -> Vec<String> {
-    lock_match_seeded(env, ground_id, player, army, behavior, opponent, opponent_owner, None)
+fn lock_match_on(env: &mut Env, ground_id: u8, player: &Keypair, army: Address, opponent: Address, opponent_owner: &Keypair) -> Vec<String> {
+    lock_match_seeded(env, ground_id, player, army, opponent, opponent_owner, None)
 }
 
 /// As [`lock_match_on`], with the VRF randomness given instead of `SHA-256(battle)`.
@@ -1574,12 +1612,11 @@ fn lock_match_seeded(
     ground_id: u8,
     player: &Keypair,
     army: Address,
-    behavior: Address,
     opponent: Address,
     opponent_owner: &Keypair,
     seed: Option<[u8; 32]>,
 ) -> Vec<String> {
-    let (battle, _) = lock_and_seed(env, ground_id, player, army, behavior, opponent, opponent_owner, seed);
+    let (battle, _) = lock_and_seed(env, ground_id, player, army, opponent, opponent_owner, seed);
     settle(env, &battle)
 }
 
@@ -1591,7 +1628,6 @@ fn lock_and_seed(
     ground_id: u8,
     player: &Keypair,
     army: Address,
-    behavior: Address,
     opponent: Address,
     opponent_owner: &Keypair,
     seed: Option<[u8; 32]>,
@@ -1608,7 +1644,7 @@ fn lock_and_seed(
     let seed = seed.unwrap_or_else(|| sha256(battle.as_ref()));
     let fulfill = mock_fulfill(env, &battle, &player.pubkey(), &seed);
     let opponent_player = player_pda(env, &opponent_owner.pubkey());
-    let lock = lock_ix(env, player, ground, army, battle, &[behavior], vec![meta(opponent, true, false), meta(opponent_player, true, false)]);
+    let lock = lock_ix(env, player, ground, army, battle, vec![meta(opponent, true, false), meta(opponent_player, true, false)]);
     let logs = send(&mut env.svm, player, &[cu_limit(), lock, fulfill]);
     (battle, logs)
 }
@@ -1743,8 +1779,8 @@ fn won_battle(env: &mut Env, segregate: bool) -> (Keypair, Keypair) {
         let call = [player_ix(env, &winner, "set_segregation", &[1])];
         send(&mut env.svm, &winner, &call);
     }
-    queue(env, &winner, army_a, advance);
-    let logs = lock_match(env, &loser, army_b, hold, army_a, &winner);
+    queue(env, &winner, army_a);
+    let logs = lock_match(env, &loser, army_b, army_a, &winner);
     assert_eq!(resolved(&logs), (1, FEE), "the fixture needs side A to win");
     (winner, loser)
 }
@@ -1860,8 +1896,8 @@ fn withdraw_never_touches_locked_stakes() {
     env.fund(&second);
     let army_a = env.army(&first, 0, 0, AshbornKind::Guard.id(), hold);
     let army_b = env.army(&second, 0, 0, AshbornKind::Guard.id(), hold);
-    queue(&mut env, &first, army_a, hold);
-    let (battle, _) = lock_and_seed(&mut env, 0, &second, army_b, hold, army_a, &first, None);
+    queue(&mut env, &first, army_a);
+    let (battle, _) = lock_and_seed(&mut env, 0, &second, army_b, army_a, &first, None);
     let ixs = [player_ix(&env, &first, "fund_budget", &30_000_000u64.to_le_bytes())];
     send(&mut env.svm, &first, &ixs);
     assert_eq!(player_state(&env, &first.pubkey()), (30_000_000, 0, STAKE, false, 1));

@@ -49,11 +49,20 @@ struct Input {
     seed: Vec<u8>,
 }
 
-/// An unknown cast effect or aim byte is an input error, not a silent default.
+/// Bound for every input stat. The catalog tops out under 100; an unbounded stat overflows the
+/// engine's arithmetic or stalls the browser on a huge speed.
+const MAX_STAT: i32 = 1000;
+
+/// An unknown cast effect or aim byte, or a stat outside `0..=MAX_STAT`, is an input error, not a silent default.
 fn convert(units: &[InputUnit]) -> Result<Vec<SnapshotUnit>, String> {
     units
         .iter()
         .map(|unit| {
+            for (name, value) in [("hp", unit.hp), ("atk", unit.atk), ("range", unit.range), ("speed", unit.speed), ("actions", unit.actions)] {
+                if !(0..=MAX_STAT).contains(&value) {
+                    return Err(format!("{name} {value} is outside 0..={MAX_STAT}"));
+                }
+            }
             Ok(SnapshotUnit {
                 kind: unit.kind,
                 behavior: BehaviorBody::parse(&unit.body).unwrap_or_default(),
@@ -123,4 +132,22 @@ pub fn blocked_json(cols: i32, rows: i32, seed: &[u8]) -> String {
 #[wasm_bindgen]
 pub fn hash_behavior(body: &[u8]) -> String {
     behavior_hash(body).iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::simulate_json;
+
+    fn input(speed: i64) -> String {
+        let unit = format!(r#"{{"kind":0,"body":[],"col":0,"row":0,"cost":1,"hp":10,"atk":5,"range":1,"speed":{speed},"actions":1,"cast":{{"damage":0,"range":0,"aoe":0}}}}"#);
+        format!(r#"{{"cols":4,"rows":6,"a":[{unit}],"b":[],"seed":{:?}}}"#, [0u8; 32])
+    }
+
+    #[test]
+    fn stats_outside_the_bound_are_input_errors() {
+        assert!(!simulate_json(&input(1000)).contains("error"));
+        assert!(simulate_json(&input(1001)).contains("speed 1001 is outside"));
+        assert!(simulate_json(&input(-1)).contains("speed -1 is outside"));
+        assert!(simulate_json(&input(i32::MAX as i64)).contains("error"));
+    }
 }

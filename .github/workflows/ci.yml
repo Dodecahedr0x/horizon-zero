@@ -36,6 +36,8 @@ jobs:
           wasm-pack build --target web --out-dir ../../app/src/combat-wasm crates/combat --features wasm
           pnpm install
           pnpm --filter app test
+          pnpm --filter app build
+          node -e "import('./app/chain/http.mjs')"
           pnpm --filter asset-studio test
 
   localnet:

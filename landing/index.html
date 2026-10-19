@@ -56,6 +56,19 @@
       <a class="scroll-cue" href="#match" aria-label="Scroll to the match"><span></span></a>
     </section>
 
+    <!-- The trailer, played once without player chrome; it stops on its title frame. -->
+    <section class="reel" aria-label="Trailer">
+      <div class="reel-frame">
+        <video class="reel-video" muted playsinline preload="none" disablepictureinpicture disableremoteplayback poster="/trailer/first.jpg" aria-label="Horizon Zero trailer: the Ashborn rise from the ash, the Rootborn grove walks, the Deeplings climb out of the drowned harbor, and their armies meet on the grid.">
+          <track kind="captions" srclang="en" label="English" src="/trailer/trailer.vtt" default>
+        </video>
+        <div class="reel-controls">
+          <button class="reel-cue reel-pause" type="button" hidden>Pause</button>
+          <button class="reel-cue" type="button" hidden>Sound</button>
+        </div>
+      </div>
+    </section>
+
     <section class="match" id="match" aria-labelledby="match-title">
       <h2 id="match-title">The match</h2>
       <p class="lead">Three moves. After the third, nobody touches the fight.</p>
@@ -135,7 +148,7 @@
     <section class="front" id="front" aria-labelledby="front-title" data-state="loading">
       <div class="front-head">
         <h2 id="front-title">The front</h2>
-        <p class="front-pulse" aria-live="polite"><i aria-hidden="true"></i><span data-live>Reading the field…</span></p>
+        <p class="front-pulse"><i aria-hidden="true"></i><span data-live>Reading the field…</span></p>
       </div>
       <p class="lead">Counted from the chain as it happens. Every battle here was staked, seeded, and fought to the end.</p>
       <dl class="tally">

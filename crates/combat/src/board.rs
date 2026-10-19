@@ -1,6 +1,6 @@
 //! The grid: geometry, the rubble a seed places, and tile lookups during a battle.
 
-use crate::{mix, Side, MAX_COLS, MAX_ROWS, ZONE_DEPTH};
+use crate::{mix, Side, MAX_COLS, MAX_ROWS, MAX_TILES, ZONE_DEPTH};
 use core::cell::RefCell;
 
 /// Columns and rows of one battleground. Starting zones are the top and bottom
@@ -12,8 +12,10 @@ pub struct Geometry {
 }
 
 impl Geometry {
+    /// At least one column and both zones, within the column, row and tile caps that keep a full
+    /// settle inside the program's heap and compute budget.
     pub fn playable(self) -> bool {
-        self.cols >= 1 && self.rows >= ZONE_DEPTH * 2 && self.cols <= MAX_COLS && self.rows <= MAX_ROWS
+        self.cols >= 1 && self.rows >= ZONE_DEPTH * 2 && self.cols <= MAX_COLS && self.rows <= MAX_ROWS && self.cols * self.rows <= MAX_TILES
     }
 
     pub fn non_zone_tiles(self) -> i32 {

@@ -91,6 +91,29 @@ fn canonical_body_rejects_empty_and_oversized_sequences() {
 }
 
 #[test]
+fn is_valid_matches_the_canonical_round_trip() {
+    let round_trip = |body: BehaviorBody| BehaviorBody::parse(&body.canonical_bytes()).is_some();
+    let mut bodies = vec![BehaviorBody::default(), still(), behavior_kite_cast(), behavior_flank_left_cast()];
+    for len in [0u8, 1, 4, 5, 255] {
+        for action_len in [0u8, 3, 4, 200] {
+            let mut body = behavior_charge_cast();
+            body.len = len;
+            for element in body.elements.iter_mut() {
+                element.action_len = action_len;
+            }
+            bodies.push(body);
+        }
+    }
+    let mut late = behavior_charge_cast();
+    late.len = 1;
+    late.elements[1].action_len = 9;
+    bodies.push(late);
+    for body in bodies {
+        assert_eq!(body.is_valid(), round_trip(body), "{body:?}");
+    }
+}
+
+#[test]
 fn still_units_draw_when_the_round_limit_is_reached() {
     let seed = [7u8; 32];
     let (winner, events) = simulate(&[dummy(AshbornKind::Guard, 0, 0)], &[dummy(AshbornKind::Guard, 0, 0)], seed, outpost());
@@ -443,7 +466,7 @@ fn guard_cast_pushes_two_tiles() {
 fn sprint_doubles_the_movement_of_that_round() {
     // Cast first, then charge: the self cast fires at the first step and does not stop the run.
     let sprint_charge = BehaviorBody::parse(&[1, 1, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0]).unwrap();
-    let (_, events) = simulate(&[unit(AshbornKind::Skirmisher, sprint_charge, 0, 0)], &[dummy(AshbornKind::Guard, 0, 0)], [0u8; 32], lane(16));
+    let (_, events) = simulate(&[unit(AshbornKind::Skirmisher, sprint_charge, 0, 0)], &[dummy(AshbornKind::Guard, 0, 0)], [0u8; 32], lane(MAX_ROWS));
     let first_round = &events[..events.iter().position(|event| matches!(event, TraceEvent::Round)).unwrap()];
     let moves = first_round.iter().filter(|event| matches!(event, TraceEvent::Move { side: Side::A, .. })).count();
     assert_eq!(moves, 6);
@@ -878,4 +901,14 @@ fn encode_catalog_behavior(behavior: &serde_json::Value) -> Vec<u8> {
         }
     }
     out
+}
+
+#[test]
+fn playable_boards_stay_within_the_row_and_tile_caps() {
+    for (cols, rows) in [(12, 10), (30, 4), (15, 8), (20, 6), (1, 4), (30, 4)] {
+        assert!(Geometry { cols, rows }.playable(), "{cols} x {rows}");
+    }
+    for (cols, rows) in [(13, 10), (12, 11), (11, 11), (8, 15), (6, 20), (32, 32), (33, 4), (0, 4), (4, 3)] {
+        assert!(!Geometry { cols, rows }.playable(), "{cols} x {rows}");
+    }
 }

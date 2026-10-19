@@ -52,7 +52,7 @@ pub enum HorizonError {
     FeeTooHigh,
     #[msg("Player budget does not cover the battleground stake")]
     BudgetTooLow,
-    #[msg("Player has too many battles that have not settled")]
+    #[msg("Player battle count would overflow")]
     PlayerBusy,
     #[msg("Player holds less than the amount asked for")]
     BalanceShort,

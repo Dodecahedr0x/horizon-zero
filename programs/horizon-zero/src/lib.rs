@@ -240,7 +240,6 @@ pub mod horizon_zero {
         require!(ctx.accounts.army.owner == player, HorizonError::NotOwner);
         require!(ctx.accounts.army.battleground == ctx.accounts.battleground.key(), HorizonError::WrongBattleground);
         require!(ctx.accounts.army.status == ArmyStatus::Idle, HorizonError::BadStatus);
-        require!(ctx.accounts.army.unit_count > 0, HorizonError::TooManyUnits);
         verify_pda(
             &[b"battleground", &[ctx.accounts.battleground.battleground_id]],
             &ctx.accounts.battleground.key(),
@@ -252,7 +251,6 @@ pub mod horizon_zero {
             ctx.accounts.army.bump,
         )?;
         require!(ctx.accounts.oracle_queue.owner == &VRF_PROGRAM_ID, HorizonError::BadQueue);
-        recheck_behaviors(&ctx.accounts.army, ctx.remaining_accounts)?;
 
         let stake = ctx.accounts.battleground.stake_lamports;
         require!(ctx.accounts.player_account.budget >= stake, HorizonError::BudgetTooLow);
@@ -980,17 +978,6 @@ fn load_units(race: u8, units: &[UnitInput], accounts: &[AccountInfo], budget: u
     Ok(stored)
 }
 
-fn recheck_behaviors(army: &Army, accounts: &[AccountInfo]) -> Result<()> {
-    for unit in army.units.iter().take(army.unit_count as usize) {
-        let account =
-            accounts.iter().find(|account| *account.key == unit.behavior).ok_or(HorizonError::MissingBehavior)?;
-        let behavior = Behavior::try_deserialize(&mut &account.try_borrow_data()?[..])?;
-        let bytes = behavior_bytes(&behavior)?;
-        require!(bytes == &unit.body[..unit.len as usize], HorizonError::HashMismatch);
-    }
-    Ok(())
-}
-
 /// What `queued_opponents` found in the battleground queue.
 struct QueueScan {
     /// Armies a locker may meet, each with the index of its owner's Player in the accounts.
@@ -1395,7 +1382,6 @@ pub struct LockArmy<'info> {
 
 #[derive(Accounts)]
 pub struct UnlockArmy<'info> {
-    #[account(mut)]
     pub player: Signer<'info>,
     #[account(mut)]
     pub battleground: Account<'info, Battleground>,

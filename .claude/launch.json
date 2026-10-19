@@ -60,6 +60,26 @@
       ],
       "port": 4730,
       "autoPort": false
+    },
+    {
+      "name": "game-dev-video",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": [
+        "-c",
+        "LOCAL_LEDGER_PORT=4743 LOCAL_LEDGER_PATH=/private/tmp/claude-501/-Users-dode-Documents-solana-horizon-zero/c3aedfc0-afe7-4b2c-8e79-ca7a38a2567e/scratchpad/video-ledger.db node app/local-ledger.mjs & cd app && LOCAL_LEDGER_PORT=4743 VITE_DEV_MODE=true exec node node_modules/vite/bin/vite.js --port 4740 --strictPort"
+      ],
+      "port": 4740,
+      "autoPort": false
+    },
+    {
+      "name": "game-chain",
+      "runtimeExecutable": "sh",
+      "runtimeArgs": [
+        "-c",
+        "cd app && VITE_DEV_MODE=false RPC_URL=http://127.0.0.1:8899 ER_RPC_URL=http://127.0.0.1:8899 exec node node_modules/vite/bin/vite.js --port 4750 --strictPort"
+      ],
+      "port": 4750,
+      "autoPort": false
     }
   ]
 }

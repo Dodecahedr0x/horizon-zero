@@ -103,8 +103,11 @@ impl BehaviorBody {
         out
     }
 
+    /// Whether `parse(canonical_bytes())` would accept this body, without allocating: the enums
+    /// are typed, so the only bad states are the counts. The program's heap never frees.
     pub fn is_valid(self) -> bool {
-        Self::parse(&self.canonical_bytes()).is_some()
+        let len = self.len as usize;
+        (1..=MAX_ELEMENTS).contains(&len) && self.elements[..len].iter().all(|element| element.action_len as usize <= MAX_ACTIONS)
     }
 }
 

@@ -133,13 +133,21 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
     setDrafts((current) => ({ ...current, [draftKey]: units }));
   }
 
+  // A read started for one wallet or backend must not land after the page has moved to another.
+  const chainNow = useRef(chain);
+  chainNow.current = chain;
+
   async function refresh() {
+    const at = chain;
     const me = await chain.owner();
+    if (chainNow.current !== at) return;
     setOwner(me);
     const known = await chain.behaviors();
+    if (chainNow.current !== at) return;
     setBehaviors(known);
     setBehaviorKey((current) => current || known[0]?.pubkey || "");
     const [mine, fought] = await Promise.all([chain.armies(me), chain.matches(me).catch(() => [] as Match[])]);
+    if (chainNow.current !== at) return;
     setArmies(mine);
     setMatches(fought);
     await Promise.all([refreshLocked(), refreshPlayer()]);
@@ -148,10 +156,13 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
   // A failed read leaves the Player unknown (not "no Player"), so nothing offers to register again.
   async function refreshPlayer() {
     try {
+      const at = chain;
       const [mine, protocol] = await Promise.all([chain.player(), chain.admin().catch(() => null)]);
+      if (chainNow.current !== at) return;
       setPlayer(mine);
       setConfig(protocol);
     } catch (err) {
+      if (chainNow.current !== chain) return;
       setPlayer(undefined);
       setConfig(null);
       throw new Error(`Your player could not be read: ${err instanceof Error ? err.message : String(err)}`);
@@ -160,7 +171,9 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
 
   // Armies locked and waiting in each battleground's queue, from every player.
   async function refreshLocked() {
+    const at = chain;
     const grounds = await chain.battlegrounds();
+    if (chainNow.current !== at) return;
     setLocked(Object.fromEntries(grounds.map((ground) => [ground.battlegroundId, ground.queue.length])));
   }
 
@@ -169,7 +182,7 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
     setOwner("");
     setPlayer(undefined);
     setConfig(null);
-    if (connected) refresh().catch((err) => setError(err.message));
+    if (connected) refresh().catch((err) => chainNow.current === chain && setError(err.message));
   }, [connected, chain]);
 
   // Other players lock and match too; keep the counts current while the page is open.

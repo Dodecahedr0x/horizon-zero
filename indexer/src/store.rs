@@ -21,6 +21,9 @@ pub const STATUS_AWAITING: u8 = 0;
 pub const STATUS_CANCELLED: u8 = 3;
 const ZERO_SEED: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
+/// The tables written from account updates, each with the slot of the update a row came from.
+const SLOT_TABLES: [&str; 4] = ["behaviors", "battlegrounds", "armies", "matches"];
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS behaviors (
     pubkey TEXT PRIMARY KEY,
@@ -31,8 +34,10 @@ CREATE TABLE IF NOT EXISTS behaviors (
     created_at INTEGER,
     updated_at INTEGER,
     created_date TEXT,
-    updated_date TEXT
+    updated_date TEXT,
+    slot INTEGER
 );
+CREATE INDEX IF NOT EXISTS behaviors_creator ON behaviors(creator);
 CREATE INDEX IF NOT EXISTS behaviors_created_date ON behaviors(created_date);
 CREATE INDEX IF NOT EXISTS behaviors_updated_date ON behaviors(updated_date);
 
@@ -45,7 +50,8 @@ CREATE TABLE IF NOT EXISTS battlegrounds (
     rows INTEGER NOT NULL,
     zone_depth INTEGER NOT NULL,
     queue_json TEXT NOT NULL,
-    match_seq INTEGER NOT NULL
+    match_seq INTEGER NOT NULL,
+    slot INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS armies (
@@ -55,8 +61,10 @@ CREATE TABLE IF NOT EXISTS armies (
     race INTEGER NOT NULL,
     idx INTEGER NOT NULL,
     status INTEGER NOT NULL,
-    units_json TEXT NOT NULL
+    units_json TEXT NOT NULL,
+    slot INTEGER
 );
+CREATE INDEX IF NOT EXISTS armies_owner ON armies(owner);
 
 CREATE TABLE IF NOT EXISTS matches (
     pubkey TEXT PRIMARY KEY,
@@ -79,9 +87,12 @@ CREATE TABLE IF NOT EXISTS matches (
     open_date TEXT,
     resolved_date TEXT,
     fee TEXT,
-    fee_bps INTEGER
+    fee_bps INTEGER,
+    slot INTEGER
 );
 CREATE INDEX IF NOT EXISTS matches_open_date ON matches(open_date);
+CREATE INDEX IF NOT EXISTS matches_player_a ON matches(player_a);
+CREATE INDEX IF NOT EXISTS matches_player_b ON matches(player_b);
 CREATE INDEX IF NOT EXISTS matches_resolved_date ON matches(resolved_date);
 
 CREATE TABLE IF NOT EXISTS resolutions (
@@ -309,6 +320,14 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     }
     // A resolution stored before seeds were has none, never matches a row, and is dropped when its
     // battle's Seeded update arrives.
+    // The slot of the update a row was last written from. A row from before the column has none and
+    // counts as older than any update.
+    for table in SLOT_TABLES {
+        let columns = table_columns(conn, table)?;
+        if !columns.is_empty() && !columns.iter().any(|name| name == "slot") {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN slot INTEGER;"))?;
+        }
+    }
     let resolutions = table_columns(conn, "resolutions")?;
     if !resolutions.is_empty() && !resolutions.iter().any(|name| name == "seed") {
         conn.execute_batch("ALTER TABLE resolutions ADD COLUMN seed TEXT;")?;
@@ -326,28 +345,64 @@ pub fn utc_day(unix: i64) -> Option<String> {
     DateTime::<Utc>::from_timestamp(unix, 0).map(|time| time.format("%Y-%m-%d").to_string())
 }
 
+/// Stores one account update, read at `slot`, and its wallets, in one transaction. A row last
+/// written from a later slot is left as it is: the startup or reconnect snapshot can arrive after
+/// a newer `programSubscribe` update. A row with no slot counts as older.
 pub fn record(
     conn: &Connection,
     pubkey: &str,
     account: &HorizonAccount,
+    slot: u64,
     unix: Option<i64>,
 ) -> rusqlite::Result<()> {
+    let slot = slot as i64;
+    let tx = conn.unchecked_transaction()?;
     match account {
-        HorizonAccount::Behavior(behavior) => record_behavior(conn, pubkey, behavior, unix)?,
-        HorizonAccount::Battleground(ground) => record_battleground(conn, pubkey, ground)?,
-        HorizonAccount::Army(army) => record_army(conn, pubkey, army)?,
-        HorizonAccount::Battle(battle) => record_battle(conn, pubkey, battle, unix)?,
+        HorizonAccount::Behavior(behavior) => record_behavior(&tx, pubkey, behavior, slot, unix)?,
+        HorizonAccount::Battleground(ground) => record_battleground(&tx, pubkey, ground, slot)?,
+        HorizonAccount::Army(army) => record_army(&tx, pubkey, army, slot)?,
+        HorizonAccount::Battle(battle) => record_battle(&tx, pubkey, battle, slot, unix)?,
     }
     for wallet in crate::decode::users_of(account) {
-        touch_user(conn, &wallet, unix)?;
+        touch_user(&tx, &wallet, unix)?;
     }
-    Ok(())
+    tx.commit()
+}
+
+/// Called with the slot of a fresh `getProgramAccounts` before its accounts are recorded. A stored
+/// slot past the RPC's current one comes from an older ledger (the local stack resets its ledger
+/// and slots restart while the database persists): every slot is cleared, so the new ledger's
+/// updates are not taken for stale ones. Returns whether it cleared them.
+/// How far a stored slot may sit past a snapshot's slot before the ledger counts as reset.
+const REWIND_MARGIN: i64 = 1_000;
+
+pub fn rewind_slots(conn: &Connection, snapshot_slot: u64) -> rusqlite::Result<bool> {
+    let newest: Option<i64> = conn.query_row(
+        "SELECT MAX(slot) FROM (
+            SELECT slot FROM behaviors UNION ALL SELECT slot FROM battlegrounds
+            UNION ALL SELECT slot FROM armies UNION ALL SELECT slot FROM matches
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    // Two snapshots answered a few slots apart (or a lagging RPC) are not a reset: a reset restarts
+    // slots near zero, far below what the database holds.
+    if newest.is_none_or(|newest| newest <= snapshot_slot as i64 + REWIND_MARGIN) {
+        return Ok(false);
+    }
+    let tx = conn.unchecked_transaction()?;
+    for table in SLOT_TABLES {
+        tx.execute(&format!("UPDATE {table} SET slot = NULL"), [])?;
+    }
+    tx.commit()?;
+    Ok(true)
 }
 
 fn record_behavior(
     conn: &Connection,
     pubkey: &str,
     behavior: &BehaviorAccount,
+    slot: i64,
     unix: Option<i64>,
 ) -> rusqlite::Result<()> {
     let existing = conn
@@ -364,8 +419,8 @@ fn record_behavior(
     conn.execute(
         "INSERT INTO behaviors (
             pubkey, creator, body_json, element_count, summary,
-            created_at, updated_at, created_date, updated_date
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            created_at, updated_at, created_date, updated_date, slot
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(pubkey) DO UPDATE SET
             creator = excluded.creator,
             body_json = excluded.body_json,
@@ -374,7 +429,9 @@ fn record_behavior(
             created_at = excluded.created_at,
             updated_at = excluded.updated_at,
             created_date = excluded.created_date,
-            updated_date = excluded.updated_date",
+            updated_date = excluded.updated_date,
+            slot = excluded.slot
+         WHERE behaviors.slot IS NULL OR excluded.slot >= behaviors.slot",
         params![
             pubkey,
             behavior.creator,
@@ -385,6 +442,7 @@ fn record_behavior(
             updated_at,
             created_at.and_then(utc_day),
             updated_at.and_then(utc_day),
+            slot,
         ],
     )?;
     Ok(())
@@ -394,11 +452,12 @@ fn record_battleground(
     conn: &Connection,
     pubkey: &str,
     ground: &BattlegroundAccount,
+    slot: i64,
 ) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO battlegrounds (
-            pubkey, battleground_id, budget, stake, cols, rows, zone_depth, queue_json, match_seq
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            pubkey, battleground_id, budget, stake, cols, rows, zone_depth, queue_json, match_seq, slot
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(pubkey) DO UPDATE SET
             battleground_id = excluded.battleground_id,
             budget = excluded.budget,
@@ -407,7 +466,9 @@ fn record_battleground(
             rows = excluded.rows,
             zone_depth = excluded.zone_depth,
             queue_json = excluded.queue_json,
-            match_seq = excluded.match_seq",
+            match_seq = excluded.match_seq,
+            slot = excluded.slot
+         WHERE battlegrounds.slot IS NULL OR excluded.slot >= battlegrounds.slot",
         params![
             pubkey,
             ground.battleground_id,
@@ -418,23 +479,26 @@ fn record_battleground(
             ground.zone_depth,
             serde_json::to_string(&ground.queue).unwrap_or_else(|_| "[]".to_string()),
             ground.match_seq,
+            slot,
         ],
     )?;
     Ok(())
 }
 
-fn record_army(conn: &Connection, pubkey: &str, army: &ArmyAccount) -> rusqlite::Result<()> {
+fn record_army(conn: &Connection, pubkey: &str, army: &ArmyAccount, slot: i64) -> rusqlite::Result<()> {
     let units: Vec<ArmyUnitOut> = army.units.iter().map(|unit| army_unit_out(unit, army.race)).collect();
     conn.execute(
-        "INSERT INTO armies (pubkey, owner, battleground, race, idx, status, units_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO armies (pubkey, owner, battleground, race, idx, status, units_json, slot)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(pubkey) DO UPDATE SET
             owner = excluded.owner,
             battleground = excluded.battleground,
             race = excluded.race,
             idx = excluded.idx,
             status = excluded.status,
-            units_json = excluded.units_json",
+            units_json = excluded.units_json,
+            slot = excluded.slot
+         WHERE armies.slot IS NULL OR excluded.slot >= armies.slot",
         params![
             pubkey,
             army.owner,
@@ -443,6 +507,7 @@ fn record_army(conn: &Connection, pubkey: &str, army: &ArmyAccount) -> rusqlite:
             army.index,
             army.status,
             serde_json::to_string(&units).unwrap_or_else(|_| "[]".to_string()),
+            slot,
         ],
     )?;
     Ok(())
@@ -451,7 +516,11 @@ fn record_army(conn: &Connection, pubkey: &str, army: &ArmyAccount) -> rusqlite:
 /// A battle's seed is all zeros while it is Awaiting and is set once, by `seed_match`. An update that
 /// would take a seeded row back to zeros is a stale snapshot and is skipped. A different non-zero
 /// seed is a new battle at a reused address (seq restarts after a ledger reset): its row starts over.
-/// The stored resolution with the same seed, if any, settles the row.
+/// The stored resolution with the same seed, if any, settles the row. An Awaiting update settles
+/// too when a resolution is stored that is no older than the battle's `open_at` (see `resolve`):
+/// the row takes the resolution's seed.
+///
+/// An update from an earlier slot than the row's is stale and is skipped before anything else.
 ///
 /// `open_at` is the battle's own `opened_at` (the program's Clock) when it has one, else the block
 /// time of the first Awaiting observation. A Cancelled row is never seeded again: an Awaiting
@@ -462,20 +531,25 @@ fn record_battle(
     conn: &Connection,
     pubkey: &str,
     battle: &BattleAccount,
+    slot: i64,
     unix: Option<i64>,
 ) -> rusqlite::Result<()> {
-    let tx = conn.unchecked_transaction()?;
+    // `record` holds the transaction.
+    let tx = conn;
     let existing = tx
         .query_row(
-            "SELECT open_at, seed, status FROM matches WHERE pubkey = ?1",
+            "SELECT open_at, seed, status, slot FROM matches WHERE pubkey = ?1",
             [pubkey],
-            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?, row.get::<_, u8>(2)?)),
+            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, String>(1)?, row.get::<_, u8>(2)?, row.get::<_, Option<i64>>(3)?)),
         )
         .optional()?;
     let seeded = !is_zero_seed(&battle.seed);
     let chain_open = (battle.opened_at > 0).then_some(battle.opened_at);
     let mut open_at = None;
-    if let Some((stored_open, stored_seed, stored_status)) = existing {
+    if let Some((stored_open, stored_seed, stored_status, stored_slot)) = existing {
+        if stored_slot.is_some_and(|stored| stored > slot) {
+            return Ok(());
+        }
         if !is_zero_seed(&stored_seed) && !seeded {
             return Ok(());
         }
@@ -516,18 +590,32 @@ fn record_battle(
         }
     }
     let mut resolution = None;
-    if seeded {
+    let mut row_seed = battle.seed.clone();
+    let awaiting = !seeded && battle.status == STATUS_AWAITING;
+    if seeded || awaiting {
         let stored = tx
             .query_row("SELECT outcome, fee, resolved_at, seed FROM resolutions WHERE pubkey = ?1", [pubkey], |row| {
                 Ok((row.get::<_, u8>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<i64>>(2)?, row.get::<_, Option<String>>(3)?))
             })
             .optional()?;
         if let Some((outcome, fee, resolved_at, seed)) = stored {
-            if seed.as_deref() == Some(battle.seed.as_str()) {
+            if seeded && seed.as_deref() == Some(battle.seed.as_str()) {
                 resolution = Some((outcome, fee, resolved_at));
-            } else {
+            } else if seeded {
                 // Another battle's resolution, or one stored before seeds were: it can never apply here.
                 tx.execute("DELETE FROM resolutions WHERE pubkey = ?1", [pubkey])?;
+            } else if let Some(seed) = seed.filter(|seed| !is_zero_seed(seed)) {
+                // A stale Awaiting snapshot of a battle seeded and settled since, or the log came first.
+                match (open_at, resolved_at) {
+                    (Some(open), Some(at)) if open > at => {
+                        // Settled before this battle opened: an older battle's at the address.
+                        tx.execute("DELETE FROM resolutions WHERE pubkey = ?1", [pubkey])?;
+                    }
+                    _ => {
+                        resolution = Some((outcome, fee, resolved_at));
+                        row_seed = seed;
+                    }
+                }
             }
         }
     }
@@ -542,8 +630,8 @@ fn record_battle(
         "INSERT INTO matches (
             pubkey, battleground, army_a, army_b, player_a, player_b, stake, seq,
             cols, rows, units_a, units_b, status, seed, outcome,
-            open_at, resolved_at, open_date, resolved_date, fee, fee_bps
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+            open_at, resolved_at, open_date, resolved_date, fee, fee_bps, slot
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
          ON CONFLICT(pubkey) DO UPDATE SET
             battleground = excluded.battleground,
             army_a = excluded.army_a,
@@ -564,7 +652,9 @@ fn record_battle(
             open_date = excluded.open_date,
             resolved_date = excluded.resolved_date,
             fee = excluded.fee,
-            fee_bps = excluded.fee_bps",
+            fee_bps = excluded.fee_bps,
+            slot = excluded.slot
+         WHERE matches.slot IS NULL OR excluded.slot >= matches.slot",
         params![
             pubkey,
             battle.battleground,
@@ -579,7 +669,7 @@ fn record_battle(
             serde_json::to_string(&units_a).unwrap_or_else(|_| "[]".to_string()),
             serde_json::to_string(&units_b).unwrap_or_else(|_| "[]".to_string()),
             status,
-            battle.seed,
+            row_seed,
             outcome,
             open_at,
             resolved_at,
@@ -587,9 +677,10 @@ fn record_battle(
             resolved_at.and_then(utc_day),
             fee,
             battle.fee_bps,
+            slot,
         ],
     )?;
-    tx.commit()
+    Ok(())
 }
 
 fn is_zero_seed(seed: &str) -> bool {
@@ -598,9 +689,13 @@ fn is_zero_seed(seed: &str) -> bool {
 
 /// Records `HZ_MATCH_RESOLVED`. `settle_match` closes the battle, so the log is the only place the
 /// outcome and fee appear. The resolution is kept on its own, keyed by battle and tagged with the
-/// seed: it settles the row only while the row holds that seed. So a log that arrives before the
-/// battle's Seeded row, or a stale account update after the log, still ends on Resolved, and an old
-/// battle's resolution never settles a new battle at the same address.
+/// seed: it settles the row while the row holds that seed, or while the row is Awaiting with a zero
+/// seed and opened no later than the resolution (unknown times do not block it), and then the row
+/// takes the seed. The second case is a battle seeded while `programSubscribe` was down, or seeded
+/// and settled in one slot: its Seeded update never arrives, since `settle_match` closes the
+/// account. So a log that arrives before the battle's row, or a stale account update after the
+/// log, still ends on Resolved, and an old battle's resolution never settles a new battle at the
+/// same address: that row holds another seed, or opened after the resolution.
 pub fn resolve(
     conn: &Connection,
     pubkey: &str,
@@ -629,9 +724,11 @@ pub fn resolve(
             outcome = ?2,
             fee = ?3,
             resolved_at = ?4,
-            resolved_date = ?5
-         WHERE pubkey = ?1 AND seed = ?6",
-        params![pubkey, outcome, fee.to_string(), resolved_at, resolved_at.and_then(utc_day), seed],
+            resolved_date = ?5,
+            seed = ?6
+         WHERE pubkey = ?1
+           AND (seed = ?6 OR (seed = ?7 AND status = ?8 AND (open_at IS NULL OR ?4 IS NULL OR open_at <= ?4)))",
+        params![pubkey, outcome, fee.to_string(), resolved_at, resolved_at.and_then(utc_day), seed, ZERO_SEED, STATUS_AWAITING],
     )?;
     tx.commit()
 }
@@ -768,11 +865,13 @@ fn battle_unit_out(unit: &BattleUnit, race: u8) -> BattleUnitOut {
     }
 }
 
-pub fn behaviors(conn: &Connection, range: &DayRange) -> rusqlite::Result<Vec<BehaviorOut>> {
+/// `limit` None is every row.
+pub fn behaviors(conn: &Connection, range: &DayRange, limit: Option<u32>) -> rusqlite::Result<Vec<BehaviorOut>> {
     let (filter, args) = behavior_filter(range);
     let sql = format!(
         "SELECT pubkey, creator, body_json, element_count, summary, created_at, updated_at, created_date, updated_date
-         FROM behaviors{filter} ORDER BY pubkey"
+         FROM behaviors{filter} ORDER BY pubkey{}",
+        limit_clause(limit)
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
@@ -888,11 +987,15 @@ pub fn army_keys(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     rows.collect()
 }
 
-/// Drops armies that `close_army` removed from the chain.
-pub fn forget_armies(conn: &Connection, keys: &[String]) -> rusqlite::Result<usize> {
+/// Drops armies that `close_army` removed from the chain, as `getMultipleAccounts` saw them at
+/// `seen_slot`. A row written from a later slot is an account recreated since, and stays.
+pub fn forget_armies(conn: &Connection, keys: &[String], seen_slot: u64) -> rusqlite::Result<usize> {
     let mut removed = 0;
     for key in keys {
-        removed += conn.execute("DELETE FROM armies WHERE pubkey = ?1", [key])?;
+        removed += conn.execute(
+            "DELETE FROM armies WHERE pubkey = ?1 AND (slot IS NULL OR slot <= ?2)",
+            params![key, seen_slot as i64],
+        )?;
     }
     Ok(removed)
 }
@@ -910,13 +1013,27 @@ fn army_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArmyOut> {
     })
 }
 
-pub fn battles(conn: &Connection, range: &DayRange) -> rusqlite::Result<Vec<BattleOut>> {
-    let (filter, args) = battle_filter(range);
+/// Battles newest first (by `seq`), only `player`'s when given (as either player). `limit` None is
+/// every row.
+pub fn battles(
+    conn: &Connection,
+    range: &DayRange,
+    player: Option<&str>,
+    limit: Option<u32>,
+) -> rusqlite::Result<Vec<BattleOut>> {
+    let (mut filter, mut args) = battle_filter(range);
+    if let Some(player) = player {
+        let n = args.len() + 1;
+        let clause = format!("(player_a = ?{n} OR player_b = ?{n})");
+        filter = if filter.is_empty() { format!(" WHERE {clause}") } else { format!("{filter} AND {clause}") };
+        args.push(player.to_string());
+    }
     let sql = format!(
         "SELECT pubkey, battleground, army_a, army_b, player_a, player_b, stake, seq,
                 cols, rows, units_a, units_b, status, seed, outcome,
                 open_at, resolved_at, open_date, resolved_date, fee, fee_bps
-         FROM matches{filter} ORDER BY seq DESC, pubkey"
+         FROM matches{filter} ORDER BY seq DESC, pubkey{}",
+        limit_clause(limit)
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), battle_row)?;
@@ -986,14 +1103,16 @@ pub fn battleground(conn: &Connection, pubkey: &str) -> rusqlite::Result<Option<
     .optional()
 }
 
-pub fn users(conn: &Connection, range: &DayRange) -> rusqlite::Result<Vec<UserOut>> {
+/// `limit` None is every row.
+pub fn users(conn: &Connection, range: &DayRange, limit: Option<u32>) -> rusqlite::Result<Vec<UserOut>> {
     let (filter, args) = user_filter(range);
     let sql = format!(
         "SELECT wallet, first_seen, last_seen, first_date, last_date,
             (SELECT COUNT(*) FROM behaviors WHERE creator = users.wallet),
             (SELECT COUNT(*) FROM armies WHERE owner = users.wallet),
             (SELECT COUNT(*) FROM matches WHERE player_a = users.wallet OR player_b = users.wallet)
-         FROM users{filter} ORDER BY wallet"
+         FROM users{filter} ORDER BY wallet{}",
+        limit_clause(limit)
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(args.iter()), |row| {
@@ -1009,6 +1128,10 @@ pub fn users(conn: &Connection, range: &DayRange) -> rusqlite::Result<Vec<UserOu
         })
     })?;
     rows.collect()
+}
+
+fn limit_clause(limit: Option<u32>) -> String {
+    limit.map(|limit| format!(" LIMIT {limit}")).unwrap_or_default()
 }
 
 fn behavior_filter(range: &DayRange) -> (String, Vec<String>) {
@@ -1074,7 +1197,9 @@ pub fn parse_day(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::{decode_account_data, fixture, BATTLE_LEN, BATTLE_OUTCOME, BATTLE_STATUS, BEHAVIOR_LEN};
+    use crate::decode::{
+        decode_account_data, fixture, ARMY_LEN, BATTLEGROUND_LEN, BATTLE_LEN, BATTLE_OUTCOME, BATTLE_STATUS, BEHAVIOR_LEN,
+    };
     use solana_pubkey::Pubkey;
 
     fn temp_db() -> (Connection, std::path::PathBuf) {
@@ -1101,6 +1226,11 @@ mod tests {
             .expect("noon")
             .and_utc()
             .timestamp()
+    }
+
+    /// `record` at slot 1. Most tests here are about the seed and cancel rules, which hold within one slot.
+    fn record(conn: &Connection, pubkey: &str, account: &HorizonAccount, unix: Option<i64>) -> rusqlite::Result<()> {
+        super::record(conn, pubkey, account, 1, unix)
     }
 
     fn pubkey(byte: u8) -> Pubkey {
@@ -1158,7 +1288,7 @@ mod tests {
             from: Some("2026-10-01".into()),
             to: Some("2026-10-06".into()),
         };
-        let behavior_rows = behaviors(&conn, &week).expect("behaviors");
+        let behavior_rows = behaviors(&conn, &week, None).expect("behaviors");
         assert_eq!(behavior_rows.len(), 2);
         assert_eq!(behavior_rows[0].summary, "1 element: March");
         assert_eq!(behavior_rows[0].element_count, 1);
@@ -1167,7 +1297,7 @@ mod tests {
             from: Some("2026-10-06".into()),
             to: Some("2026-10-06".into()),
         };
-        let on_sixth = behaviors(&conn, &sixth).expect("sixth");
+        let on_sixth = behaviors(&conn, &sixth, None).expect("sixth");
         assert_eq!(on_sixth.len(), 1);
         assert_eq!(on_sixth[0].pubkey, "behavior-late");
 
@@ -1175,24 +1305,26 @@ mod tests {
             from: Some("2026-10-02".into()),
             to: Some("2026-10-02".into()),
         };
-        assert!(behaviors(&conn, &empty_day).expect("empty").is_empty());
-        assert!(behaviors(&conn, &DayRange::default()).expect("all").len() == 2);
+        assert!(behaviors(&conn, &empty_day, None).expect("empty").is_empty());
+        assert!(behaviors(&conn, &DayRange::default(), None).expect("all").len() == 2);
 
-        let battle_rows = battles(&conn, &sixth).expect("battles on resolve day");
+        let battle_rows = battles(&conn, &sixth, None, None).expect("battles on resolve day");
         assert_eq!(battle_rows.len(), 1);
         assert_eq!(battle_rows[0].open_date.as_deref(), Some("2026-10-01"));
         assert_eq!(battle_rows[0].resolved_date.as_deref(), Some("2026-10-06"));
         assert_eq!(battle_rows[0].status, 1);
         assert_eq!(battle_rows[0].outcome, 1);
         assert_eq!(battle_rows[0].stake, "50");
-        assert!(battles(&conn, &empty_day).expect("no battle").is_empty());
+        assert!(battles(&conn, &empty_day, None, None).expect("no battle").is_empty());
         assert_eq!(
             battles(
                 &conn,
                 &DayRange {
                     from: Some("2026-10-01".into()),
                     to: Some("2026-10-01".into())
-                }
+                },
+                None,
+                None
             )
             .expect("open day")
             .len(),
@@ -1205,6 +1337,7 @@ mod tests {
                 from: Some("2026-10-01".into()),
                 to: None,
             },
+            None,
         )
         .expect("users");
         let wallets: Vec<_> = user_rows.iter().map(|user| user.wallet.as_str()).collect();
@@ -1230,7 +1363,8 @@ mod tests {
             &DayRange {
                 from: Some("2026-10-03".into()),
                 to: Some("2026-10-03".into())
-            }
+            },
+            None
         )
         .expect("span")
         .iter()
@@ -1240,7 +1374,8 @@ mod tests {
             &DayRange {
                 from: Some("2026-10-07".into()),
                 to: None
-            }
+            },
+            None
         )
         .expect("after")
         .is_empty());
@@ -1290,7 +1425,7 @@ mod tests {
         assert_eq!(row.resolved_date.as_deref(), Some("2026-10-06"));
         assert_eq!(row.seed, seed(9));
 
-        let json = serde_json::to_value(&battles(&conn, &DayRange::default()).expect("all")[0]).expect("json");
+        let json = serde_json::to_value(&battles(&conn, &DayRange::default(), None, None).expect("all")[0]).expect("json");
         assert_eq!(json["fee"], "1000000");
         assert_eq!(json["feeBps"], 500);
         assert_eq!(json["status"], 1);
@@ -1304,7 +1439,7 @@ mod tests {
         let (conn, path) = temp_db();
         resolve(&conn, "battle-2", 3, 0, &seed(9), Some(noon("2026-10-06"))).expect("resolve");
         assert!(battle(&conn, "battle-2").expect("read").is_none());
-        assert!(battles(&conn, &DayRange::default()).expect("all").is_empty());
+        assert!(battles(&conn, &DayRange::default(), None, None).expect("all").is_empty());
 
         record(&conn, "battle-2", &seeded_battle(250), Some(noon("2026-10-05"))).expect("seeded");
         let row = battle(&conn, "battle-2").expect("read").expect("row");
@@ -1318,18 +1453,136 @@ mod tests {
     }
 
     #[test]
-    fn an_awaiting_row_waits_for_its_seeded_snapshot_before_the_resolution_applies() {
+    fn a_resolution_settles_an_awaiting_row_whose_seeded_update_was_missed() {
         let (conn, path) = temp_db();
-        record(&conn, "battle-3", &battle_account(100, 0), Some(noon("2026-10-04"))).expect("awaiting");
+        // Seeded while the subscription was down, or seeded and settled in one slot: the Seeded
+        // update never arrives, since settle_match closes the account.
+        record(&conn, "battle-3", &battle_opened(noon("2026-10-04"), 0), None).expect("awaiting");
         resolve(&conn, "battle-3", 2, 5, &seed(7), Some(noon("2026-10-06"))).expect("resolve");
         let row = battle(&conn, "battle-3").expect("read").expect("row");
-        assert_eq!((row.status, row.outcome, row.fee.as_deref(), row.resolved_at), (0, 0, None, None));
-
-        record(&conn, "battle-3", &battle_account(100, 7), Some(noon("2026-10-05"))).expect("seeded");
-        let row = battle(&conn, "battle-3").expect("read").expect("row");
         assert_eq!((row.status, row.outcome, row.fee.as_deref()), (1, 2, Some("5")));
+        assert_eq!(row.seed, seed(7), "the row takes the logged seed");
         assert_eq!(row.open_date.as_deref(), Some("2026-10-04"));
         assert_eq!(row.resolved_date.as_deref(), Some("2026-10-06"));
+
+        // A late Seeded or Awaiting snapshot leaves it Resolved.
+        record(&conn, "battle-3", &battle_opened(noon("2026-10-04"), 7), None).expect("seeded");
+        record(&conn, "battle-3", &battle_opened(noon("2026-10-04"), 0), None).expect("stale awaiting");
+        let row = battle(&conn, "battle-3").expect("read").expect("row");
+        assert_eq!((row.status, row.outcome, row.fee.as_deref(), row.seed), (1, 2, Some("5"), seed(7)));
+
+        // The log first, then a stale Awaiting snapshot read before the settlement.
+        resolve(&conn, "battle-3b", 1, 9, &seed(5), Some(noon("2026-10-06"))).expect("log first");
+        record(&conn, "battle-3b", &battle_opened(noon("2026-10-05"), 0), None).expect("stale awaiting");
+        let row = battle(&conn, "battle-3b").expect("read").expect("row");
+        assert_eq!((row.status, row.outcome, row.fee.as_deref(), row.seed), (1, 1, Some("9"), seed(5)));
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_resolution_older_than_an_awaiting_battle_is_another_battles() {
+        let (conn, path) = temp_db();
+        let opened = noon("2026-10-05");
+        // A reused address: the old battle's log replays while the row holds a newer Awaiting battle.
+        record(&conn, "battle-r1", &battle_opened(opened, 0), None).expect("awaiting");
+        resolve(&conn, "battle-r1", 1, 5, &seed(9), Some(opened - 60)).expect("old log");
+        let row = battle(&conn, "battle-r1").expect("read").expect("row");
+        assert_eq!((row.status, row.seed.as_str(), row.fee), (0, ZERO_SEED, None));
+
+        // The old log stored first, then the newer battle's Awaiting row: the log is dropped.
+        resolve(&conn, "battle-r2", 1, 5, &seed(9), Some(opened - 60)).expect("old log");
+        record(&conn, "battle-r2", &battle_opened(opened, 0), None).expect("awaiting");
+        assert_eq!(battle(&conn, "battle-r2").expect("read").expect("row").status, 0);
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM resolutions WHERE pubkey = 'battle-r2'", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(left, 0);
+
+        // A Cancelled row is never resolved.
+        record(&conn, "battle-r3", &battle_opened(opened, 0), None).expect("awaiting");
+        cancel(&conn, "battle-r3", Some(opened + 10)).expect("cancel");
+        resolve(&conn, "battle-r3", 1, 5, &seed(9), Some(opened + 20)).expect("stray log");
+        assert_eq!(battle(&conn, "battle-r3").expect("read").expect("row").status, STATUS_CANCELLED);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn an_update_from_an_earlier_slot_does_not_overwrite_a_newer_row() {
+        let (conn, path) = temp_db();
+        // The battle seeded at slot 20 by programSubscribe; a snapshot read at slot 10 lands after it.
+        super::record(&conn, "battle-s1", &battle_opened(noon("2026-10-05"), 7), 20, None).expect("seeded");
+        super::record(&conn, "battle-s1", &battle_opened(noon("2026-10-05"), 0), 10, None).expect("stale");
+        let row = battle(&conn, "battle-s1").expect("read").expect("row");
+        assert_eq!((row.status, row.seed), (2, seed(7)));
+        // The seed rule still holds within a slot, and a later slot writes as usual.
+        super::record(&conn, "battle-s1", &battle_opened(noon("2026-10-05"), 0), 20, None).expect("same slot");
+        assert_eq!(battle(&conn, "battle-s1").expect("read").expect("row").status, 2);
+        super::record(&conn, "battle-s1", &battle_opened(noon("2026-10-05"), 7), 30, None).expect("later");
+        let stored: i64 = conn.query_row("SELECT slot FROM matches WHERE pubkey = 'battle-s1'", [], |row| row.get(0)).expect("slot");
+        assert_eq!(stored, 30);
+
+        // The same for armies, battlegrounds and behaviors.
+        let ground = |queue: &[u8]| {
+            let mut data = fixture("Battleground", BATTLEGROUND_LEN);
+            // The queue length byte; the queued keys follow it.
+            data[54] = queue.len() as u8;
+            decode_account_data(&data).expect("battleground")
+        };
+        super::record(&conn, "ground", &ground(&[1]), 50, None).expect("newer");
+        super::record(&conn, "ground", &ground(&[]), 40, None).expect("older");
+        assert_eq!(battleground(&conn, "ground").expect("read").expect("row").queue.len(), 1);
+        let army = |status: u8| {
+            let mut data = fixture("Army", ARMY_LEN);
+            // The status byte, after the ten unit slots.
+            data[ARMY_LEN - 2] = status;
+            decode_account_data(&data).expect("army")
+        };
+        super::record(&conn, "army", &army(1), 50, None).expect("newer");
+        super::record(&conn, "army", &army(0), 40, None).expect("older");
+        assert_eq!(super::army(&conn, "army").expect("read").expect("row").status, 1);
+        super::record(&conn, "army", &army(0), 60, None).expect("later");
+        assert_eq!(super::army(&conn, "army").expect("read").expect("row").status, 0);
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn a_reset_ledger_clears_the_stored_slots() {
+        let (conn, path) = temp_db();
+        super::record(&conn, "battle-l1", &battle_opened(noon("2026-10-05"), 7), 5_000, None).expect("old ledger");
+        assert!(!rewind_slots(&conn, 5_000).expect("same ledger"));
+        // Slots restart after a reset; a new battle at the address comes from a low slot.
+        assert!(rewind_slots(&conn, 12).expect("reset"));
+        super::record(&conn, "battle-l1", &battle_opened(noon("2026-10-06"), 4), 12, None).expect("new ledger");
+        let row = battle(&conn, "battle-l1").expect("read").expect("row");
+        assert_eq!((row.status, row.seed), (2, seed(4)));
+        // Without the reset check the slot rule would have skipped it.
+        super::record(&conn, "battle-l1", &battle_opened(noon("2026-10-06"), 4), 5_000, None).expect("later");
+        assert!(super::record(&conn, "battle-l1", &battle_opened(noon("2026-10-07"), 3), 12, None).is_ok());
+        assert_eq!(battle(&conn, "battle-l1").expect("read").expect("row").seed, seed(4));
+        drop(conn);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn matches_filter_by_player_and_take_a_limit() {
+        let (conn, path) = temp_db();
+        for (seq, a, b) in [(1, "w1", "w2"), (2, "w3", "w1"), (3, "w2", "w3"), (4, "w1", "w3")] {
+            conn.execute(
+                "INSERT INTO matches (pubkey, battleground, army_a, army_b, player_a, player_b, stake, seq, cols, rows,
+                     units_a, units_b, status, seed, outcome)
+                 VALUES (?1, 'g', 'a', 'b', ?2, ?3, '5', ?4, 8, 6, '[]', '[]', 0, '', 0)",
+                rusqlite::params![format!("m{seq}"), a, b, seq],
+            )
+            .expect("insert");
+        }
+        let keys = |rows: Vec<BattleOut>| rows.into_iter().map(|row| row.pubkey).collect::<Vec<_>>();
+        assert_eq!(keys(battles(&conn, &DayRange::default(), Some("w1"), None).expect("w1")), ["m4", "m2", "m1"]);
+        assert_eq!(keys(battles(&conn, &DayRange::default(), Some("w1"), Some(2)).expect("w1 two")), ["m4", "m2"]);
+        assert_eq!(keys(battles(&conn, &DayRange::default(), None, Some(1)).expect("newest")), ["m4"]);
+        assert!(battles(&conn, &DayRange::default(), Some("nobody"), None).expect("none").is_empty());
         drop(conn);
         cleanup(&path);
     }
@@ -1529,8 +1782,15 @@ mod tests {
         assert!(columns.iter().any(|name| name == "fee"));
         assert!(columns.iter().any(|name| name == "fee_bps"));
         assert!(table_columns(&conn, "resolutions").expect("columns").iter().any(|name| name == "seed"));
+        assert!(columns.iter().any(|name| name == "slot"));
+        assert!(table_columns(&conn, "behaviors").expect("columns").iter().any(|name| name == "slot"));
         let row = battle(&conn, "kept").expect("read").expect("kept row");
         assert_eq!((row.outcome, row.fee, row.fee_bps), (2, None, None));
+        let slot: Option<i64> = conn.query_row("SELECT slot FROM matches WHERE pubkey = 'kept'", [], |row| row.get(0)).expect("slot");
+        assert_eq!(slot, None);
+        // A row from before the slot column has none, and any update overwrites it.
+        record(&conn, "kept", &battle_account(0, 4), None).expect("update");
+        assert_eq!(battle(&conn, "kept").expect("read").expect("kept row").status, 2);
         drop(conn);
         // Opening again finds the columns and leaves them be.
         drop(open(&path).expect("reopen"));
@@ -1551,12 +1811,16 @@ mod tests {
         let mut keys = army_keys(&conn).expect("keys");
         keys.sort();
         assert_eq!(keys, vec!["closed".to_string(), "kept".to_string()]);
-        assert_eq!(forget_armies(&conn, &["closed".to_string(), "never".to_string()]).expect("forget"), 1);
+        assert_eq!(forget_armies(&conn, &["closed".to_string(), "never".to_string()], 1).expect("forget"), 1);
         assert_eq!(army_keys(&conn).expect("keys"), vec!["kept".to_string()]);
+        // An account closed and recreated after getMultipleAccounts answered at slot 70 is kept.
+        conn.execute("UPDATE armies SET slot = 80 WHERE pubkey = 'kept'", []).expect("recreated");
+        assert_eq!(forget_armies(&conn, &["kept".to_string()], 70).expect("forget newer"), 0);
+        assert_eq!(forget_armies(&conn, &["kept".to_string()], 80).expect("forget at slot"), 1);
         // Pruning is for armies only: a settled battle's account is closed too, and its row stays.
         record(&conn, "closed", &seeded_battle(0), None).expect("battle");
         resolve(&conn, "closed", 1, 7, &seed(9), None).expect("resolve");
-        forget_armies(&conn, &["closed".to_string()]).expect("forget again");
+        forget_armies(&conn, &["closed".to_string()], 1).expect("forget again");
         assert!(battle(&conn, "closed").expect("read").is_some());
         drop(conn);
         cleanup(&path);
@@ -1569,9 +1833,9 @@ mod tests {
             from: Some("2026-10-06".into()),
             to: Some("2026-10-06".into()),
         };
-        assert!(behaviors(&conn, &day).expect("behaviors").is_empty());
-        assert!(battles(&conn, &day).expect("battles").is_empty());
-        assert!(users(&conn, &day).expect("users").is_empty());
+        assert!(behaviors(&conn, &day, None).expect("behaviors").is_empty());
+        assert!(battles(&conn, &day, None, None).expect("battles").is_empty());
+        assert!(users(&conn, &day, None).expect("users").is_empty());
         let empty = stats(&conn, 1_000_000).expect("stats");
         assert_eq!(empty.battles_fought, 0);
         assert_eq!(empty.staked_lamports, "0");
@@ -1585,8 +1849,8 @@ mod tests {
         let (conn, path) = temp_db();
         let now = noon("2026-10-13");
         conn.execute_batch(
-            "INSERT INTO battlegrounds VALUES ('g0', 0, 8, '50000000', 8, 6, 2, '[\"q1\",\"q2\"]', 3);
-             INSERT INTO battlegrounds VALUES ('g1', 1, 16, '200000000', 10, 8, 2, '[]', 1);
+            "INSERT INTO battlegrounds VALUES ('g0', 0, 8, '50000000', 8, 6, 2, '[\"q1\",\"q2\"]', 3, 1);
+             INSERT INTO battlegrounds VALUES ('g1', 1, 16, '200000000', 10, 8, 2, '[]', 1, 1);
              INSERT INTO users (wallet) VALUES ('w1'), ('w2'), ('w3');
              INSERT INTO behaviors (pubkey, creator, body_json, element_count, summary) VALUES ('b1', 'w1', '[]', 1, '');",
         )

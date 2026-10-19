@@ -342,6 +342,85 @@ h1 {
 
 /* ---------------------------------------------------------------- match */
 
+/* ---------------------------------------------------------------- the reel */
+
+.reel {
+  position: relative;
+  padding: clamp(24px, 6vw, 72px) 0 0;
+}
+
+/* No border, no controls: the frame dissolves into the night on every edge. */
+.reel-frame {
+  position: relative;
+  max-width: 1600px;
+  margin: 0 auto;
+  aspect-ratio: 16 / 9;
+  -webkit-mask-image:
+    linear-gradient(90deg, transparent, #000 9%, #000 91%, transparent),
+    linear-gradient(180deg, transparent, #000 14%, #000 84%, transparent);
+  -webkit-mask-composite: source-in;
+  mask-image:
+    linear-gradient(90deg, transparent, #000 9%, #000 91%, transparent),
+    linear-gradient(180deg, transparent, #000 14%, #000 84%, transparent);
+  mask-composite: intersect;
+}
+
+.reel-video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: var(--night);
+}
+
+/* Quiet words in the corner: pause, and sound, then "again" once the reel has ended. */
+.reel-controls {
+  position: absolute;
+  right: 13%;
+  bottom: 19%;
+  display: flex;
+  gap: 24px;
+}
+
+.reel-cue {
+  appearance: none;
+  border: 0;
+  border-bottom: 1px solid rgba(241, 233, 220, 0.35);
+  background: none;
+  padding: 0 0 2px;
+  color: var(--bone);
+  font: 500 14px/1.2 var(--text, inherit);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  opacity: 0.85;
+  text-shadow: 0 0 6px #000, 0 0 2px #000;
+  cursor: pointer;
+  transition: opacity 300ms, border-color 200ms;
+}
+
+.reel-cue::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 10px;
+  rotate: 45deg;
+  translate: 0 -2px;
+  background: var(--ember);
+  box-shadow: 0 0 8px var(--ember);
+}
+
+.reel-cue:hover, .reel-cue:focus-visible { opacity: 1; border-color: var(--ember-hot); }
+.reel-cue[aria-pressed="true"]::before { background: var(--ember-hot); }
+.reel-pause::before { display: none; }
+.reel-video::cue { font: 500 16px/1.3 var(--text, sans-serif); background: rgba(0, 0, 0, 0.6); }
+
+@media (max-width: 720px) {
+  .reel-frame { -webkit-mask-image: linear-gradient(180deg, transparent, #000 12%, #000 88%, transparent); mask-image: linear-gradient(180deg, transparent, #000 12%, #000 88%, transparent); }
+  .reel-controls { right: var(--gutter); bottom: 14%; }
+  .reel-cue { font-size: 12px; }
+}
+
 .match {
   position: relative;
   padding: clamp(96px, 14vw, 180px) var(--gutter) clamp(72px, 10vw, 140px);

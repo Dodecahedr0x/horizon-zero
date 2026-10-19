@@ -222,7 +222,7 @@ async function main() {
   log(`  VRF queue           ${EPHEMERAL_TEST_QUEUE} (ephemeral, oracle on the rollup)`);
   log(`  admin keypair       ${path.relative(root, admin)}`);
   if (indexing) log(`  indexer             ${INDEXER_URL}   db target/localnet/indexer.db`);
-  log(`  app env             VITE_DEV_MODE=false VITE_RPC_URL=${BASE_URL} VITE_ER_RPC_URL=${ER_URL} VITE_ORACLE_QUEUE=${EPHEMERAL_TEST_QUEUE}`);
+  log(`  app env             VITE_DEV_MODE=false RPC_URL=${BASE_URL} ER_RPC_URL=${ER_URL} ORACLE_QUEUE=${EPHEMERAL_TEST_QUEUE}`);
   log(`  fund a wallet       pnpm localnet:fund <address>`);
 
   if (args.has("--check")) {

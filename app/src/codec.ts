@@ -344,7 +344,7 @@ export const PROGRAM_ERRORS: readonly (readonly [name: string, message: string])
   ["DuplicatePosition", "Two units in one army cannot share a tile"],
   ["FeeTooHigh", "Fee rate is above the cap"],
   ["BudgetTooLow", "Player budget does not cover the battleground stake"],
-  ["PlayerBusy", "Player has too many battles that have not settled"],
+  ["PlayerBusy", "Player battle count would overflow"],
   ["BalanceShort", "Player holds less than the amount asked for"],
   ["RentShort", "Player free balance does not cover the account rent"],
   ["OutboxBusy", "Outbox still holds an unreleased withdrawal"],
@@ -652,7 +652,6 @@ export function lockArmyIx(args: {
   player: PublicKey;
   battlegroundId: number;
   army: PublicKey;
-  behaviors: PublicKey[];
   queue: PublicKey;
   seq: number;
   candidates: { army: PublicKey; owner: PublicKey }[];
@@ -672,7 +671,6 @@ export function lockArmyIx(args: {
     readonly(VRF_PROGRAM_ID),
     readonly(SLOT_HASHES),
     readonly(SystemProgram.programId),
-    ...args.behaviors.map(readonly),
   ];
   for (const candidate of args.candidates) keys.push(writable(candidate.army));
   for (const owner of new Set(args.candidates.map((candidate) => candidate.owner.toBase58()))) {
@@ -706,7 +704,7 @@ export function lockOpens(args: { locker: PublicKey; stake: bigint; armies: read
 }
 
 export function unlockArmyIx(player: PublicKey, battlegroundId: number, army: PublicKey) {
-  return ix("unlock_army", [signer(player), writable(battlegroundPda(battlegroundId)), writable(army)]);
+  return ix("unlock_army", [signer(player, false), writable(battlegroundPda(battlegroundId)), writable(army)]);
 }
 
 export function closeArmyIx(owner: PublicKey, army: PublicKey) {

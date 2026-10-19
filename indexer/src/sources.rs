@@ -1,8 +1,10 @@
 //! RPC account sources for the Carbon pipeline.
 //!
 //! `getProgramAccounts` sends one snapshot. `programSubscribe` streams later
-//! updates. A refused dial is logged with the URL and tried again every few
-//! seconds until shutdown. The pipeline stays up while the validator is down.
+//! updates, and after each successful (re)subscribe sends a fresh snapshot, so
+//! an update missed while the websocket was down is not lost. A refused dial is
+//! logged with the URL and tried again every few seconds until shutdown. The
+//! pipeline stays up while the validator is down.
 //!
 //! `logsSubscribe` streams the logs of transactions that mention the program.
 //! Carbon has no update type for bare logs, and a logs notification carries no
@@ -34,16 +36,22 @@ use tokio_util::sync::CancellationToken;
 const RPC_RETRY: Duration = Duration::from_secs(3);
 const RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Called with a snapshot's slot before its accounts are sent.
+pub type SnapshotHook = Arc<dyn Fn(u64) + Send + Sync>;
+
 pub struct ProgramSnapshot {
     rpc_url: String,
     program_id: Pubkey,
+    on_snapshot: SnapshotHook,
     retry: Duration,
     failures: Arc<AtomicU32>,
 }
 
 pub struct ProgramSubscribe {
     ws_url: String,
+    rpc_url: String,
     program_id: Pubkey,
+    on_snapshot: SnapshotHook,
     retry: Duration,
     failures: Arc<AtomicU32>,
 }
@@ -63,10 +71,11 @@ pub struct ProgramLogs {
 }
 
 impl ProgramSnapshot {
-    pub fn new(rpc_url: String, program_id: Pubkey) -> Self {
+    pub fn new(rpc_url: String, program_id: Pubkey, on_snapshot: SnapshotHook) -> Self {
         Self {
             rpc_url,
             program_id,
+            on_snapshot,
             retry: RPC_RETRY,
             failures: Arc::new(AtomicU32::new(0)),
         }
@@ -74,10 +83,12 @@ impl ProgramSnapshot {
 }
 
 impl ProgramSubscribe {
-    pub fn new(ws_url: String, program_id: Pubkey) -> Self {
+    pub fn new(ws_url: String, rpc_url: String, program_id: Pubkey, on_snapshot: SnapshotHook) -> Self {
         Self {
             ws_url,
+            rpc_url,
             program_id,
+            on_snapshot,
             retry: RPC_RETRY,
             failures: Arc::new(AtomicU32::new(0)),
         }
@@ -194,6 +205,62 @@ async fn pause(token: &CancellationToken, retry: Duration) -> bool {
     }
 }
 
+fn snapshot_client(rpc_url: &str) -> RpcClient {
+    RpcClient::new_with_timeout_and_commitment(rpc_url.to_string(), RPC_TIMEOUT, CommitmentConfig::confirmed())
+}
+
+/// One `getProgramAccounts`: `on_snapshot` gets its slot, then every account goes to the pipeline as
+/// an update at that slot. `Ok(true)` means the indexer is shutting down or the pipeline stopped.
+async fn send_snapshot(
+    rpc: &RpcClient,
+    program_id: &Pubkey,
+    on_snapshot: &SnapshotHook,
+    id: &DatasourceId,
+    sender: &tokio::sync::mpsc::Sender<(Update, DatasourceId)>,
+    cancellation_token: &CancellationToken,
+) -> Result<bool, String> {
+    let config = RpcProgramAccountsConfig {
+        with_context: Some(true),
+        account_config: RpcAccountInfoConfig {
+            encoding: Some(UiAccountEncoding::Base64),
+            commitment: Some(CommitmentConfig::confirmed()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let params = serde_json::json!([program_id.to_string(), config]);
+    let response = match rpc.send::<OptionalContext<Vec<RpcKeyedAccount>>>(RpcRequest::GetProgramAccounts, params).await {
+        Ok(OptionalContext::Context(response)) => response,
+        Ok(OptionalContext::NoContext(_)) => return Err("response had no slot".to_string()),
+        Err(err) => return Err(err.to_string()),
+    };
+    log::info!(
+        "Fetched {} accounts for program {} (slot: {})",
+        response.value.len(),
+        program_id,
+        response.context.slot
+    );
+    on_snapshot(response.context.slot);
+    for account in response.value {
+        if cancellation_token.is_cancelled() {
+            return Ok(true);
+        }
+        let Ok(pubkey) = Pubkey::from_str(&account.pubkey) else {
+            log::error!("Error parsing account pubkey. Value: {}", account.pubkey);
+            continue;
+        };
+        let Some(decoded) = account.account.to_account() else {
+            log::error!("Error decoding account {}", account.pubkey);
+            continue;
+        };
+        let update = account_update(pubkey, decoded, response.context.slot);
+        if sender.send((update, id.clone())).await.is_err() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[async_trait]
 impl Datasource for ProgramSnapshot {
     async fn consume(
@@ -202,65 +269,13 @@ impl Datasource for ProgramSnapshot {
         sender: tokio::sync::mpsc::Sender<(Update, DatasourceId)>,
         cancellation_token: CancellationToken,
     ) -> CarbonResult<()> {
-        let rpc = RpcClient::new_with_timeout_and_commitment(
-            self.rpc_url.clone(),
-            RPC_TIMEOUT,
-            CommitmentConfig::confirmed(),
-        );
-        let config = RpcProgramAccountsConfig {
-            with_context: Some(true),
-            account_config: RpcAccountInfoConfig {
-                encoding: Some(UiAccountEncoding::Base64),
-                commitment: Some(CommitmentConfig::confirmed()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let params = serde_json::json!([self.program_id.to_string(), config]);
-
+        let rpc = snapshot_client(&self.rpc_url);
         loop {
             if cancellation_token.is_cancelled() {
                 return Ok(());
             }
-            match rpc
-                .send::<OptionalContext<Vec<RpcKeyedAccount>>>(
-                    RpcRequest::GetProgramAccounts,
-                    params.clone(),
-                )
-                .await
-            {
-                Ok(OptionalContext::Context(response)) => {
-                    log::info!(
-                        "Fetched {} accounts for program {} (slot: {})",
-                        response.value.len(),
-                        self.program_id,
-                        response.context.slot
-                    );
-                    for account in response.value {
-                        if cancellation_token.is_cancelled() {
-                            return Ok(());
-                        }
-                        let Ok(pubkey) = Pubkey::from_str(&account.pubkey) else {
-                            log::error!("Error parsing account pubkey. Value: {}", account.pubkey);
-                            continue;
-                        };
-                        let Some(decoded) = account.account.to_account() else {
-                            log::error!("Error decoding account {}", account.pubkey);
-                            continue;
-                        };
-                        let update = account_update(pubkey, decoded, response.context.slot);
-                        if sender.send((update, id.clone())).await.is_err() {
-                            return Ok(());
-                        }
-                    }
-                    return Ok(());
-                }
-                Ok(OptionalContext::NoContext(_)) => {
-                    log::error!(
-                        "getProgramAccounts {}: response had no slot; retrying",
-                        self.rpc_url
-                    );
-                }
+            match send_snapshot(&rpc, &self.program_id, &self.on_snapshot, &id, &sender, &cancellation_token).await {
+                Ok(_) => return Ok(()),
                 Err(err) => {
                     self.failures.fetch_add(1, Ordering::Relaxed);
                     log::error!("getProgramAccounts {}: {err}; retrying", self.rpc_url);
@@ -285,6 +300,7 @@ impl Datasource for ProgramSubscribe {
         sender: tokio::sync::mpsc::Sender<(Update, DatasourceId)>,
         cancellation_token: CancellationToken,
     ) -> CarbonResult<()> {
+        let rpc = snapshot_client(&self.rpc_url);
         loop {
             if cancellation_token.is_cancelled() {
                 return Ok(());
@@ -329,6 +345,22 @@ impl Datasource for ProgramSubscribe {
                         continue;
                     }
                 };
+
+            // Anything that changed before the subscription took hold (a reconnect gap, or the
+            // time since the startup snapshot) arrives in this snapshot. Notifications queue on
+            // the subscription meanwhile. Updates carry their slot, so the order does not matter.
+            match send_snapshot(&rpc, &self.program_id, &self.on_snapshot, &id, &sender, &cancellation_token).await {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(err) => {
+                    self.failures.fetch_add(1, Ordering::Relaxed);
+                    log::error!("getProgramAccounts {} after subscribing: {err}; subscribing again", self.rpc_url);
+                    if pause(&cancellation_token, self.retry).await {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            }
 
             loop {
                 tokio::select! {
@@ -425,6 +457,7 @@ mod tests {
         let source = ProgramSnapshot {
             rpc_url: "http://127.0.0.1:1".to_string(),
             program_id: Pubkey::from_str("11111111111111111111111111111111").unwrap(),
+            on_snapshot: Arc::new(|_| {}),
             retry: Duration::from_millis(20),
             failures: Arc::clone(&failures),
         };
@@ -441,7 +474,9 @@ mod tests {
         let failures = Arc::new(AtomicU32::new(0));
         let source = ProgramSubscribe {
             ws_url: "ws://127.0.0.1:1".to_string(),
+            rpc_url: "http://127.0.0.1:1".to_string(),
             program_id: Pubkey::from_str("11111111111111111111111111111111").unwrap(),
+            on_snapshot: Arc::new(|_| {}),
             retry: Duration::from_millis(20),
             failures: Arc::clone(&failures),
         };

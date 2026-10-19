@@ -411,11 +411,19 @@ function send(res, status, body, type = "application/json") {
   else res.end(JSON.stringify(body));
 }
 
+const MAX_BODY = 1 << 20;
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on("data", (chunk) => chunks.push(chunk));
+    let size = 0;
+    // Past the cap the rest is read and dropped, so the 400 still reaches the client.
+    req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size <= MAX_BODY) chunks.push(chunk);
+    });
     req.on("end", () => {
+      if (size > MAX_BODY) return reject(new Error("request body too large"));
       try {
         resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : {});
       } catch (error) {
@@ -500,8 +508,19 @@ function startBatch(ground, army, rounds) {
 }
 
 const publicDir = path.join(here, "public");
+// The studio deletes folders, rewrites the catalog and spends API credits, so only its own page may
+// call it: another site's request carries a foreign Origin, and a DNS-rebound one a foreign Host.
+function sameOrigin(req) {
+  const bound = server.address().port;
+  const hosts = [`127.0.0.1:${bound}`, `localhost:${bound}`];
+  if (!hosts.includes(req.headers.host)) return false;
+  const origin = req.headers.origin;
+  return !origin || hosts.some((host) => origin === `http://${host}`);
+}
+
 const server = http.createServer(async (req, res) => {
   try {
+    if (!sameOrigin(req)) return send(res, 403, { error: "forbidden" });
     const url = new URL(req.url, `http://127.0.0.1:${port}`);
     if (req.method === "GET" && url.pathname === "/") {
       return send(res, 200, fs.readFileSync(path.join(publicDir, "index.html")), "text/html; charset=utf-8");
@@ -549,8 +568,8 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "GET" && url.pathname.startsWith("/files/")) {
       const file = path.resolve(assets, decodeURIComponent(url.pathname.slice("/files/".length)));
-      if (!file.startsWith(assets)) return send(res, 404, "missing");
-      if (!fs.existsSync(file)) return send(res, 404, "missing");
+      if (!file.startsWith(assets + path.sep)) return send(res, 404, "missing");
+      if (!fs.existsSync(file) || !fs.statSync(file).isFile()) return send(res, 404, "missing");
       const type = file.endsWith(".png") ? "image/png" : file.endsWith(".glb") ? "model/gltf-binary" : "application/octet-stream";
       const body = fs.readFileSync(file);
       res.writeHead(200, {

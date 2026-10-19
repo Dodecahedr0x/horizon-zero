@@ -43,8 +43,14 @@ pub use ids::*;
 pub use trace::{trace_text, TraceEvent};
 
 pub const ZONE_DEPTH: i32 = 2;
+/// Each row's occupancy and walk frontier is one `u32` bit mask.
 pub const MAX_COLS: i32 = 32;
-pub const MAX_ROWS: i32 = 32;
+/// Rows set the walk between the zones. A full settle on 12 x 11 or 8 x 15 nears or runs out of
+/// the 1.4M compute-unit limit; 10 rows keep every board under it.
+pub const MAX_ROWS: i32 = 10;
+/// `cols * rows`. Rubble, the flood fill and the walk waves are sized by the board on a 32 KiB
+/// heap that never frees: past Citadel's 12 x 10, full armies run it out (16 x 10 does).
+pub const MAX_TILES: i32 = 120;
 pub const MAX_ROUNDS: u32 = 12;
 pub const MAX_UNITS: usize = 10;
 

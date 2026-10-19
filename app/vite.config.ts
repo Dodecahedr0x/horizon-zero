@@ -39,6 +39,13 @@ export default defineConfig({
           res.setHeader("Content-Type", file.endsWith(".glb") ? "model/gltf-binary" : "application/octet-stream");
           fs.createReadStream(file).pipe(res);
         });
+        // The production server (app/server.js) answers /chain/*; this does the same in dev, so the
+        // RPC URLs stay in this process and never reach the page.
+        server.middlewares.use("/chain", (req, res, next) => {
+          server.ssrLoadModule("/chain/http.mjs")
+            .then(({ handleChain }) => handleChain(req, res, (req.url || "/").split("?")[0]))
+            .catch(next);
+        });
       },
     },
   ],

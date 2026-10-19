@@ -1,4 +1,5 @@
-//! HTTP API. Date filters use `date=YYYY-MM-DD` or `from` / `to`, UTC, inclusive.
+//! HTTP API. Date filters use `date=YYYY-MM-DD` or `from` / `to`, UTC, inclusive. List endpoints
+//! take `limit`, capped at `MAX_LIMIT`.
 
 use std::sync::{Arc, Mutex};
 
@@ -18,11 +19,24 @@ pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
 }
 
+/// The most rows a list endpoint returns for any `limit`.
+const MAX_LIMIT: u32 = 500;
+/// `/matches`, `/battles` and `/users` without `limit`. `/behaviors` has none: the game lists every
+/// behavior.
+const DEFAULT_LIMIT: u32 = 100;
+
 #[derive(Deserialize, Default)]
 pub struct DateParams {
     pub date: Option<String>,
     pub from: Option<String>,
     pub to: Option<String>,
+    pub limit: Option<u32>,
+    /// `/matches` and `/battles` only: battles where this wallet is either player.
+    pub player: Option<String>,
+}
+
+fn limit(params: &DateParams, default: Option<u32>) -> Option<u32> {
+    params.limit.or(default).map(|limit| limit.min(MAX_LIMIT))
 }
 
 pub fn router(state: AppState) -> Router {
@@ -53,7 +67,7 @@ async fn behaviors(
 ) -> Result<Json<Vec<store::BehaviorOut>>, ApiError> {
     let range = day_range(&params)?;
     let conn = lock(&state)?;
-    Ok(Json(store::behaviors(&conn, &range)?))
+    Ok(Json(store::behaviors(&conn, &range, limit(&params, None))?))
 }
 
 async fn battlegrounds(
@@ -96,7 +110,7 @@ async fn battles(
 ) -> Result<Json<Vec<store::BattleOut>>, ApiError> {
     let range = day_range(&params)?;
     let conn = lock(&state)?;
-    Ok(Json(store::battles(&conn, &range)?))
+    Ok(Json(store::battles(&conn, &range, params.player.as_deref(), limit(&params, Some(DEFAULT_LIMIT)))?))
 }
 
 async fn battle(
@@ -113,7 +127,7 @@ async fn users(
 ) -> Result<Json<Vec<store::UserOut>>, ApiError> {
     let range = day_range(&params)?;
     let conn = lock(&state)?;
-    Ok(Json(store::users(&conn, &range)?))
+    Ok(Json(store::users(&conn, &range, limit(&params, Some(DEFAULT_LIMIT)))?))
 }
 
 /// Public game-wide numbers. Any page may read them, so the landing site can call this across origins.

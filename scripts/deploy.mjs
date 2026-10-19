@@ -151,10 +151,9 @@ if (!has("--skip-bootstrap")) {
 
 const rollup = erUrl || "<rollup RPC>";
 process.stdout.write(`
-[deploy] done. Build the game for this cluster with:
-  VITE_DEV_MODE=false
-  VITE_RPC_URL=${url}
-  VITE_ER_RPC_URL=${rollup}
-  VITE_ORACLE_QUEUE=${ORACLE_QUEUE}
+[deploy] done. Build the game with VITE_DEV_MODE=false and run its server for this cluster with:
+  RPC_URL=${url}
+  ER_RPC_URL=${rollup}
+  ORACLE_QUEUE=${ORACLE_QUEUE}
 and point the indexer at the same rollup (not ${url}) with SOLANA_RPC_URL=${rollup}
 `);

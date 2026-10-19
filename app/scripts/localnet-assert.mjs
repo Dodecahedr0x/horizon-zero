@@ -383,14 +383,14 @@ for (const [i, wallet] of wallets.entries()) {
   const ephemeral = await er.getAccountInfo(behavior);
   probe(`behavior ${behavior.toBase58()} owner=${ephemeral.owner.toBase58()} lamports=${ephemeral.lamports} len=${ephemeral.data.length}`);
   await send(er, "create_army", [wallet], createArmyIx(owner, OUTPOST.id, 0, race.id, armyUnits(behavior)));
-  armies.push({ owner, army: armyPda(owner, 0), behavior });
+  armies.push({ owner, army: armyPda(owner, 0) });
 }
 
 const ground = battlegroundPda(OUTPOST.id);
 const groundState = async () => decodeBattleground((await er.getAccountInfo(ground)).data);
 const beforeLock = await Promise.all(wallets.map((wallet) => erPlayer(wallet.publicKey)));
 const lock = (index, candidates, seq) =>
-  lockArmyIx({ player: armies[index].owner, battlegroundId: OUTPOST.id, army: armies[index].army, behaviors: [armies[index].behavior], queue, seq, candidates, opens: candidates.length > 0 });
+  lockArmyIx({ player: armies[index].owner, battlegroundId: OUTPOST.id, army: armies[index].army, queue, seq, candidates, opens: candidates.length > 0 });
 let seq = (await groundState()).matchSeq;
 await send(er, "lock_army (queues)", [first], computeBudgetIx(), lock(0, [], seq));
 check((await groundState()).queue.includes(armies[0].army.toBase58()), "the first army is queued");

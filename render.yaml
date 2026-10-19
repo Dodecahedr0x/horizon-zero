@@ -16,14 +16,16 @@ services:
       # /api does not send this header. Unset uses the local landing dev and preview origins.
       - key: ASSET_CORS_ORIGINS
         sync: false
-      # The cluster the game bundle talks to, inlined at build time. See scripts/deploy.mjs.
-      - key: VITE_RPC_URL
+      # The server reads the chain and builds the transactions the browser signs (app/chain/http.mjs),
+      # so these are runtime variables and never reach the bundle. On Render the server exits at startup if any is unset.
+      # The Solana cluster. See scripts/deploy.mjs.
+      - key: RPC_URL
         sync: false
-      # The ephemeral rollup serving the validator Config pins. A production build has no default.
-      - key: VITE_ER_RPC_URL
+      # The ephemeral rollup serving the validator Config pins.
+      - key: ER_RPC_URL
         sync: false
       # An ephemeral queue: lock_army runs in the rollup (SDK DEFAULT_EPHEMERAL_QUEUE).
-      - key: VITE_ORACLE_QUEUE
+      - key: ORACLE_QUEUE
         value: 5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc
   - type: web
     name: horizon-zero-landing
@@ -58,7 +60,7 @@ services:
     envVars:
       - key: DATABASE_PATH
         value: /var/data/horizon.db
-      # The same ephemeral rollup as VITE_ER_RPC_URL, not the Solana RPC.
+      # The same ephemeral rollup as ER_RPC_URL, not the Solana RPC.
       - key: SOLANA_RPC_URL
         sync: false
       - key: PROGRAM_ID

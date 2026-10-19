@@ -26,6 +26,7 @@ app/src/combat-node/package.json
 tools/unit-rig/work/
 tools/trailer/out/
 magicblock-test-storage/
+**/.impeccable/
 
 # Deploy keypairs
 *-keypair.json

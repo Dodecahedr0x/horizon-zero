@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { loadCatalog } from "./load.mjs";
-import { MAX_BEHAVIOR_NAME_LEN, clipBehaviorName, encodeBehavior, nameBehavior } from "./interpret.mjs";
+import { MAX_BEHAVIOR_NAME_LEN, clipBehaviorName, encodeBehavior, nameBehavior, parseBehavior } from "./interpret.mjs";
 
 const standards = loadCatalog().behaviors;
 const nearest = { stat: 0, extremum: 0, side: 0 };
@@ -55,4 +55,32 @@ test("a long stored name is cut at a word with an ellipsis", () => {
   assert.ok(clipped.length <= MAX_BEHAVIOR_NAME_LEN);
   assert.equal(clipped, "Approach Lowest Distance Enemy…");
   assert.equal(clipBehaviorName("March"), "March");
+});
+
+test("parse and encode take only integer bytes inside each field's range", () => {
+  const good = [1, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0];
+  assert.deepEqual(encodeBehavior(parseBehavior(good)), good);
+  for (let index = 0; index < good.length; index += 1) {
+    for (const bad of [-1, 0.5, "0", undefined, null, Number.NaN, 9]) {
+      const body = good.slice();
+      body[index] = bad;
+      assert.equal(parseBehavior(body), null, `byte ${index} = ${String(bad)}`);
+    }
+  }
+  const element = () => ({ movement: { kind: 0, extremum: 0, stat: 0, side: 0, stop: 1 }, actions: [{ verb: 0, extremum: 0, stat: 0, side: 0 }] });
+  assert.deepEqual(encodeBehavior([element()]), good);
+  for (const field of ["kind", "extremum", "stat", "side", "stop"]) {
+    for (const bad of [-1, 0.5, "0", undefined, 4]) {
+      const elements = [element()];
+      elements[0].movement[field] = bad;
+      assert.equal(encodeBehavior(elements), null, `movement.${field} = ${String(bad)}`);
+    }
+  }
+  for (const field of ["verb", "extremum", "stat", "side"]) {
+    for (const bad of [-1, 0.5, "0", undefined, 3]) {
+      const elements = [element()];
+      elements[0].actions[0][field] = bad;
+      assert.equal(encodeBehavior(elements), null, `action.${field} = ${String(bad)}`);
+    }
+  }
 });

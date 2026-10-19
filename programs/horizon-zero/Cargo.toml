@@ -28,7 +28,7 @@ custom-panic = []
 cu-profile = ["combat/cu-profile"]
 
 [dependencies]
-anchor-lang = { version = "1.0.1", features = ["init-if-needed"] }
+anchor-lang = "1.0.1"
 ephemeral-vrf-sdk = { version = "0.17.3", features = ["anchor"] }
 ephemeral-rollups-sdk = { version = "0.17.3", features = ["anchor"] }
 combat = { path = "../../crates/combat" }

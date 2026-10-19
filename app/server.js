@@ -3,6 +3,14 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { handleChain, REQUIRED_ENV } from "./chain/http.mjs";
+
+// The /chain backend falls back to the local stack, which a deployment never wants.
+const missing = REQUIRED_ENV.filter((name) => !process.env[name]);
+if (missing.length && (process.env.RENDER || process.env.NODE_ENV === "production")) {
+  console.error(`horizon-zero: set ${missing.join(", ")} before starting the game server`);
+  process.exit(1);
+}
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const dist = path.join(root, "dist");
@@ -60,6 +68,14 @@ function inside(parent, target) {
 
 http.createServer((req, res) => {
   const url = new URL(req.url, "http://127.0.0.1");
+  if (url.pathname.startsWith("/chain/")) {
+    handleChain(req, res, url.pathname.slice("/chain".length)).catch((err) => {
+      console.error("chain call failed", err);
+      if (!res.headersSent) res.writeHead(500);
+      res.end();
+    });
+    return;
+  }
   if (url.pathname.startsWith("/api/")) {
     const target = new URL(url.pathname.slice(4) + url.search, indexer.endsWith("/") ? indexer : `${indexer}/`);
     const proxy = http.request(target, { method: req.method, headers: req.headers }, (upstream) => {

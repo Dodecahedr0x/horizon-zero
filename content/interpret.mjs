@@ -158,6 +158,9 @@ export function interpretCatalog(raw) {
   return { battlegrounds, races, behaviors };
 }
 
+// Every body byte is an integer id in 0..=max: no negatives, fractions, strings or holes.
+const inRange = (value, max) => Number.isInteger(value) && value >= 0 && value <= max;
+
 export function encodeBehavior(elements) {
   if (!Array.isArray(elements) || elements.length < 1 || elements.length > 4) return null;
   const out = [elements.length];
@@ -165,16 +168,15 @@ export function encodeBehavior(elements) {
     if (!element || !Array.isArray(element.actions) || element.actions.length > 3) return null;
     if (element.movement) {
       const movement = element.movement;
-      if (movement.kind > 3 || movement.extremum > 1 || movement.stat > 2 || movement.stop > 1) return null;
-      if (movement.side !== 0 && movement.side !== 1) return null;
+      if (!inRange(movement.kind, 3) || !inRange(movement.extremum, 1) || !inRange(movement.stat, 2)) return null;
+      if (!inRange(movement.side, 1) || !inRange(movement.stop, 1)) return null;
       out.push(1, movement.kind, movement.extremum, movement.stat, movement.side, movement.stop);
     } else {
       out.push(0);
     }
     out.push(element.actions.length);
     for (const action of element.actions) {
-      if (action.verb > 1 || action.extremum > 1 || action.stat > 2) return null;
-      if (action.side !== 0 && action.side !== 1) return null;
+      if (!action || !inRange(action.verb, 1) || !inRange(action.extremum, 1) || !inRange(action.stat, 2) || !inRange(action.side, 1)) return null;
       out.push(action.verb, action.extremum, action.stat, action.side);
     }
   }
@@ -185,11 +187,11 @@ export function parseBehavior(body) {
   if (!Array.isArray(body)) return null;
   let index = 0;
   const count = body[index++];
-  if (!count || count > 4 || body.length > MAX_BEHAVIOR_LEN) return null;
+  if (!inRange(count, 4) || count === 0 || body.length > MAX_BEHAVIOR_LEN) return null;
   const elements = [];
   for (let slot = 0; slot < count; slot += 1) {
     const present = body[index++];
-    if (present !== 0 && present !== 1) return null;
+    if (!inRange(present, 1)) return null;
     let movement = null;
     if (present === 1) {
       const kind = body[index++];
@@ -197,22 +199,18 @@ export function parseBehavior(body) {
       const stat = body[index++];
       const side = body[index++];
       const stop = body[index++];
-      if ([kind, extremum, stat, side, stop].some((value) => value === undefined)) return null;
-      if (kind > 3 || extremum > 1 || stat > 2 || stop > 1) return null;
-      if (side !== 0 && side !== 1) return null;
+      if (!inRange(kind, 3) || !inRange(extremum, 1) || !inRange(stat, 2) || !inRange(side, 1) || !inRange(stop, 1)) return null;
       movement = { kind, extremum, stat, side, stop };
     }
     const actionCount = body[index++];
-    if (actionCount === undefined || actionCount > 3) return null;
+    if (!inRange(actionCount, 3)) return null;
     const actions = [];
     for (let actionIndex = 0; actionIndex < actionCount; actionIndex += 1) {
       const verb = body[index++];
       const extremum = body[index++];
       const stat = body[index++];
       const side = body[index++];
-      if ([verb, extremum, stat, side].some((value) => value === undefined)) return null;
-      if (verb > 1 || extremum > 1 || stat > 2) return null;
-      if (side !== 0 && side !== 1) return null;
+      if (!inRange(verb, 1) || !inRange(extremum, 1) || !inRange(stat, 2) || !inRange(side, 1)) return null;
       actions.push({ verb, extremum, stat, side });
     }
     elements.push({ movement, actions });

@@ -10,6 +10,7 @@ flowchart TB
     App["app ChainAdapter"]
     Wasm["combat wasm replay"]
   end
+  Server["game server /chain:<br/>holds the RPC URLs, builds transactions"]
   Ledger["local ledger sqlite"]
   subgraph chain [On-chain program Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c]
     subgraph rollup [Rollup: delegated and ephemeral accounts]
@@ -39,11 +40,13 @@ flowchart TB
 
   App --> Wasm
   App --> Ledger
-  App --> Indexer
-  App --> Army
+  App -->|"calls, signed transactions"| Server
+  Server -->|"unsigned transactions"| App
+  Server --> Indexer
+  Server --> Army
   Army --> Battleground
   Army --> Behavior
-  App -->|"register and delegate on Solana, top up"| Player
+  Server -->|"register and delegate on Solana, top up"| Player
   Player -->|"sponsors"| Army
   Player -->|"sponsors"| Battle
   Battle -->|"settle_match pays"| Player

@@ -5,7 +5,10 @@
 //! `SOLANA_RPC_URL` is the MagicBlock ephemeral rollup's RPC: Armies, Behaviors
 //! and Battles exist only there, and Battlegrounds and Players are delegated to it.
 //! The pipeline's account decoder is fed by two RPC sources in this crate:
-//! `getProgramAccounts` on `SOLANA_RPC_URL`, then WebSocket `programSubscribe`.
+//! `getProgramAccounts` on `SOLANA_RPC_URL`, then WebSocket `programSubscribe`,
+//! which takes a fresh `getProgramAccounts` snapshot after every (re)subscribe.
+//! Rows keep the slot they were written from, and an update from an earlier
+//! slot does not overwrite them.
 //! A third source, WebSocket `logsSubscribe`, reads `HZ_MATCH_RESOLVED`:
 //! `settle_match` closes the battle, so the outcome and fee are only in that log.
 //! A websocket URL is derived from the HTTP URL the same way the previous
@@ -17,20 +20,22 @@
 //! Account updates carry a slot. Block time is `getBlockTime` for that slot,
 //! asked up to five times 200 ms apart: the rollup has no time for a slot until
 //! about 100 ms after it. If the RPC still has none, the row is stored with a
-//! null timestamp.
+//! null timestamp. An account update in a slot within `NEAR_SLOTS` of a slot
+//! already timed takes that slot's time instead of asking.
 //!
 //! `close_army` hands the account back to the System Program, and
 //! `programSubscribe` only reports accounts the program still owns, so a
 //! closed army never arrives as an update. Every `PRUNE_EVERY` the indexer
 //! reads its stored armies with `getMultipleAccounts` and deletes the rows
-//! whose account is gone or no longer owned by the program.
+//! whose account is gone or no longer owned by the program, unless the row was
+//! written from a slot later than the one that answer was read at.
 
 mod decode;
 mod http;
 mod sources;
 mod store;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -43,7 +48,7 @@ use decode::{HorizonAccount, HorizonDecoder, PROGRAM_ID};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
-use sources::{LogsSubscribe, ProgramLogs, ProgramSnapshot, ProgramSubscribe};
+use sources::{LogsSubscribe, ProgramLogs, ProgramSnapshot, ProgramSubscribe, SnapshotHook};
 use tokio_util::sync::CancellationToken;
 
 const PRUNE_EVERY: Duration = Duration::from_secs(30);
@@ -107,14 +112,24 @@ async fn run(config: Config) -> Result<(), String> {
             Duration::from_secs(10),
             CommitmentConfig::confirmed(),
         ),
-        times: HashMap::new(),
+        times: BTreeMap::new(),
     };
+    let snapshot_db = Arc::clone(&db);
+    let on_snapshot: SnapshotHook = Arc::new(move |slot| match snapshot_db.lock() {
+        Ok(conn) => match store::rewind_slots(&conn, slot) {
+            Ok(true) => log::warn!("stored slots are past the RPC's slot {slot}: the ledger was reset; slots cleared"),
+            Ok(false) => {}
+            Err(err) => log::error!("snapshot slot check: {err}"),
+        },
+        Err(_) => log::error!("snapshot slot check: sqlite lock poisoned"),
+    });
     let mut pipeline = carbon_core::pipeline::Pipeline::builder()
         .datasource(ProgramSnapshot::new(
             config.rpc_url.clone(),
             config.program_id,
+            Arc::clone(&on_snapshot),
         ))
-        .datasource(ProgramSubscribe::new(ws_url.clone(), config.program_id))
+        .datasource(ProgramSubscribe::new(ws_url.clone(), config.rpc_url.clone(), config.program_id, on_snapshot))
         .metrics(Arc::new(LogMetrics::new()))
         .account(HorizonDecoder, processor)
         .shutdown_strategy(carbon_core::pipeline::ShutdownStrategy::Immediate)
@@ -225,11 +240,14 @@ async fn prune_closed_armies(db: Arc<Mutex<rusqlite::Connection>>, rpc_url: Stri
             }
         };
         let mut gone = Vec::new();
+        // The earliest slot any answer was read at: a row written later is a recreated account.
+        let mut seen_slot = u64::MAX;
         for chunk in keys.chunks(100) {
             let pubkeys: Vec<Pubkey> = chunk.iter().filter_map(|key| key.parse().ok()).collect();
-            match rpc.get_multiple_accounts(&pubkeys).await {
-                Ok(accounts) => {
-                    for (pubkey, account) in pubkeys.iter().zip(accounts) {
+            match rpc.get_multiple_accounts_with_commitment(&pubkeys, CommitmentConfig::confirmed()).await {
+                Ok(response) => {
+                    seen_slot = seen_slot.min(response.context.slot);
+                    for (pubkey, account) in pubkeys.iter().zip(response.value) {
                         let closed = account.is_none_or(|account| account.owner != program_id || account.data.is_empty());
                         if closed {
                             gone.push(pubkey.to_string());
@@ -247,7 +265,7 @@ async fn prune_closed_armies(db: Arc<Mutex<rusqlite::Connection>>, rpc_url: Stri
             continue;
         }
         match db.lock() {
-            Ok(conn) => match store::forget_armies(&conn, &gone) {
+            Ok(conn) => match store::forget_armies(&conn, &gone, seen_slot) {
                 Ok(count) => log::info!("prune: removed {count} closed armies"),
                 Err(err) => log::warn!("prune: {err}"),
             },
@@ -261,7 +279,7 @@ struct IndexProcessor {
     rpc: RpcClient,
     /// Block times by slot. A slot the RPC could not time is remembered as None until
     /// `NO_TIME_FOR`, so a burst of updates in that slot does not wait out the retries each time.
-    times: HashMap<u64, (Option<i64>, Instant)>,
+    times: BTreeMap<u64, (Option<i64>, Instant)>,
 }
 
 impl Processor<AccountProcessorInputType<'_, HorizonAccount>> for IndexProcessor {
@@ -277,7 +295,7 @@ impl Processor<AccountProcessorInputType<'_, HorizonAccount>> for IndexProcessor
             .db
             .lock()
             .map_err(|_| carbon_core::error::Error::Custom("sqlite lock poisoned".to_string()))?;
-        store::record(&conn, &pubkey, &account, unix)
+        store::record(&conn, &pubkey, &account, slot, unix)
             .map_err(|err| carbon_core::error::Error::Custom(err.to_string()))?;
         Ok(())
     }
@@ -290,6 +308,9 @@ impl IndexProcessor {
                 return time;
             }
         }
+        if let Some(time) = near_time(&self.times, slot) {
+            return Some(time);
+        }
         let time = block_time(&self.rpc, slot).await;
         if self.times.len() >= TIMES_KEPT {
             self.times.clear();
@@ -299,6 +320,19 @@ impl IndexProcessor {
     }
 }
 
+/// The time of the nearest slot already timed, when one is within `NEAR_SLOTS` of `slot`. Each slot
+/// that misses waits on `getBlockTime`, with retries, before its update is stored; a few slots
+/// apart the time differs by about a second on the rollup, so the cached one stands in.
+fn near_time(times: &BTreeMap<u64, (Option<i64>, Instant)>, slot: u64) -> Option<i64> {
+    times
+        .range(slot.saturating_sub(NEAR_SLOTS)..=slot.saturating_add(NEAR_SLOTS))
+        .filter_map(|(&near, &(time, _))| time.map(|time| (near.abs_diff(slot), time)))
+        .min_by_key(|&(distance, _)| distance)
+        .map(|(_, time)| time)
+}
+
+/// How far, in slots, a cached block time stands in for a slot not asked for.
+const NEAR_SLOTS: u64 = 20;
 /// How long a slot the RPC could not time is not asked again.
 const NO_TIME_FOR: Duration = Duration::from_secs(30);
 /// The block-time cache is cleared when it holds this many slots.
@@ -491,6 +525,19 @@ fn shift_port(host_and_port: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_slot_near_a_timed_one_takes_its_time() {
+        let mut times = BTreeMap::new();
+        times.insert(100, (Some(1_000), Instant::now()));
+        times.insert(130, (None, Instant::now()));
+        times.insert(150, (Some(1_020), Instant::now()));
+        assert_eq!(near_time(&times, 100), Some(1_000));
+        assert_eq!(near_time(&times, 115), Some(1_000));
+        assert_eq!(near_time(&times, 140), Some(1_020));
+        assert_eq!(near_time(&times, 125), None, "an untimed slot does not count");
+        assert_eq!(near_time(&times, 200), None);
+    }
 
     #[test]
     fn websocket_url_matches_local_validator_and_public_rpc() {

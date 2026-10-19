@@ -200,9 +200,8 @@ test("fund_outbox then withdraw, and the treasury pair", () => {
   expect(setFeeIx(owner, 500), "set_fee", [[owner, true, false], [configPda(), false, true]], Buffer.from([0xf4, 0x01]));
 });
 
-test("lock_army passes the VRF accounts, then behaviors, candidates and each owner's Player once", () => {
+test("lock_army passes the VRF accounts, then candidates and each owner's Player once", () => {
   const army = key(2);
-  const behavior = key(3);
   const queue = key(4);
   const rival = key(5);
   const ground = battlegroundPda(1);
@@ -210,7 +209,6 @@ test("lock_army passes the VRF accounts, then behaviors, candidates and each own
     player: owner,
     battlegroundId: 1,
     army,
-    behaviors: [behavior],
     queue,
     seq: 9,
     candidates: [{ army: key(6), owner: rival }, { army: key(7), owner: rival }],
@@ -230,13 +228,12 @@ test("lock_army passes the VRF accounts, then behaviors, candidates and each own
     [VRF_PROGRAM_ID, false, false],
     [SLOT_HASHES, false, false],
     [SystemProgram.programId, false, false],
-    [behavior, false, false],
     [key(6), false, true],
     [key(7), false, true],
     [playerPda(rival), false, true],
   ]);
   // A lock that can only queue passes the battle read-only.
-  const queues = lockArmyIx({ player: owner, battlegroundId: 1, army, behaviors: [behavior], queue, seq: 9, candidates: [], opens: false });
+  const queues = lockArmyIx({ player: owner, battlegroundId: 1, army, queue, seq: 9, candidates: [], opens: false });
   assert.deepEqual(metas(queues)[5], [matchPda(ground, 9).toBase58(), false, false]);
 });
 
@@ -408,7 +405,7 @@ test("delegate_outbox, fund_budget, set_segregation, unlock_army and close_army 
   ]);
   expect(fundBudgetIx(owner, 9n), "fund_budget", [[owner, true, false], [playerPda(owner), false, true]], u64(9));
   expect(setSegregationIx(owner, true), "set_segregation", [[owner, true, false], [playerPda(owner), false, true]], Buffer.from([1]));
-  expect(unlockArmyIx(owner, 2, key(2)), "unlock_army", [[owner, true, true], [battlegroundPda(2), false, true], [key(2), false, true]]);
+  expect(unlockArmyIx(owner, 2, key(2)), "unlock_army", [[owner, true, false], [battlegroundPda(2), false, true], [key(2), false, true]]);
   expect(closeArmyIx(owner, key(2)), "close_army", [
     [owner, true, false],
     [playerPda(owner), false, true],
