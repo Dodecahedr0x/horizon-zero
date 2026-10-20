@@ -30,7 +30,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const work = path.join(root, "target/localnet");
 const args = new Set(process.argv.slice(2));
 
-export const PROGRAM_ID = "Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c";
+export const PROGRAM_ID = "zeroDcScmnx7TSvWvnKBa81Gcq34T1QSRWH182YdqRg";
 // ephemeral_vrf_sdk::consts::DEFAULT_EPHEMERAL_TEST_QUEUE, served by the vrf-oracle that watches the rollup.
 export const EPHEMERAL_TEST_QUEUE = "Sc9MJUngNbQXSXGP3F67KvKwVnhaYn6kcioxXNVowYT";
 // The identity mb-stack's ephemeral validator signs with. The local build delegates to it.

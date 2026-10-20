@@ -9,7 +9,7 @@
 //                build this script recorded for that same validator), --skip-bootstrap
 //
 // The program id is the address of target/deploy/horizon_zero-keypair.json, which must be
-// Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c. The --keypair wallet pays, holds the upgrade
+// zeroDcScmnx7TSvWvnKBa81Gcq34T1QSRWH182YdqRg. The --keypair wallet pays, holds the upgrade
 // authority, and becomes the game admin on the first bootstrap: `initialize` accepts only the
 // upgrade authority, so the deploy and the bootstrap use that one keypair. An upgrade by another
 // wallet is refused before anything is sent. Local testing does not use this script: it runs on
@@ -22,7 +22,7 @@ import { fileURLToPath } from "node:url";
 import { assertDefaultBuild, buildDefault } from "./program-build.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PROGRAM_ID = "Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c";
+const PROGRAM_ID = "zeroDcScmnx7TSvWvnKBa81Gcq34T1QSRWH182YdqRg";
 // ephemeral_vrf_sdk::consts::DEFAULT_EPHEMERAL_QUEUE: lock_army runs in the rollup, so its oracle
 // must call back into the rollup.
 const ORACLE_QUEUE = "5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc";

@@ -1,7 +1,7 @@
 //! Host-side helpers shared with the LiteSVM integration test.
 use sha2::{Digest, Sha256};
 
-pub const PROGRAM_ID: &str = "Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c";
+pub const PROGRAM_ID: &str = "zeroDcScmnx7TSvWvnKBa81Gcq34T1QSRWH182YdqRg";
 pub const VRF_ID: &str = "Vrf1RNUjXmQGjmQrQLvJHs9SNkvDJEsRVFPkfSQUwGz";
 
 pub fn sighash(name: &str) -> [u8; 8] {

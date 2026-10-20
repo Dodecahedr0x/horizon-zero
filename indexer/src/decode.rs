@@ -7,7 +7,7 @@ use carbon_core::account::{AccountDecoder, DecodedAccount};
 use sha2::{Digest, Sha256};
 use solana_pubkey::Pubkey;
 
-pub const PROGRAM_ID: &str = "Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c";
+pub const PROGRAM_ID: &str = "zeroDcScmnx7TSvWvnKBa81Gcq34T1QSRWH182YdqRg";
 
 pub(crate) const BEHAVIOR_LEN: usize = 119;
 pub(crate) const BATTLEGROUND_LEN: usize = 576;

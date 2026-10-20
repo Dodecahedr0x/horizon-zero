@@ -29,7 +29,7 @@ import {
 export { EXTREMA, MOVE_KINDS, SIDES, STATS, VERBS, describeCast };
 export { MAX_BEHAVIOR_NAME_LEN, clipBehaviorName } from "../../content/interpret.mjs";
 
-export const PROGRAM_ID = new PublicKey("Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c");
+export const PROGRAM_ID = new PublicKey("zeroDcScmnx7TSvWvnKBa81Gcq34T1QSRWH182YdqRg");
 export const VRF_PROGRAM_ID = new PublicKey("Vrf1RNUjXmQGjmQrQLvJHs9SNkvDJEsRVFPkfSQUwGz");
 // The VRF queues whose oracles call back into the rollup. ephemeral_vrf_sdk::consts::DEFAULT_EPHEMERAL_QUEUE
 // is served by MagicBlock; DEFAULT_EPHEMERAL_TEST_QUEUE by the local stack's second vrf-oracle.

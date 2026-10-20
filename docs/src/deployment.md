@@ -66,7 +66,7 @@ It does not create standard behaviors: behaviors live in the rollup and a Player
 
 1. Mainnet requires `--confirm-mainnet`.
 2. `--er-url <rollup rpc>` and `--validator <identity>` are required, even with `--skip-bootstrap`: the build needs the identity. Before anything is built or any SOL is spent, the script calls `getIdentity` on `--er-url`, prints it, and stops unless `--validator` equals it.
-3. The program keypair `target/deploy/horizon_zero-keypair.json` must be `Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c`, the `declare_id!`. Keep that file; without it the program cannot be upgraded at the same address.
+3. The program keypair `target/deploy/horizon_zero-keypair.json` must be `zeroDcScmnx7TSvWvnKBa81Gcq34T1QSRWH182YdqRg`, the `declare_id!`. Keep that file; without it the program cannot be upgraded at the same address.
 4. `cargo-build-sbf` with default features, `HZ_VALIDATOR` = `--validator` and `HZ_VRF_QUEUE` = `5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc`, recorded as below. `--skip-build` reuses `target/deploy/horizon_zero.so` only when it is the recorded default build for that validator and queue, and stops otherwise. `inline-mock-vrf` and `inline-mock-magic` never reach a real cluster.
 5. The script asks the RPC (`getAccountInfo`) whether the program exists, and stops if that call fails. When it exists, its upgrade authority (from `solana program show`, which must succeed) must be the `--keypair` wallet, or the script stops before sending anything.
 6. `solana program deploy` with `--keypair` (default `~/.config/solana/id.json`) as payer and `--upgrade-authority`, and `--with-compute-unit-price` when `--priority` is given.

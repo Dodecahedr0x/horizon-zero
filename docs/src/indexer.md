@@ -62,7 +62,7 @@ Each account update and each logs notification carries a slot. The indexer calls
 
 | env | default |
 | --- | --- |
-| `PROGRAM_ID` | `Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c` |
+| `PROGRAM_ID` | `zeroDcScmnx7TSvWvnKBa81Gcq34T1QSRWH182YdqRg` |
 | `SOLANA_RPC_URL` | `http://127.0.0.1:7799`, the local rollup. Set it to the ephemeral rollup's RPC, not the base layer |
 | `INDEXER_PORT` | `4714`. Preferred local listen port. `pnpm indexer` and `pnpm dev:chain` pass it to this process only. |
 | `PORT` | unset locally. Render injects this on the indexer service. Used when `INDEXER_PORT` is unset. |

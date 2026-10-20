@@ -12,7 +12,7 @@ flowchart TB
   end
   Server["game server /chain:<br/>holds the RPC URLs, builds transactions"]
   Ledger["local ledger sqlite"]
-  subgraph chain [On-chain program Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c]
+  subgraph chain [On-chain program zeroDcScmnx7TSvWvnKBa81Gcq34T1QSRWH182YdqRg]
     subgraph rollup [Rollup: delegated and ephemeral accounts]
       Config["Config"]
       Battleground["Battleground"]
@@ -142,7 +142,7 @@ Each battleground is its own grid. An army holds at most 10 units, one tile each
 
 `lock_army` chooses the opponent from the queue's first eight entries, which the locker must all pass, with the recent slot hash before it requests randomness. The VRF callback only stores the seed that `simulate` uses; `settle_match`, which anyone may send, plays the battle and pays out.
 
-Program id: `Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c`.
+Program id: `zeroDcScmnx7TSvWvnKBa81Gcq34T1QSRWH182YdqRg`.
 
 VRF program: `Vrf1RNUjXmQGjmQrQLvJHs9SNkvDJEsRVFPkfSQUwGz`, crate `ephemeral-vrf-sdk` 0.17.3. `lock_army` sends a scoped request whose first byte is `10`.
 

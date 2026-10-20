@@ -1,6 +1,6 @@
 # Accounts and instructions
 
-The program is Anchor. Every account begins with the 8-byte discriminator `SHA-256("account:<Name>")[..8]`. Every instruction begins with `SHA-256("global:<snake_name>")[..8]`. Integers are little-endian. The program id is `Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c`.
+The program is Anchor. Every account begins with the 8-byte discriminator `SHA-256("account:<Name>")[..8]`. Every instruction begins with `SHA-256("global:<snake_name>")[..8]`. Integers are little-endian. The program id is `zeroDcScmnx7TSvWvnKBa81Gcq34T1QSRWH182YdqRg`.
 
 ## PDA seeds
 
@@ -276,7 +276,7 @@ Each snapshot unit is 96 bytes: `kind`, `len`, `body` (77 bytes), `col`, `row`, 
 
 ### `initialize(fee_bps: u16)`
 
-Solana. Accounts: admin signer writable, config init, identity writable, system program, this program (`Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c`), its ProgramData `[program_id]` under `BPFLoaderUpgradeab1e11111111111111111111111`.
+Solana. Accounts: admin signer writable, config init, identity writable, system program, this program (`zeroDcScmnx7TSvWvnKBa81Gcq34T1QSRWH182YdqRg`), its ProgramData `[program_id]` under `BPFLoaderUpgradeab1e11111111111111111111111`.
 
 Only the program's upgrade authority may call it. The program account must name the passed ProgramData as its own, and the ProgramData's `upgrade_authority_address` must be the signer; either mismatch fails with `NotUpgradeAuthority`, as does a program with no upgrade authority. So nobody can run `initialize` between the deploy and the deployer's bootstrap and become the admin. The program must be deployed through the upgradeable loader; a program loaded without ProgramData cannot be initialized. The check is the same in every build, including the mock features.
 

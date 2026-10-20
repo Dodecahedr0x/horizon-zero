@@ -19,7 +19,7 @@ mod state;
 use error::HorizonError;
 use state::*;
 
-declare_id!("Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c");
+declare_id!("zeroDcScmnx7TSvWvnKBa81Gcq34T1QSRWH182YdqRg");
 
 /// Collects ephemeral rent in the rollup. Unchecked under LiteSVM, where nothing reads it.
 #[cfg(not(feature = "inline-mock-magic"))]
