@@ -62,6 +62,8 @@ import {
   releaseOutboxIx,
   resolvedMatch,
   resolvedOutcome,
+  setAdminIx,
+  acceptAdminIx,
   setFeeIx,
   settleMatchIx,
   treasuryOutboxPda,
@@ -106,7 +108,6 @@ test("register_player and delegate_player follow the program's account order", (
   const player = playerPda(owner);
   expect(delegatePlayerIx(owner), "delegate_player", [
     [owner, true, true],
-    [configPda(), false, false],
     [pda([Buffer.from("buffer"), player.toBuffer()], PROGRAM_ID), false, true],
     [pda([Buffer.from("delegation"), player.toBuffer()], DELEGATION_PROGRAM_ID), false, true],
     [pda([Buffer.from("delegation-metadata"), player.toBuffer()], DELEGATION_PROGRAM_ID), false, true],
@@ -121,17 +122,16 @@ test("register_player and delegate_player follow the program's account order", (
 });
 
 test("the admin's Solana instructions follow the program's account order", () => {
-  const validator = key(9);
   const fee = Buffer.alloc(2);
   fee.writeUInt16LE(500);
-  expect(initializeIx(owner, 500, validator), "initialize", [
+  expect(initializeIx(owner, 500), "initialize", [
     [owner, true, true],
     [configPda(), false, true],
     [identityPda(), false, true],
     [SystemProgram.programId, false, false],
     [PROGRAM_ID, false, false],
     [pda([PROGRAM_ID.toBuffer()], BPF_LOADER_UPGRADEABLE_ID), false, false],
-  ], Buffer.concat([fee, validator.toBuffer()]));
+  ], fee);
   assert.equal(programDataPda().toBase58(), pda([PROGRAM_ID.toBuffer()], new PublicKey("BPFLoaderUpgradeab1e11111111111111111111111")).toBase58());
   const args = Buffer.alloc(13);
   args[0] = 1;
@@ -198,6 +198,13 @@ test("fund_outbox then withdraw, and the treasury pair", () => {
     [owner, false, true],
   ]);
   expect(setFeeIx(owner, 500), "set_fee", [[owner, true, false], [configPda(), false, true]], Buffer.from([0xf4, 0x01]));
+  expect(setAdminIx(owner, key(14)), "set_admin", [[owner, true, false], [configPda(), false, true]], key(14).toBuffer());
+  expect(acceptAdminIx(key(14)), "accept_admin", [
+    [key(14), true, true],
+    [configPda(), false, true],
+    [MAGIC_CONTEXT_ID, false, true],
+    [MAGIC_PROGRAM_ID, false, false],
+  ]);
 });
 
 test("lock_army passes the VRF accounts, then candidates and each owner's Player once", () => {
@@ -232,6 +239,9 @@ test("lock_army passes the VRF accounts, then candidates and each owner's Player
     [key(7), false, true],
     [playerPda(rival), false, true],
   ]);
+  // The locker's own queued army is part of the window, but its Player is already the second account.
+  const withOwn = lockArmyIx({ player: owner, battlegroundId: 1, army, queue, seq: 9, candidates: [{ army: key(6), owner }, { army: key(7), owner: rival }], opens: true });
+  assert.deepEqual(metas(withOwn).slice(13).map(([pubkey]) => pubkey), [key(6), key(7), playerPda(rival)].map((k) => k.toBase58()));
   // A lock that can only queue passes the battle read-only.
   const queues = lockArmyIx({ player: owner, battlegroundId: 1, army, queue, seq: 9, candidates: [], opens: false });
   assert.deepEqual(metas(queues)[5], [matchPda(ground, 9).toBase58(), false, false]);
@@ -320,8 +330,9 @@ test("decoders read the documented offsets", () => {
   owner.toBuffer().copy(config, 8);
   config.writeUInt16LE(500, 40);
   config.writeBigUInt64LE(42n, 42);
+  assert.deepEqual(decodeConfig(config), { admin: owner.toBase58(), feeBps: 500, fees: "42", pendingAdmin: null });
   key(13).toBuffer().copy(config, 50);
-  assert.deepEqual(decodeConfig(config), { admin: owner.toBase58(), feeBps: 500, fees: "42", validator: key(13).toBase58() });
+  assert.deepEqual(decodeConfig(config), { admin: owner.toBase58(), feeBps: 500, fees: "42", pendingAdmin: key(13).toBase58() });
 
   const outbox = Buffer.alloc(49);
   owner.toBuffer().copy(outbox, 8);
@@ -394,7 +405,6 @@ test("delegate_outbox, fund_budget, set_segregation, unlock_army and close_army 
   const outbox = outboxPda(owner);
   expect(delegateOutboxIx(owner), "delegate_outbox", [
     [owner, true, true],
-    [configPda(), false, false],
     [pda([Buffer.from("buffer"), outbox.toBuffer()], PROGRAM_ID), false, true],
     [pda([Buffer.from("delegation"), outbox.toBuffer()], DELEGATION_PROGRAM_ID), false, true],
     [pda([Buffer.from("delegation-metadata"), outbox.toBuffer()], DELEGATION_PROGRAM_ID), false, true],

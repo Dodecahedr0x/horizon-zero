@@ -13,7 +13,8 @@ const tile = (col, row) => ({ col, row });
  * unknown. Actor lines carry `actor` ({side, index}); hits carry `target`, `damage` and `hp` (the
  * target's hp after the line); casts add `effect` (name), `effectId`, `amount`, `rounds`, `from`
  * and `to` (the target's tile before and after); moves carry `from` and `to`; `end` carries
- * `winner` (0, 1 or null) and `limit`.
+ * `winner` (0, 1 or null), `limit` (twelve rounds ended a draw) and `work` (the engine's work limit
+ * stopped the battle; the side with the larger share of its starting hp left wins).
  */
 export function parseTraceLine(line) {
   const text = String(line ?? "").trim();
@@ -50,8 +51,8 @@ export function parseTraceLine(line) {
     case "R":
       return { kind: "round", line: text };
     case "E":
-      if (parts[1] === "draw") return { kind: "end", line: text, winner: null, limit: parts[2] === "limit" };
-      return { kind: "end", line: text, winner: n[1], limit: false };
+      if (parts[1] === "draw") return { kind: "end", line: text, winner: null, limit: parts[2] === "limit", work: parts[2] === "work" };
+      return { kind: "end", line: text, winner: n[1], limit: false, work: parts[2] === "work" };
     default:
       return { kind: "unknown", line: text };
   }

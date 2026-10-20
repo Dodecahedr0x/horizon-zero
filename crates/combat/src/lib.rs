@@ -38,7 +38,7 @@ mod wasm;
 pub use behavior::*;
 pub use board::{blocked_tiles, Geometry};
 pub use catalog::*;
-pub use engine::{simulate, simulate_winner, MAX_STATUSES};
+pub use engine::{simulate, simulate_winner, simulate_work, MAX_STATUSES};
 pub use ids::*;
 pub use trace::{trace_text, TraceEvent};
 
@@ -52,6 +52,16 @@ pub const MAX_ROWS: i32 = 10;
 /// heap that never frees: past Citadel's 12 x 10, full armies run it out (16 x 10 does).
 pub const MAX_TILES: i32 = 120;
 pub const MAX_ROUNDS: u32 = 12;
+/// The most work a battle may do, in the engine's own units: a turn, an element of the actor's
+/// behavior, a walking-distance question, a wave start, a row a wave scans, a fighter a target
+/// rule looks at, a seeded tie-break hash, a step and an action tried each cost a fixed number of
+/// them, about 14 compute units each. The engine checks it before each turn, element and step, so
+/// a battle stops at most one step past it, with both sides standing; the side with the larger
+/// share of its starting hp left wins, and equal shares draw. 72 000 units keep `settle_match`
+/// near 1.26M compute units at worst, under the 1.4M transaction limit whatever the behaviors do,
+/// while about one battle in sixteen between full Citadel armies on standard behaviors reaches
+/// it. The program and the wasm replay count the same units, so they stop at the same point.
+pub const WORK_LIMIT: u32 = 72_000;
 pub const MAX_UNITS: usize = 10;
 
 pub const MAX_ELEMENTS: usize = 4;

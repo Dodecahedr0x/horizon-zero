@@ -73,7 +73,7 @@ test("two generated armies fight through simulate_json", () => {
   assert.ok(result.lines.length > 0);
   assert.match(result.lines.at(-1), /^E /);
   assert.equal(result.sentences.length, result.lines.length);
-  assert.match(result.sentences.at(-1), /^(Side A wins\.|Side B wins\.|Draw\.|Draw\. Round limit reached\.)$/);
+  assert.match(result.sentences.at(-1), /^(Side [AB] wins\.|Side [AB] wins on hp left\. Work limit reached\.|Draw\.|Draw\. (Round|Work) limit reached\.)$/);
   for (const sentence of result.sentences) {
     assert.doesNotMatch(sentence, /^[MACFDR] /);
     assert.doesNotMatch(sentence, /^E /);

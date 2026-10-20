@@ -736,11 +736,12 @@ export function createLedger(dbPath, options = {}) {
     const stake = BigInt(ground.stake);
     if ((playerOf(live.owner)?.budget ?? 0n) < stake) throw programFail("BudgetTooLow");
     const queue = JSON.parse(ground.queue);
-    // As lock_army: another owner's queued army is a candidate while its owner's budget covers a
-    // stake, and is evicted (Idle, out of the queue) once it does not. The ledger knows every Player.
+    // As lock_army: among the queue's first eight entries (MATCH_WINDOW), another owner's queued
+    // army is a candidate while its owner's budget covers a stake, and is evicted (Idle, out of the
+    // queue) once it does not. The ledger knows every Player.
     const opponents = [];
     const evicted = [];
-    for (const key of queue) {
+    for (const key of queue.slice(0, 8)) {
       const item = armyRow(key);
       if (!item || item.owner === live.owner || item.status !== 1) continue;
       const owner = playerOf(item.owner);

@@ -55,7 +55,11 @@ export function chronicle(match: Match, lines: string[], mySide: number, foeLabe
       case "round":
         return { index, kind: "round", text: `End of round ${round++}` };
       case "end":
-        if (step.winner === null) return { index, kind: "end", text: step.limit ? "Draw · both hosts still stand after twelve rounds" : "Draw" };
+        if (step.winner === null) {
+          if (step.work) return { index, kind: "end", text: "Draw · the battle ran out of time with both hosts equally hurt" };
+          return { index, kind: "end", text: step.limit ? "Draw · both hosts still stand after twelve rounds" : "Draw" };
+        }
+        if (step.work) return { index, kind: "end", text: step.winner === mySide ? "Time runs out · your host keeps more of its strength" : "Time runs out · the foe keeps more of its strength" };
         return { index, kind: "end", text: step.winner === mySide ? "Your host holds the field" : "The foe holds the field" };
       default:
         return { index, kind: "end", text: line };

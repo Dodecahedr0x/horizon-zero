@@ -54,9 +54,10 @@ pub struct Config {
     pub fee_bps: u16,
     /// Claimable fee lamports, held on Config on top of its rent.
     pub fees: u64,
-    /// The rollup validator identity every delegate instruction delegates to. Set by `initialize`;
-    /// nothing changes it.
-    pub validator: Pubkey,
+    /// The admin `set_admin` proposed, who becomes admin by signing `accept_admin`; all zeros when
+    /// none is proposed. Same offset and size as the `validator` it replaced: the rollup validator
+    /// is built into the program (`VALIDATOR`).
+    pub pending_admin: Pubkey,
     pub bump: u8,
 }
 
@@ -319,7 +320,7 @@ mod layout_tests {
         assert_eq!(8 + Battleground::INIT_SPACE, 576);
         assert_eq!(8 + Army::INIT_SPACE, 1360);
         assert_eq!(8 + Battle::INIT_SPACE, 2155); // fee_bps at 2144, opened_at at 2146, bump at 2154
-        assert_eq!(8 + Config::INIT_SPACE, 83); // admin 32, fee_bps 2, fees 8, validator 32, bump 1
+        assert_eq!(8 + Config::INIT_SPACE, 83); // admin 32, fee_bps 2, fees 8, pending_admin 32, bump 1
                                                 // owner 32, budget 8, winnings 8, locked 8, segregate 1, fighting 2, bump 1
         assert_eq!(8 + Player::INIT_SPACE, 68);
         assert_eq!(8 + Outbox::INIT_SPACE, 49); // owner 32, amount 8, bump 1

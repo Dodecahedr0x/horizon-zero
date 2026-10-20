@@ -199,7 +199,7 @@ export function decodePlayer(data: Uint8Array) {
   };
 }
 
-/** `Config`: admin 8, fee_bps 40, fees 42, validator 50, bump 82. */
+/** `Config`: admin 8, fee_bps 40, fees 42, pending_admin 50 (all zeros: none), bump 82. */
 export function decodeConfig(data: Uint8Array) {
   if (data.length !== CONFIG_LEN) return null;
   const v = view(data);
@@ -207,7 +207,7 @@ export function decodeConfig(data: Uint8Array) {
     admin: key(data, 8).toBase58(),
     feeBps: v.getUint16(40, true),
     fees: v.getBigUint64(42, true).toString(),
-    validator: key(data, 50).toBase58(),
+    pendingAdmin: data.subarray(50, 82).some((byte) => byte !== 0) ? key(data, 50).toBase58() : null,
   };
 }
 
@@ -338,7 +338,7 @@ export const PROGRAM_ERRORS: readonly (readonly [name: string, message: string])
   ["MissingAccount", "A required account is missing"],
   ["BadMatch", "Match account was not the next battleground match PDA"],
   ["VrfRequest", "VRF request failed"],
-  ["BadQueue", "Oracle queue is not owned by the VRF program"],
+  ["BadQueue", "Oracle queue is not the one the program is built for"],
   ["BadGrid", "Battleground grid is not playable"],
   ["BadPosition", "Unit position is outside the starting zone"],
   ["DuplicatePosition", "Two units in one army cannot share a tile"],
@@ -351,7 +351,7 @@ export const PROGRAM_ERRORS: readonly (readonly [name: string, message: string])
   ["AlreadyExists", "Account already exists"],
   ["NotSeeded", "Battle has no VRF seed yet"],
   ["NothingToWithdraw", "There is nothing to withdraw"],
-  ["BadValidator", "Validator identity must be set"],
+  ["NotPendingAdmin", "Signer is not the proposed admin"],
   ["NotUpgradeAuthority", "Only the program's upgrade authority may initialize"],
   ["TooEarly", "Battle cannot be cancelled before its wait is over"],
   ["AlreadySeeded", "Battle is seeded: settle it instead"],
@@ -433,19 +433,18 @@ function delegated(account: PublicKey): { head: Meta[]; tail: Meta[] } {
   };
 }
 
-function delegateIx(name: string, signerKey: PublicKey, account: PublicKey) {
+function delegateIx(name: string, signerKey: PublicKey, account: PublicKey, withConfig: boolean) {
   const { head, tail } = delegated(account);
-  return ix(name, [signer(signerKey), readonly(configPda()), ...head, ...tail]);
+  return ix(name, [signer(signerKey), ...(withConfig ? [readonly(configPda())] : []), ...head, ...tail]);
 }
 
 /**
  * Solana, once. The signer becomes the admin and must be the program's upgrade authority (the
- * program checks ProgramData); `validator` is the rollup every delegation goes to.
+ * program checks ProgramData). The rollup validator is built into the program (`HZ_VALIDATOR`).
  */
-export function initializeIx(admin: PublicKey, feeBps: number, validator: PublicKey) {
-  const rest = new Uint8Array(34);
+export function initializeIx(admin: PublicKey, feeBps: number) {
+  const rest = new Uint8Array(2);
   new DataView(rest.buffer).setUint16(0, feeBps, true);
-  rest.set(validator.toBytes(), 2);
   return ix(
     "initialize",
     [
@@ -483,7 +482,7 @@ export function initTreasuryOutboxIx(admin: PublicKey) {
   return ix("init_treasury_outbox", [signer(admin), readonly(configPda()), writable(treasuryOutboxPda()), readonly(SystemProgram.programId)]);
 }
 
-/** Solana, admin. Delegates Config to its own validator. */
+/** Solana, admin. Delegates Config to the rollup validator. */
 export function delegateConfigIx(admin: PublicKey) {
   const { head, tail } = delegated(configPda());
   return ix("delegate_config", [signer(admin), ...head, ...tail]);
@@ -504,19 +503,19 @@ export function registerPlayerIx(owner: PublicKey, deposit: bigint) {
   );
 }
 
-/** Solana. Delegates the wallet's Player to Config's rollup validator. */
+/** Solana. Delegates the wallet's Player to the rollup validator. */
 export function delegatePlayerIx(owner: PublicKey) {
-  return delegateIx("delegate_player", owner, playerPda(owner));
+  return delegateIx("delegate_player", owner, playerPda(owner), false);
 }
 
 /** Solana. Delegates the wallet's empty Outbox again before a withdrawal. */
 export function delegateOutboxIx(owner: PublicKey) {
-  return delegateIx("delegate_outbox", owner, outboxPda(owner));
+  return delegateIx("delegate_outbox", owner, outboxPda(owner), false);
 }
 
 /** Solana, admin. Delegates the empty treasury Outbox again before a claim. */
 export function delegateTreasuryOutboxIx(admin: PublicKey) {
-  return delegateIx("delegate_treasury_outbox", admin, treasuryOutboxPda());
+  return delegateIx("delegate_treasury_outbox", admin, treasuryOutboxPda(), true);
 }
 
 /** Rollup. Moves free lamports into the budget. */
@@ -552,6 +551,16 @@ export function setFeeIx(admin: PublicKey, bps: number) {
   const rest = new Uint8Array(2);
   new DataView(rest.buffer).setUint16(0, bps, true);
   return ix("set_fee", [signer(admin, false), writable(configPda())], rest);
+}
+
+/** Rollup, admin. Proposes `newAdmin`, who takes over with `acceptAdminIx`; `PublicKey.default` withdraws the proposal. */
+export function setAdminIx(admin: PublicKey, newAdmin: PublicKey) {
+  return ix("set_admin", [signer(admin, false), writable(configPda())], newAdmin.toBytes());
+}
+
+/** Rollup, signed by the proposed admin. Makes it Config's admin and commits Config to Solana. */
+export function acceptAdminIx(newAdmin: PublicKey) {
+  return ix("accept_admin", [signer(newAdmin), writable(configPda()), ...magic()]);
 }
 
 /** Rollup, admin. Moves every claimable fee into the treasury Outbox. `claimFeesIx` follows in the same transaction. */
@@ -641,10 +650,14 @@ export function createArmyIx(
   );
 }
 
+/** How many queue entries, from the front, `lock_army` requires and may match (`MATCH_WINDOW`). */
+export const MATCH_WINDOW = 8;
+
 /**
- * Rollup. `candidates` are queued armies offered as opponents; each is passed writable with its
- * owner's Player once. The program matches a candidate whose owner's budget covers the stake and
- * evicts one whose owner's Player shows less. `opens` says a candidate's owner covers the stake, so
+ * Rollup. `candidates` are the first `MATCH_WINDOW` queue entries, the locker's own armies
+ * included; the program refuses a lock that leaves one out (`MissingAccount`). Each is passed
+ * writable, with its owner's Player once unless the locker owns it. The program matches a candidate
+ * whose owner's budget covers the stake and evicts one whose owner's Player shows less. `opens` says a candidate's owner covers the stake, so
  * the lock opens a battle: only then is the battle passed writable. The rollup refuses a transaction
  * that passes writable an account it neither holds nor creates, so a lock that queues passes it read-only.
  */
@@ -674,7 +687,7 @@ export function lockArmyIx(args: {
   ];
   for (const candidate of args.candidates) keys.push(writable(candidate.army));
   for (const owner of new Set(args.candidates.map((candidate) => candidate.owner.toBase58()))) {
-    keys.push(writable(playerPda(new PublicKey(owner))));
+    if (owner !== args.player.toBase58()) keys.push(writable(playerPda(new PublicKey(owner))));
   }
   return ix("lock_army", keys);
 }

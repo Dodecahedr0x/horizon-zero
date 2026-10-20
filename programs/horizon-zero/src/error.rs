@@ -40,7 +40,7 @@ pub enum HorizonError {
     BadMatch,
     #[msg("VRF request failed")]
     VrfRequest,
-    #[msg("Oracle queue is not owned by the VRF program")]
+    #[msg("Oracle queue is not the one the program is built for")]
     BadQueue,
     #[msg("Battleground grid is not playable")]
     BadGrid,
@@ -66,8 +66,9 @@ pub enum HorizonError {
     NotSeeded,
     #[msg("There is nothing to withdraw")]
     NothingToWithdraw,
-    #[msg("Validator identity must be set")]
-    BadValidator,
+    /// Took the code `BadValidator` had, so the codes after it stay put.
+    #[msg("Signer is not the proposed admin")]
+    NotPendingAdmin,
     #[msg("Only the program's upgrade authority may initialize")]
     NotUpgradeAuthority,
     #[msg("Battle cannot be cancelled before its wait is over")]

@@ -72,6 +72,7 @@ impl Battle<'_> {
     }
 
     fn tie_key(&self, actor: usize, step: i32, (col, row): (i32, i32)) -> [u8; 32] {
+        self.charge(super::WORK_HASH);
         let me = &self.fighters[actor];
         mix(&self.seed, &[me.side.id(), me.index, self.round as u8, step as u8, col as u8, row as u8])
     }

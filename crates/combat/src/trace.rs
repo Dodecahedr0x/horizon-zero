@@ -57,6 +57,9 @@ pub enum TraceEvent {
         winner: Option<Side>,
         /// Both sides still had a living unit when [`crate::MAX_ROUNDS`] stopped the fight.
         limit: bool,
+        /// [`crate::WORK_LIMIT`] stopped the fight with both sides standing; `winner` is the side
+        /// with the larger share of its starting hp left.
+        work: bool,
     },
 }
 
@@ -76,9 +79,11 @@ impl TraceEvent {
             TraceEvent::Death { side, index } => format!("D {side} {index}"),
             TraceEvent::Expire { side, index, effect } => format!("X {side} {index} {effect}"),
             TraceEvent::Round => "R".to_string(),
+            TraceEvent::End { winner: Some(side), work: true, .. } => format!("E {side} work"),
             TraceEvent::End { winner: Some(side), .. } => format!("E {side}"),
-            TraceEvent::End { winner: None, limit: true } => "E draw limit".to_string(),
-            TraceEvent::End { winner: None, limit: false } => "E draw".to_string(),
+            TraceEvent::End { winner: None, work: true, .. } => "E draw work".to_string(),
+            TraceEvent::End { winner: None, limit: true, .. } => "E draw limit".to_string(),
+            TraceEvent::End { winner: None, .. } => "E draw".to_string(),
         }
     }
 }

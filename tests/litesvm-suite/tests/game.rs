@@ -28,8 +28,6 @@ const BUDGET: u16 = 8;
 const VAULT: Address = address!("MagicVau1t999999999999999999999999999999999");
 const MAGIC: Address = address!("Magic11111111111111111111111111111111111111");
 const SYSTEM: Address = address!("11111111111111111111111111111111");
-/// The local rollup validator's identity, which `initialize` pins in Config.
-const VALIDATOR: Address = address!("mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev");
 /// Owns a delegated account's Solana copy.
 const DELEGATION: Address = address!("DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh");
 /// What a helper deposits when it registers a wallet that has no Player yet.
@@ -146,14 +144,15 @@ fn setup_on(svm: LiteSVM) -> Env {
 
     let admin = Keypair::new();
     svm.airdrop(&admin.pubkey(), 20_000_000_000).unwrap();
-    let queue = Address::new_unique();
+    // The mock build pins the SDK's ephemeral test queue (programs/horizon-zero/build.rs).
+    let queue = address!("Sc9MJUngNbQXSXGP3F67KvKwVnhaYn6kcioxXNVowYT");
     svm.set_account(queue, Account { lamports: 1_000_000_000, data: vec![0; 256], owner: vrf, executable: false, rent_epoch: 0 }).unwrap();
 
     // `add_program` deploys through the upgradeable loader with no upgrade authority; the admin
     // becomes it, as the deployer would be, so `initialize` accepts the admin.
     set_upgrade_authority(&mut svm, &program, Some(&admin.pubkey()));
     let (config, _) = pda(&[b"config"], &program);
-    send(&mut svm, &admin, &[initialize_ix(&program, &admin.pubkey(), &program, VALIDATOR)]);
+    send(&mut svm, &admin, &[initialize_ix(&program, &admin.pubkey(), &program)]);
 
     let mut env = Env { svm, program, vrf, queue, admin, config };
     env.create_battleground(0, BUDGET, STAKE, 8, 6);
@@ -182,8 +181,8 @@ fn set_upgrade_authority(svm: &mut LiteSVM, program: &Address, authority: Option
     svm.set_account(key, account).unwrap();
 }
 
-/// `initialize(500, validator)` signed by `admin`, with `data_of`'s ProgramData as the program's.
-fn initialize_ix(program: &Address, admin: &Address, data_of: &Address, validator: Address) -> Instruction {
+/// `initialize(500)` signed by `admin`, with `data_of`'s ProgramData as the program's.
+fn initialize_ix(program: &Address, admin: &Address, data_of: &Address) -> Instruction {
     let accounts = vec![
         meta(*admin, true, true),
         meta(pda(&[b"config"], program).0, true, false),
@@ -192,7 +191,7 @@ fn initialize_ix(program: &Address, admin: &Address, data_of: &Address, validato
         meta(*program, false, false),
         meta(program_data(data_of), false, false),
     ];
-    ix(*program, accounts, disc("initialize", &[&500u16.to_le_bytes()[..], validator.as_ref()].concat()))
+    ix(*program, accounts, disc("initialize", &500u16.to_le_bytes()))
 }
 
 impl Env {
@@ -416,19 +415,77 @@ fn still_body() -> Vec<u8> {
     BehaviorBody::parse(&[1, 0, 0]).unwrap().canonical_bytes()
 }
 
+/// `set_admin(new_admin)` signed by `signer`.
+fn set_admin_ix(env: &Env, signer: &Keypair, new_admin: Address) -> Instruction {
+    ix(env.program, vec![meta(signer.pubkey(), false, true), meta(env.config, true, false)], disc("set_admin", new_admin.as_ref()))
+}
+
+/// `accept_admin` signed by `signer`, with the magic accounts its commit takes.
+fn accept_admin_ix(env: &Env, signer: &Keypair) -> Instruction {
+    let accounts = vec![meta(signer.pubkey(), true, true), meta(env.config, true, false), meta(MAGIC_CONTEXT, true, false), meta(MAGIC, false, false)];
+    ix(env.program, accounts, disc("accept_admin", &[]))
+}
+
+/// (admin, pending_admin) of Config, at the offsets in the accounts chapter.
+fn config_admins(env: &Env) -> (Address, Address) {
+    let data = env.svm.get_account(&env.config).unwrap().data;
+    assert_eq!(data.len(), CONFIG_LEN);
+    (Address::try_from(&data[8..40]).unwrap(), Address::try_from(&data[50..82]).unwrap())
+}
+
 #[test]
-fn initialize_needs_a_validator_identity() {
+fn initialize_leaves_no_admin_proposed() {
+    let env = setup();
+    assert_eq!(config_admins(&env), (env.admin.pubkey(), Address::default()));
+}
+
+#[test]
+fn the_admin_hands_over_in_two_steps() {
     let mut env = setup();
-    // Config and the identity exist after setup; clear both so `initialize` can run again.
-    let identity = pda(&[b"identity"], &env.program).0;
-    for key in [env.config, identity] {
-        env.svm.set_account(key, Account::default()).unwrap();
-    }
-    let init = |env: &Env, admin: &Keypair, validator: Address| initialize_ix(&env.program, &admin.pubkey(), &env.program, validator);
     let admin = env.admin.insecure_clone();
-    send_expect_reason_with(&mut env, &admin, |env| vec![init(env, &admin, Address::default())], "BadValidator");
-    send_with(&mut env, &admin, |env| vec![init(env, &admin, VALIDATOR)]);
-    assert_eq!(Address::try_from(&env.svm.get_account(&env.config).unwrap().data[50..82]).unwrap(), VALIDATOR);
+    let next = Keypair::new();
+    let stranger = Keypair::new();
+    env.fund(&next);
+    env.fund(&stranger);
+
+    // Only the admin proposes; nobody accepts what was not proposed.
+    send_expect_reason_with(&mut env, &stranger, |env| vec![set_admin_ix(env, &stranger, stranger.pubkey())], "NotAdmin");
+    send_expect_reason_with(&mut env, &next, |env| vec![accept_admin_ix(env, &next)], "NotPendingAdmin");
+    let logs = send_with(&mut env, &admin, |env| vec![set_admin_ix(env, &admin, next.pubkey())]);
+    assert!(logs.iter().any(|line| line.contains(&format!("HZ_ADMIN_PROPOSED {}", next.pubkey()))));
+    assert_eq!(config_admins(&env), (admin.pubkey(), next.pubkey()), "proposing changes nothing yet");
+
+    // Only the proposed key accepts, and Config must be this program's.
+    send_expect_reason_with(&mut env, &stranger, |env| vec![accept_admin_ix(env, &stranger)], "NotPendingAdmin");
+    let config = env.svm.get_account(&env.config).unwrap();
+    env.svm.set_account(env.config, Account { owner: SYSTEM, ..config.clone() }).unwrap();
+    send_expect_reason_with(&mut env, &next, |env| vec![accept_admin_ix(env, &next)], "BadPda");
+    env.svm.set_account(env.config, config).unwrap();
+    let logs = send_with(&mut env, &next, |env| vec![accept_admin_ix(env, &next)]);
+    assert!(logs.iter().any(|line| line.contains(&format!("HZ_ADMIN {}", next.pubkey()))));
+    assert_eq!(config_admins(&env), (next.pubkey(), Address::default()));
+
+    // The old admin is out, in the rollup and on Solana; the new one is in.
+    let set_fee = |env: &Env, signer: &Keypair| ix(env.program, vec![meta(signer.pubkey(), false, true), meta(env.config, true, false)], disc("set_fee", &100u16.to_le_bytes()));
+    send_expect_reason_with(&mut env, &admin, |env| vec![set_fee(env, &admin)], "NotAdmin");
+    send_expect_reason_with(&mut env, &admin, |env| vec![set_admin_ix(env, &admin, admin.pubkey())], "NotAdmin");
+    send_expect_reason_with(&mut env, &admin, |env| vec![treasury_ix(env, &admin, "init_treasury_outbox")], "NotAdmin");
+    send_with(&mut env, &next, |env| vec![set_fee(env, &next)]);
+    send_with(&mut env, &next, |env| vec![treasury_ix(env, &next, "init_treasury_outbox")]);
+    // A second acceptance finds no proposal.
+    send_expect_reason_with(&mut env, &next, |env| vec![accept_admin_ix(env, &next)], "NotPendingAdmin");
+}
+
+#[test]
+fn the_all_zero_key_withdraws_a_proposal() {
+    let mut env = setup();
+    let admin = env.admin.insecure_clone();
+    let next = Keypair::new();
+    env.fund(&next);
+    send_with(&mut env, &admin, |env| vec![set_admin_ix(env, &admin, next.pubkey())]);
+    send_with(&mut env, &admin, |env| vec![set_admin_ix(env, &admin, Address::default())]);
+    assert_eq!(config_admins(&env), (admin.pubkey(), Address::default()));
+    send_expect_reason_with(&mut env, &next, |env| vec![accept_admin_ix(env, &next)], "NotPendingAdmin");
 }
 
 #[test]
@@ -442,21 +499,21 @@ fn only_the_upgrade_authority_initializes_and_a_funded_identity_does_not_block_i
     let stranger = Keypair::new();
     env.fund(&stranger);
     // A signer that is not the upgrade authority, with the real ProgramData.
-    send_expect_reason_with(&mut env, &stranger, |env| vec![initialize_ix(&env.program, &stranger.pubkey(), &env.program, VALIDATOR)], "NotUpgradeAuthority");
+    send_expect_reason_with(&mut env, &stranger, |env| vec![initialize_ix(&env.program, &stranger.pubkey(), &env.program)], "NotUpgradeAuthority");
     // Another program's ProgramData whose authority is the stranger: not this program's.
     let vrf = env.vrf;
     set_upgrade_authority(&mut env.svm, &vrf, Some(&stranger.pubkey()));
-    send_expect_reason_with(&mut env, &stranger, |env| vec![initialize_ix(&env.program, &stranger.pubkey(), &env.vrf, VALIDATOR)], "NotUpgradeAuthority");
+    send_expect_reason_with(&mut env, &stranger, |env| vec![initialize_ix(&env.program, &stranger.pubkey(), &env.vrf)], "NotUpgradeAuthority");
     // A program with no upgrade authority (made immutable) cannot be initialized by anyone.
     let program = env.program;
     set_upgrade_authority(&mut env.svm, &program, None);
-    send_expect_reason_with(&mut env, &admin, |env| vec![initialize_ix(&env.program, &admin.pubkey(), &env.program, VALIDATOR)], "NotUpgradeAuthority");
+    send_expect_reason_with(&mut env, &admin, |env| vec![initialize_ix(&env.program, &admin.pubkey(), &env.program)], "NotUpgradeAuthority");
     set_upgrade_authority(&mut env.svm, &program, Some(&admin.pubkey()));
     assert!(env.svm.get_account(&env.config).is_none_or(|account| account.data.is_empty()), "no failed call made a Config");
 
     // Lamports sent to the identity address beforehand, short of its rent, are topped up.
     env.svm.set_account(identity, Account { lamports: 1_000, data: vec![], owner: SYSTEM, executable: false, rent_epoch: 0 }).unwrap();
-    send_with(&mut env, &admin, |env| vec![initialize_ix(&env.program, &admin.pubkey(), &env.program, VALIDATOR)]);
+    send_with(&mut env, &admin, |env| vec![initialize_ix(&env.program, &admin.pubkey(), &env.program)]);
     let stored = env.svm.get_account(&identity).unwrap();
     assert_eq!((stored.owner, stored.data.len(), stored.lamports), (env.program, 0, env.svm.minimum_balance_for_rent_exemption(0)));
     assert_eq!(&env.svm.get_account(&env.config).unwrap().data[8..40], admin.pubkey().as_ref());
@@ -466,7 +523,7 @@ fn only_the_upgrade_authority_initializes_and_a_funded_identity_does_not_block_i
         env.svm.set_account(key, Account::default()).unwrap();
     }
     env.svm.set_account(identity, Account { lamports: 5_000_000, data: vec![], owner: SYSTEM, executable: false, rent_epoch: 0 }).unwrap();
-    send_with(&mut env, &admin, |env| vec![initialize_ix(&env.program, &admin.pubkey(), &env.program, VALIDATOR)]);
+    send_with(&mut env, &admin, |env| vec![initialize_ix(&env.program, &admin.pubkey(), &env.program)]);
     assert_eq!(env.balance(&identity), 5_000_000);
     assert_eq!(env.svm.get_account(&identity).unwrap().owner, env.program);
 }
@@ -1003,44 +1060,40 @@ fn an_army_whose_owner_cannot_cover_a_stake_is_evicted() {
     let owner = Keypair::new();
     env.fund(&owner);
     let stranded = env.army(&owner, 0, 0, AshbornKind::Guard.id(), hold);
-    let met = env.army(&owner, 0, 1, AshbornKind::Guard.id(), hold);
+    let second_queued = env.army(&owner, 0, 1, AshbornKind::Guard.id(), hold);
     queue(&mut env, &owner, stranded);
-    queue(&mut env, &owner, met);
+    queue(&mut env, &owner, second_queued);
     let owner_player = player_pda(&env, &owner.pubkey());
 
-    // A locker meets the second army: the owner's one stake is now locked and the budget is empty.
+    // A locker meets one of the two: the owner's one stake is now locked and the budget is empty.
     let first = Keypair::new();
     env.fund(&first);
     let army = env.army(&first, 0, 0, AshbornKind::Guard.id(), hold);
     cover_stake(&mut env, &first, &ground);
-    let lock = lock_ix(&env, &first, ground, army, battle_pda(&env, 0, 0), vec![meta(met, true, false), meta(owner_player, true, false)]);
+    let window = queue_window(&env, &ground, &first.pubkey());
+    assert_eq!(window.len(), 3, "both armies and their owner's Player once");
+    let lock = lock_ix(&env, &first, ground, army, battle_pda(&env, 0, 0), window);
     send(&mut env.svm, &first, &[cu_limit(), lock]);
     assert_eq!(player_state(&env, &owner.pubkey()), (0, 0, STAKE, false, 1));
+    let met = Address::try_from(&env.svm.get_account(&battle_pda(&env, 0, 0)).unwrap().data[40..72]).unwrap();
+    let stranded = if met == stranded { second_queued } else { stranded };
     assert_eq!(queued_armies(&env, &ground), vec![stranded]);
 
-    // Without the owner's Player there is no evidence: the army is skipped, not evicted.
+    // The queue's front is not the locker's to trim: leaving out the owner's Player, or passing a
+    // program-owned Player copy away from the owner's PDA, is refused, and the queue is unchanged.
     let second = Keypair::new();
     env.fund(&second);
     let second_army = env.army(&second, 0, 0, AshbornKind::Guard.id(), hold);
     cover_stake(&mut env, &second, &ground);
     let lock = lock_ix(&env, &second, ground, second_army, Address::new_unique(), vec![meta(stranded, true, false)]);
-    let logs = send(&mut env.svm, &second, &[cu_limit(), lock]);
-    assert!(!logs.iter().any(|line| line.contains("HZ_EVICT")));
-    assert_eq!(queued_armies(&env, &ground), vec![stranded, second_army]);
-
-    // A program-owned Player copy away from the owner's PDA is not evidence either.
+    send_expect_reason(&mut env.svm, &second, &[cu_limit(), lock], "MissingAccount");
     let mut forged = env.svm.get_account(&owner_player).unwrap();
     forged.data[40..48].copy_from_slice(&0u64.to_le_bytes());
     let fake = Address::new_unique();
     env.svm.set_account(fake, forged).unwrap();
-    let third = Keypair::new();
-    env.fund(&third);
-    let third_army = env.army(&third, 0, 0, AshbornKind::Guard.id(), hold);
-    cover_stake(&mut env, &third, &ground);
-    let lock = lock_ix(&env, &third, ground, third_army, Address::new_unique(), vec![meta(stranded, true, false), meta(fake, true, false)]);
-    let logs = send(&mut env.svm, &third, &[cu_limit(), lock]);
-    assert!(!logs.iter().any(|line| line.contains("HZ_EVICT")));
-    assert_eq!(queued_armies(&env, &ground).len(), 3);
+    let lock = lock_ix(&env, &second, ground, second_army, Address::new_unique(), vec![meta(stranded, true, false), meta(fake, true, false)]);
+    send_expect_reason(&mut env.svm, &second, &[cu_limit(), lock], "MissingAccount");
+    assert_eq!(queued_armies(&env, &ground), vec![stranded]);
 
     // With the owner's real Player supplied, the next lock evicts the army and sets it Idle.
     let fourth = Keypair::new();
@@ -1051,12 +1104,90 @@ fn an_army_whose_owner_cannot_cover_a_stake_is_evicted() {
     let logs = send(&mut env.svm, &fourth, &[cu_limit(), lock]);
     assert!(logs.iter().any(|line| line.contains(&format!("HZ_EVICT {stranded}"))));
     assert!(logs.iter().any(|line| line.contains("HZ_QUEUED")));
-    let queued = queued_armies(&env, &ground);
-    assert_eq!(queued.len(), 3);
-    assert!(!queued.contains(&stranded) && queued.contains(&fourth_army));
+    assert_eq!(queued_armies(&env, &ground), vec![fourth_army]);
     assert_eq!(env.svm.get_account(&stranded).unwrap().data[1358], 0, "the evicted army is Idle");
     // The owner closes it like any idle army.
     env.close_army(&owner, stranded);
+}
+
+/// `lock_army` asks only the oracle queue the program was built for: another queue the VRF program
+/// owns is refused too, since a lock could otherwise send its request where no oracle answers it.
+#[test]
+fn lock_army_asks_only_the_pinned_oracle_queue() {
+    let mut env = setup();
+    let hold = env.behavior(&still_body());
+    let (ground, _) = pda(&[b"battleground", &[0]], &env.program);
+    let owner = Keypair::new();
+    env.fund(&owner);
+    let army = env.army(&owner, 0, 0, AshbornKind::Guard.id(), hold);
+    cover_stake(&mut env, &owner, &ground);
+    let other = Address::new_unique();
+    let pinned = env.svm.get_account(&env.queue).unwrap();
+    env.svm.set_account(other, pinned.clone()).unwrap();
+    let mut forged_owner = pinned;
+    forged_owner.owner = SYSTEM;
+    for (queue, account) in [(other, None), (env.queue, Some(forged_owner))] {
+        let saved = env.svm.get_account(&env.queue).unwrap();
+        if let Some(account) = account {
+            env.svm.set_account(env.queue, account).unwrap();
+        }
+        let mut lock = lock_ix(&env, &owner, ground, army, Address::new_unique(), vec![]);
+        lock.accounts.iter_mut().filter(|meta| meta.pubkey == env.queue).for_each(|meta| meta.pubkey = queue);
+        lock.accounts[5].is_writable = false;
+        send_expect_reason(&mut env.svm, &owner, &[cu_limit(), lock], "BadQueue");
+        env.svm.set_account(env.queue, saved).unwrap();
+    }
+    queue(&mut env, &owner, army);
+    assert_eq!(queued_armies(&env, &ground), vec![army]);
+}
+
+/// `lock_army` takes its candidates from the queue's first `MATCH_WINDOW` (8) entries, and the
+/// locker must pass all of them: it cannot leave out the armies it would rather not meet. An army
+/// past the window is neither required nor met.
+#[test]
+fn a_lock_must_offer_the_whole_queue_window() {
+    let mut env = setup();
+    let hold = env.behavior(&still_body());
+    let (ground, _) = pda(&[b"battleground", &[0]], &env.program);
+    // Nine funded owners with one queued army each. Queued through `lock_army`, each would meet the
+    // one before it, so the queue is written directly.
+    let mut ground_account = env.svm.get_account(&ground).unwrap();
+    for at in 0..9 {
+        let owner = Keypair::new();
+        env.fund(&owner);
+        let army = env.army(&owner, 0, 0, AshbornKind::Guard.id(), hold);
+        cover_stake(&mut env, &owner, &ground);
+        let mut account = env.svm.get_account(&army).unwrap();
+        account.data[1358] = 1;
+        env.svm.set_account(army, account).unwrap();
+        ground_account.data[55 + 32 * at..87 + 32 * at].copy_from_slice(army.as_ref());
+    }
+    ground_account.data[54] = 9;
+    env.svm.set_account(ground, ground_account).unwrap();
+    let order = queued_armies(&env, &ground);
+    assert_eq!(order.len(), 9);
+    let locker = Keypair::new();
+    env.fund(&locker);
+    let army = env.army(&locker, 0, 0, AshbornKind::Guard.id(), hold);
+    cover_stake(&mut env, &locker, &ground);
+    let window = queue_window(&env, &ground, &locker.pubkey());
+    assert_eq!(window.len(), 16, "eight armies and eight Players");
+    assert!(!window.iter().any(|meta| meta.pubkey == order[8]), "the ninth army is past the window");
+
+    // Any one army, or any one Player, left out of the window is refused.
+    for skip in [0, 1, 14, 15] {
+        let mut short = window.clone();
+        short.remove(skip);
+        let lock = lock_ix(&env, &locker, ground, army, battle_pda(&env, 0, 0), short);
+        send_expect_reason(&mut env.svm, &locker, &[cu_limit(), lock], "MissingAccount");
+    }
+    assert_eq!(queued_armies(&env, &ground), order);
+
+    let lock = lock_ix(&env, &locker, ground, army, battle_pda(&env, 0, 0), window);
+    send(&mut env.svm, &locker, &[cu_limit(), lock]);
+    let met = Address::try_from(&env.svm.get_account(&battle_pda(&env, 0, 0)).unwrap().data[40..72]).unwrap();
+    assert!(order[..8].contains(&met), "the opponent came from the window");
+    assert!(queued_armies(&env, &ground).contains(&order[8]));
 }
 
 #[test]
@@ -1320,6 +1451,101 @@ fn the_largest_boards_settle_full_armies_and_one_tile_more_is_refused() {
     }
 }
 
+/// Random behaviors and an army built to make the walks expensive: ten cheap units packed against
+/// the board's edge, each re-reading its target every step. Before the engine counted its work,
+/// such battles ran `settle_match` past the 1.4M compute-unit limit, so no one could settle them
+/// and, being seeded, no one could cancel them either: both stakes stayed locked. Every one must
+/// settle under the default limit and pay the winner the host engine names, and some must stop at
+/// `WORK_LIMIT`, so the hp-share judgement runs on chain too.
+#[test]
+fn battles_that_run_out_of_work_settle_and_match_the_host() {
+    let standards = [behavior_march_cast(), behavior_charge_cast(), behavior_kite_cast(), behavior_flank_left_cast(), behavior_march(), behavior_charge(), behavior_kite()];
+    let packed: Vec<Placement> = [(1u8, 9u8, 1u8), (4, 1, 0), (1, 0, 0), (1, 3, 0), (3, 11, 1), (1, 5, 0), (3, 10, 1), (4, 7, 0), (3, 8, 0), (1, 9, 0)]
+        .iter()
+        .map(|&(kind, col, row)| (AshbornKind::from_u8(kind).unwrap(), col, row))
+        .collect();
+    let packed_body = BehaviorBody::parse(&[1, 1, 3, 0, 2, 1, 0, 3, 1, 1, 2, 1, 1, 1, 0, 1, 0, 0, 0, 0]).unwrap();
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut next = move |bound: u64| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state % bound
+    };
+    let random_body = |next: &mut dyn FnMut(u64) -> u64| loop {
+        let count = 1 + next(4) as u8;
+        let mut bytes = vec![count];
+        let spec = |bytes: &mut Vec<u8>, next: &mut dyn FnMut(u64) -> u64| bytes.extend([next(2) as u8, next(3) as u8, next(2) as u8]);
+        for _ in 0..count {
+            let moves = next(4) != 0;
+            bytes.push(moves as u8);
+            if moves {
+                bytes.push(next(4) as u8);
+                spec(&mut bytes, next);
+                bytes.push(next(2) as u8);
+            }
+            let actions = next(4) as u8;
+            bytes.push(actions);
+            for _ in 0..actions {
+                bytes.push(next(2) as u8);
+                spec(&mut bytes, next);
+            }
+        }
+        if let Some(body) = BehaviorBody::parse(&bytes) {
+            return body;
+        }
+    };
+    let random_army = |next: &mut dyn FnMut(u64) -> u64| {
+        let mut units: Vec<Placement> = Vec::new();
+        let mut spent = 0;
+        for _ in 0..40 {
+            let kind = AshbornKind::from_u8(next(5) as u8).unwrap();
+            let cost = stats_for(0, kind.id()).unwrap().cost;
+            let tile = (next(12) as u8, next(2) as u8);
+            if units.len() < MAX_UNITS && spent + cost <= 32 && !units.iter().any(|&(_, col, row)| (col, row) == tile) {
+                spent += cost;
+                units.push((kind, tile.0, tile.1));
+            }
+        }
+        units
+    };
+    let (mut worst, mut stopped) = (0, 0);
+    for battle_no in 0..16u8 {
+        let honest = random_army(&mut next);
+        let honest_body = if battle_no % 2 == 0 { standards[next(standards.len() as u64) as usize] } else { random_body(&mut next) };
+        let (other, other_body) = if battle_no % 4 < 2 { (packed.clone(), packed_body) } else { (random_army(&mut next), random_body(&mut next)) };
+        let seed = sha256(&[battle_no, 0x5e]);
+        let snapshot = |units: &[Placement], body| -> Vec<SnapshotUnit> { units.iter().map(|&(kind, col, row)| SnapshotUnit::catalog(0, kind.id(), body, col, row).unwrap()).collect() };
+        let (winner, work) = horizon_combat::simulate_work(&snapshot(&honest, honest_body), &snapshot(&other, other_body), seed, Geometry { cols: 12, rows: 10 });
+        stopped += (work >= horizon_combat::WORK_LIMIT) as u32;
+
+        let mut env = setup();
+        let first = Keypair::new();
+        let second = Keypair::new();
+        env.fund(&first);
+        env.fund(&second);
+        let first_behavior = env.behavior(&honest_body.canonical_bytes());
+        let second_behavior = if other_body == honest_body { first_behavior } else { env.behavior(&other_body.canonical_bytes()) };
+        let army_a = env.squad(&first, 2, 0, &honest, first_behavior);
+        let army_b = env.squad(&second, 2, 0, &other, second_behavior);
+        queue(&mut env, &first, army_a);
+        let (battle, _) = lock_and_seed(&mut env, 2, &second, army_b, army_a, &first, Some(seed));
+        let logs = settle(&mut env, &battle);
+        let cost = program_cost(&env, &logs);
+        worst = worst.max(cost);
+        println!("battle {battle_no}: work {work}, settle_match consumed {cost} CU");
+        let expected = match winner {
+            Some(Side::A) => 1,
+            Some(Side::B) => 2,
+            None => 3,
+        };
+        assert_eq!(resolved(&logs).0, expected, "battle {battle_no}");
+    }
+    println!("worst settle_match: {worst} CU; {stopped} of 16 stopped at the work limit");
+    assert!(stopped > 0, "no battle reached the work limit");
+    assert!(worst < 1_300_000, "settle_match consumed {worst} CU");
+}
+
 /// Compute benchmark: `settle_match` on a fixed, seeded set of battles. Each battleground gets
 /// `BENCH_BATTLES` pairs of random budget-legal armies, each army on one random standard behavior,
 /// with a random VRF seed. Run with
@@ -1542,10 +1768,30 @@ fn queue(env: &mut Env, player: &Keypair, army: Address) {
     let ground = Address::from(stored);
     cover_stake(env, player, &ground);
     let battle = Address::new_unique();
-    let mut lock = lock_ix(env, player, ground, army, battle, vec![]);
+    let window = queue_window(env, &ground, &player.pubkey());
+    let mut lock = lock_ix(env, player, ground, army, battle, window);
     // A lock that only queues passes the battle read-only, as the rollup requires.
     lock.accounts.iter_mut().filter(|meta| meta.pubkey == battle).for_each(|meta| meta.is_writable = false);
     send(&mut env.svm, player, &[cu_limit(), lock]);
+}
+
+/// The queue's first `MATCH_WINDOW` (8) armies, writable, each followed by its owner's Player once
+/// unless `locker` owns it: what `lock_army` requires.
+fn queue_window(env: &Env, ground: &Address, locker: &Address) -> Vec<AccountMeta> {
+    let data = env.svm.get_account(ground).unwrap().data;
+    // disc, admin, id, budget, stake, cols, rows, zone_depth, then queue_len and the queue
+    let len = data[54] as usize;
+    let mut out: Vec<AccountMeta> = Vec::new();
+    for at in 0..len.min(8) {
+        let army = Address::try_from(&data[55 + 32 * at..87 + 32 * at]).unwrap();
+        out.push(meta(army, true, false));
+        let owner = Address::try_from(&env.svm.get_account(&army).unwrap().data[8..40]).unwrap();
+        let player = player_pda(env, &owner);
+        if owner != *locker && !out.iter().any(|meta| meta.pubkey == player) {
+            out.push(meta(player, true, false));
+        }
+    }
+    out
 }
 
 /// `lock_army`: the fixed accounts, then `rest`.
@@ -1643,8 +1889,10 @@ fn lock_and_seed(
     }
     let seed = seed.unwrap_or_else(|| sha256(battle.as_ref()));
     let fulfill = mock_fulfill(env, &battle, &player.pubkey(), &seed);
-    let opponent_player = player_pda(env, &opponent_owner.pubkey());
-    let lock = lock_ix(env, player, ground, army, battle, vec![meta(opponent, true, false), meta(opponent_player, true, false)]);
+    let window = queue_window(env, &ground, &player.pubkey());
+    assert!(window.iter().any(|meta| meta.pubkey == opponent), "the opponent is in the queue window");
+    assert!(window.iter().any(|meta| meta.pubkey == player_pda(env, &opponent_owner.pubkey())) || opponent_owner.pubkey() == player.pubkey());
+    let lock = lock_ix(env, player, ground, army, battle, window);
     let logs = send(&mut env.svm, player, &[cu_limit(), lock, fulfill]);
     (battle, logs)
 }
@@ -1979,7 +2227,6 @@ fn solana_admin_checks_read_config_by_hand() {
     env.fund(&stranger);
     let data = env.svm.get_account(&env.config).unwrap().data;
     assert_eq!(data.len(), CONFIG_LEN);
-    assert_eq!(Address::try_from(&data[50..82]).unwrap(), VALIDATOR, "initialize pinned the rollup validator");
 
     // `create_battleground` and `init_treasury_outbox` read Config by hand. The treasury Outbox's
     // seeds follow the account passed as Config, so each call names the Outbox of that account.
@@ -2022,4 +2269,29 @@ fn solana_admin_checks_read_config_by_hand() {
     send_with(&mut env, &admin, |env| vec![init(env, &admin, env.config)]);
     assert_eq!(outbox_state(&env, &treasury_outbox(&env)), (admin.pubkey(), 0));
     env.svm.set_account(env.config, config).unwrap();
+}
+
+#[test]
+fn a_claim_funded_before_a_handover_pays_the_new_admin() {
+    let mut env = setup();
+    won_battle(&mut env, false);
+    let admin = env.admin.insecure_clone();
+    let next = Keypair::new();
+    env.fund(&next);
+    let outbox = treasury_outbox(&env);
+    send_with(&mut env, &admin, |env| vec![treasury_ix(env, &admin, "init_treasury_outbox")]);
+    // Funded in one transaction and left unclaimed: the Outbox records the old admin.
+    send_with(&mut env, &admin, |env| vec![treasury_ix(env, &admin, "fund_treasury_outbox")]);
+    assert_eq!(outbox_state(&env, &outbox), (admin.pubkey(), FEE));
+    send_with(&mut env, &admin, |env| vec![set_admin_ix(env, &admin, next.pubkey())]);
+    send_with(&mut env, &next, |env| vec![accept_admin_ix(env, &next)]);
+
+    send_expect_reason_with(&mut env, &admin, |env| vec![treasury_ix(env, &admin, "claim_fees")], "NotAdmin");
+    let logs = send_with(&mut env, &next, |env| vec![treasury_ix(env, &next, "claim_fees")]);
+    assert!(logs.iter().any(|line| line.contains(&format!("HZ_CLAIM {outbox} {FEE}"))));
+    assert_eq!(outbox_state(&env, &outbox), (next.pubkey(), FEE), "the claim pays the current admin");
+    send_expect_reason_with(&mut env, &admin, |env| vec![release_ix(env, outbox, admin.pubkey())], "ConstraintAddress");
+    let wallet = env.balance(&next.pubkey());
+    send_with(&mut env, &admin, |env| vec![release_ix(env, outbox, next.pubkey())]);
+    assert_eq!(env.balance(&next.pubkey()), wallet + FEE);
 }

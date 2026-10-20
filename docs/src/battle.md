@@ -16,6 +16,25 @@ Wasm input is JSON: `cols`, `rows`, `a` and `b` as arrays of `{kind, body, col, 
 
 `settle_match` calls `simulate_winner`, which plays the same battle as `simulate` without keeping the trace. On a Solana target every SHA-256 (tie keys, initiative, blocked-tile order, behavior hashes) goes through the `sol_sha256` syscall; other builds use the `sha2` crate, with identical output. Tie keys are hashed only when two candidates tie on the primary key, and a step attempt that neither moves nor fires anything ends the element's remaining attempts, because each would repeat the same no-op; the movement points are spent either way. The program heap is 32 KiB and never frees, so the hot paths use fixed arrays, the flood fill reuses one buffer, and the spawn-time body check (`BehaviorBody::is_valid`) reads the element and action counts instead of re-encoding the body. None of this changes a trace: 400 random battles replay identically before and after.
 
+### Work limit
+
+Behaviors are free-form, so the cost of a battle is up to its players. Before the engine counted its work, an army of ten cheap units packed against its edge and re-reading its target every step ran `settle_match` past the 1 400 000 CU a transaction can have, so a battle against it could neither settle nor, once seeded, be cancelled: both stakes stayed locked for good. The engine now counts its work in its own units and stops at `WORK_LIMIT` (72 000, `crates/combat/src/lib.rs`). Each of these costs a fixed number of units, about 14 CU each:
+
+| work | units |
+| --- | --- |
+| a turn | 33, plus 5 per element of the actor's behavior |
+| a step taken or tried | 60 |
+| an action tried | 18 |
+| a walking-distance question | 44 |
+| a wave started | 64 |
+| a row one wave step scans | 8 |
+| a fighter a target rule looks at | 1 |
+| a seeded tie-break hash | 14 |
+
+The weights are a least-squares fit of `settle_match` cost on 360 battles: random and adversarial armies, standard and random behaviors, on Citadel. The engine checks the count before each turn, each element and each step, so a battle stops at most one step past the limit (under 1 000 units in practice). When it stops with both sides standing, the side with the larger share of its starting hp left wins (`left_a × start_b` against `left_b × start_a`, hp below 0 counted as 0), and equal shares draw. Ending in a draw instead would let an army that only exhausts the limit turn a loss into a refund. The trace ends `E <side> work` or `E draw work`. The program and the wasm replay count the same units, so they stop at the same point.
+
+Across 800 random and adversarial Citadel battles the worst `settle_match` used about 1 256 000 CU. Battles between full-budget Citadel armies on standard behaviors reached the limit about one time in sixteen. Battles with a packed army reached it about half the time.
+
 Walking distance dominates a battle's cost, so `Field` keeps one wave per goal tile (8 kept, the oldest replaced). Rubble never moves and units are not walls, so a goal's distances never change during a battle: the wave grows from the goal one step at a time, as one bit mask per row over only the rows it has reached, records each tile's distance as it reaches it, and stops once the tiles asked about are reached. A later question about the same goal continues that wave. Waves use two frontier buffers so a step neither clears nor copies one, and they live on the heap, allocated once. A unit already next to its goal skips the lookup, since no step can get closer. Occupied tiles are a bit mask per row kept in step with every move, push and death, so a step candidate is one lookup instead of a scan of the fighters. `seed_match` and `settle_match` check the battle address with one `create_program_address` on the stored canonical bump instead of a bump search. The wave step and the distance and rubble lookups (`Field::grow_walk`, `walking_distances`, `is_blocked` in `board.rs`) index without bounds checks: each `unsafe` block states why its indices are in range (rows below `rows`, a reached bit below `cols`, a tile already checked to be on the board) and repeats it as a `debug_assert!`, which the test suite exercises. These are the only `unsafe` blocks in the engine. The [Testing](testing.md#compute-benchmark) chapter has the benchmark these were measured with.
 
 ## Ids
@@ -149,7 +168,7 @@ A cast that fires in round `r` with cooldown `c` cannot fire again before round 
 
 A self cast fires the first time its action is tried in a turn (in an element with a movement, that is right after the first step attempt), and it is not recast while its status holds. Every unit has one action point, so a Skirmisher that sprints or an Archer that draws long does not also attack that round.
 
-If both sides still have a living unit after round 12, the result is a draw and the last trace line is `E draw limit`. The interpreter does not start a 13th round. If both sides are dead, the result is a draw and the last line is `E draw`. Otherwise the side that still has a living unit wins, and the last line is `E 0` or `E 1`. Each round that starts appends `R` after that round's other events. A round that never starts, because a side is already wiped, does not append `R`.
+If both sides still have a living unit after round 12, the result is a draw and the last trace line is `E draw limit`. A battle that reaches the [work limit](#work-limit) first ends there and is judged by hp share. The interpreter does not start a 13th round. If both sides are dead, the result is a draw and the last line is `E draw`. Otherwise the side that still has a living unit wins, and the last line is `E 0` or `E 1`. Each round that starts appends `R` after that round's other events. A round that never starts, because a side is already wiped, does not append `R`.
 
 ## Targeting
 
@@ -201,8 +220,10 @@ D <side> <index>
 X <side> <index> <effect>
 R
 E <side>
+E <side> work
 E draw
 E draw limit
+E draw work
 ```
 
-`A` is an attack, `C` is a cast, and `F` is the unit defending for the rest of the round. A cast line names one unit it landed on; a self cast names the caster as its own target. `effect` is the effect id. `amount` is what it did: tiles pushed, hp restored, or the power of a lasting effect, `0` for none. `rounds` is how long a lasting effect stays, `0` otherwise. `target_hp` is after the damage and the heal. `from` is the unit's tile when the cast landed and `to` is its tile after a push. They are equal when it did not move. `X` is a lasting effect ending on a living unit at the end of a round, just before `R`. `R` is the end of a round that started. `E draw limit` is a draw because both sides still have a living unit after round 12. `E draw` is any other draw. A move line is emitted for each step that changes the tile, so an attack or cast can sit between two moves of the same run. The golden vector `crates/combat/golden/advance.txt` is two catalog Guards on Outpost (8×6), both March (approach lowest distance, then attack lowest distance, stop if an action fires) at zone-local `(0, 0)`, seed bytes all `9`. That seed puts rubble on column 0 between them, so both walk around it to column 2, meet in round 2, trade blows, and side B wins in round 3: the trace ends `E 1`. Under the old straight-line approach the same pair stopped in front of the rubble and drew after 12 rounds. `app/src/golden.test.mjs` replays that file through the node wasm build.
+`A` is an attack, `C` is a cast, and `F` is the unit defending for the rest of the round. A cast line names one unit it landed on; a self cast names the caster as its own target. `effect` is the effect id. `amount` is what it did: tiles pushed, hp restored, or the power of a lasting effect, `0` for none. `rounds` is how long a lasting effect stays, `0` otherwise. `target_hp` is after the damage and the heal. `from` is the unit's tile when the cast landed and `to` is its tile after a push. They are equal when it did not move. `X` is a lasting effect ending on a living unit at the end of a round, just before `R`. `R` is the end of a round that started. `E draw limit` is a draw because both sides still have a living unit after round 12. `E <side> work` and `E draw work` end a battle the [work limit](#work-limit) stopped, judged by hp share. `E draw` is any other draw. A move line is emitted for each step that changes the tile, so an attack or cast can sit between two moves of the same run. The golden vector `crates/combat/golden/advance.txt` is two catalog Guards on Outpost (8×6), both March (approach lowest distance, then attack lowest distance, stop if an action fires) at zone-local `(0, 0)`, seed bytes all `9`. That seed puts rubble on column 0 between them, so both walk around it to column 2, meet in round 2, trade blows, and side B wins in round 3: the trace ends `E 1`. Under the old straight-line approach the same pair stopped in front of the rubble and drew after 12 rounds. `app/src/golden.test.mjs` replays that file through the node wasm build.

@@ -21,10 +21,11 @@ services:
       # The Solana cluster. See scripts/deploy.mjs.
       - key: RPC_URL
         sync: false
-      # The ephemeral rollup serving the validator Config pins.
+      # The ephemeral rollup serving the validator the program was built for (HZ_VALIDATOR).
       - key: ER_RPC_URL
         sync: false
-      # An ephemeral queue: lock_army runs in the rollup (SDK DEFAULT_EPHEMERAL_QUEUE).
+      # An ephemeral queue: lock_army runs in the rollup (SDK DEFAULT_EPHEMERAL_QUEUE). It must be the
+      # queue the program was built for (HZ_VRF_QUEUE in scripts/deploy.mjs), or lock_army fails with BadQueue.
       - key: ORACLE_QUEUE
         value: 5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc
   - type: web

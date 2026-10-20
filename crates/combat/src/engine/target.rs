@@ -51,7 +51,9 @@ impl Battle<'_> {
     /// The unit in `pool` and in range that `spec` ranks first, skipping any `wanted` rejects.
     pub(crate) fn choose_from(&self, actor: usize, spec: TargetSpec, pool: Pool, max_range: Option<i32>, wanted: impl Fn(&Fighter) -> bool) -> Option<usize> {
         let me = &self.fighters[actor];
+        self.charge(super::WORK_CANDIDATE * self.fighters.len() as u32);
         let tie_of = |idx: usize| {
+            self.charge(super::WORK_HASH);
             let other = &self.fighters[idx];
             mix(&self.seed, &[me.side.id(), me.index, other.side.id(), other.index, self.round as u8])
         };

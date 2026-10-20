@@ -22,7 +22,7 @@ The scoped VRF identity is a different account, owned by the derivation under th
 
 | account | created on Solana by | delegated to the rollup by | leaves the rollup |
 | --- | --- | --- | --- |
-| Config | `initialize` | `delegate_config` | never; each `claim_fees` commits it and it stays delegated |
+| Config | `initialize` | `delegate_config` | never; each `claim_fees` and `accept_admin` commits it and it stays delegated |
 | Battleground | `create_battleground` | `delegate_battleground` | never |
 | Player | `register_player` | `delegate_player` | never; each `withdraw` commits it and it stays delegated |
 | Outbox | `register_player` | `delegate_outbox`, before each withdrawal | `withdraw` commits and undelegates it |
@@ -30,9 +30,9 @@ The scoped VRF identity is a different account, owned by the derivation under th
 | program identity | `initialize` | not delegated | — |
 | Behavior, Army, Battle | not on Solana | ephemeral: created in the rollup (see [Ephemeral accounts](#ephemeral-accounts)) | never |
 
-The first five are program PDAs. Each is delegated to the rollup validator pinned in Config by `initialize`. Once delegated, each one's Solana copy is owned by the delegation program `DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh`; the rollup holds the live copy.
+The first five are program PDAs. Each is delegated to the rollup validator built into the program (see [Delegation](#delegation)). Once delegated, each one's Solana copy is owned by the delegation program `DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh`; the rollup holds the live copy.
 
-Nothing commits on a timer: every delegation uses the SDK's default commit frequency, `u32::MAX` ms. Commits happen only when cash leaves the rollup. Money leaves only through an Outbox (see [Money in and out](matchmaking.md#money-in-and-out)). In one intent bundle, `withdraw` commits the owner's Player and commits and undelegates their Outbox; `claim_fees` commits Config and commits and undelegates the treasury Outbox. The Player and Config stay delegated. A Battleground is never committed.
+Nothing commits on a timer: every delegation uses the SDK's default commit frequency, `u32::MAX` ms. Commits happen when cash leaves the rollup, and when the admin changes. Money leaves only through an Outbox (see [Money in and out](matchmaking.md#money-in-and-out)). In one intent bundle, `withdraw` commits the owner's Player and commits and undelegates their Outbox; `claim_fees` commits Config and commits and undelegates the treasury Outbox. `accept_admin` commits Config alone, so the admin instructions that run on Solana see the new admin. The Player and Config stay delegated. A Battleground is never committed.
 
 The commit is what keeps the validator's books exact. A top-up reaches the Player only in the rollup; on Solana its lamports end in the validator's fees vault (see [Money in and out](matchmaking.md#money-in-and-out)). A commit that raises a delegated account's Solana balance is paid by the rollup validator's identity. Committing the source (Player or Config) with the Outbox sets its Solana copy to the rollup's balance, so the identity pays out, for that account, what the rollup holds for it, against the top-ups its fees vault took in. Between withdrawals a Player's Solana copy is stale: it shows the data and lamports of its last commit, or of its delegation if it was never committed. Top-ups, budgets, stakes and payouts live in the rollup until the next withdrawal.
 
@@ -53,6 +53,7 @@ flowchart LR
   Init -->|"delegate_config, delegate_battleground, delegate_player,<br/>delegate_outbox, delegate_treasury_outbox"| Live
   Live -->|"Player sponsors"| Eph
   Live -->|"withdraw, claim_fees: commit the Player or Config,<br/>commit and undelegate the Outbox"| Release
+  Live -->|"accept_admin: commit Config"| Copy["Config's Solana copy,<br/>read by the admin instructions"]
   Release -->|"delegate_outbox or delegate_treasury_outbox again"| Live
 ```
 
@@ -122,8 +123,10 @@ Sizes include the 8-byte discriminator. The indexer decodes an account only when
 | 8 | `admin` pubkey |
 | 40 | `fee_bps` u16, the protocol fee rate in basis points |
 | 42 | `fees` u64, claimable fee lamports |
-| 50 | `validator` pubkey, the rollup validator identity every delegate instruction delegates to |
+| 50 | `pending_admin` pubkey, the admin `set_admin` proposed; all zeros when none is |
 | 82 | `bump` |
+
+The rollup validator is not stored here: it is built into the program (see [Delegation](#delegation)). `pending_admin` took the offset and size of the `validator` field it replaced, so the account is still 83 bytes.
 
 The account's lamports are its rent plus `fees`. Only `fees` can be claimed: `fund_treasury_outbox` moves exactly `config.fees` and keeps the rest, so lamports sent to Config directly stay there for good. `fee_bps` is at most `1000` (`MAX_FEE_BPS` in `programs/horizon-zero/src/fees.rs`); the program has no default, and the bootstrap passes `500`. The indexer does not store Config.
 
@@ -271,13 +274,13 @@ Each snapshot unit is 96 bytes: `kind`, `len`, `body` (77 bytes), `col`, `row`, 
 
 ## Instructions
 
-### `initialize(fee_bps: u16, validator: Pubkey)`
+### `initialize(fee_bps: u16)`
 
 Solana. Accounts: admin signer writable, config init, identity writable, system program, this program (`Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c`), its ProgramData `[program_id]` under `BPFLoaderUpgradeab1e11111111111111111111111`.
 
 Only the program's upgrade authority may call it. The program account must name the passed ProgramData as its own, and the ProgramData's `upgrade_authority_address` must be the signer; either mismatch fails with `NotUpgradeAuthority`, as does a program with no upgrade authority. So nobody can run `initialize` between the deploy and the deployer's bootstrap and become the admin. The program must be deployed through the upgradeable loader; a program loaded without ProgramData cannot be initialized. The check is the same in every build, including the mock features.
 
-`fee_bps` above `1000` fails with `FeeTooHigh`, and a `validator` of all zeros (`Pubkey::default()`) fails with `BadValidator`. Sets `config.admin` to the signer, stores `fee_bps` with `fees` 0 and `validator`, and creates the program identity PDA with space 0, owned by this program. Lamports sent to the identity address beforehand do not block it: the instruction tops the account up to the rent-exempt minimum from the admin when it holds less, then assigns it to this program, signed by the PDA's seeds. The admin is the upgrade authority at the time of the call; a later authority change does not move it. There is no admin transfer and no instruction that changes `validator`. On the local stack `validator` is `mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev`. Beyond the all-zeros check, the program cannot check it: a wrong identity delegates every account to a validator that does not serve them, and nothing undelegates a Player.
+`fee_bps` above `1000` fails with `FeeTooHigh`. Sets `config.admin` to the signer, stores `fee_bps` with `fees` 0 and no `pending_admin`, and creates the program identity PDA with space 0, owned by this program. Lamports sent to the identity address beforehand do not block it: the instruction tops the account up to the rent-exempt minimum from the admin when it holds less, then assigns it to this program, signed by the PDA's seeds. The admin is the upgrade authority at the time of the call; a later authority change does not move it. `set_admin` and `accept_admin` move it.
 
 ### `set_fee(fee_bps: u16)`
 
@@ -286,6 +289,24 @@ Rollup once Config is delegated. Accounts: admin signer, config writable `[b"con
 Config is a typed account here, not read by hand, so the instruction runs where Config is writable by this program: in the rollup once Config is delegated, or on Solana before `delegate_config`. The signer must be `config.admin` (`NotAdmin`), and `fee_bps` must be at most `1000` (`FeeTooHigh`). Battles already open keep the rate they copied at `lock_army`.
 
 Log: `HZ_FEE <fee_bps>`.
+
+### `set_admin(new_admin: Pubkey)`
+
+Rollup once Config is delegated. Accounts: admin signer, config writable `[b"config"]`.
+
+The same accounts and rule as `set_fee`: the signer must be `config.admin` (`NotAdmin`). Stores `new_admin` as `config.pending_admin`. Nothing else changes: the current admin keeps the role until `new_admin` signs `accept_admin`. A later call replaces the proposal, and the all-zero key withdraws it.
+
+Log: `HZ_ADMIN_PROPOSED <new_admin>`.
+
+### `accept_admin`
+
+Rollup. Accounts: new admin signer writable, config writable, magic context writable, magic program.
+
+The signer must be `config.pending_admin` (`NotPendingAdmin`; with no proposal, nobody matches) and must not be `VALIDATOR`, the rollup validator identity (`NotPendingAdmin`). A Config created by an older build stored that identity at offset 50, so after an in-place upgrade it reads as a proposal; the check keeps the rollup operator from taking the role. Config is committed, so it is an unchecked account read by hand, as in [`init_treasury_outbox`](#init_treasury_outbox), and must also be owned by this program (`BadPda`). Sets `config.admin` to the signer and clears `pending_admin`, writing Config by hand before it schedules a plain commit of Config, paid by the signer; Config stays delegated. The commit is what lets the Solana admin instructions, which read Config's committed copy, accept the new admin and refuse the old one. Config must be delegated: the instruction runs in the rollup only.
+
+Two steps keep a mistyped key from taking the role: the proposed key must sign. It must also sign in the rollup, which every rollup admin instruction (`set_fee`, `set_admin`, `fund_treasury_outbox`, `claim_fees`) needs. A key that cannot sign a rollup transaction, such as a multisig vault PDA, cannot accept, and the old admin keeps the role.
+
+Log: `HZ_ADMIN <new_admin>`.
 
 ### `create_battleground(battleground_id: u8, budget: u16, stake_lamports: u64, cols: u8, rows: u8)`
 
@@ -357,23 +378,24 @@ No instruction arguments. Account order after the `#[vrf]` macro expands `LockAr
 6. battle: writable when a match opens, which creates it here; read-only when the army only queues. The rollup refuses a transaction that passes writable an account it neither holds nor creates (`InvalidWritableAccount`, before the program runs), so the client passes the battle writable only when a candidate's owner's budget covers the stake. Passed read-only to a lock that does open a match, the creation fails.
 7. vault, writable
 8. magic program
-9. oracle queue, writable, owned by the VRF program
+9. oracle queue, writable: the `ORACLE_QUEUE` the program was built with (`HZ_VRF_QUEUE`), owned by the VRF program (`BadQueue`)
 10. program identity `[b"identity"]`
 11. VRF program
 12. `SysvarS1otHashes111111111111111111111111111`
 13. system program
 
-To open a match the client then passes, in any order, each queued army it offers as a candidate (writable) and each of their owners' Players once (writable). With no candidates it passes nothing more.
+The client then passes, in any order, every army in the queue's first `MATCH_WINDOW` (8) entries (writable), the locker's own included, and the Player of each of their owners other than the locker, once (writable). With an empty queue it passes nothing more.
 
 The player must own the army. The army must belong to this battleground and be Idle. The lock passes no behavior accounts: `create_army` and `update_army` already checked each body against its behavior's hash and copied it into the army, refused an empty roster, and a behavior is never changed or closed. The lock copies each unit's kind, behavior body, zone-local position, stats, and cast into the battle snapshot, copies `cols` and `rows` onto the battle, stores each army's race as `race_a` and `race_b`, and copies `config.fee_bps`. The program writes the new battle into its account field by field, in `Battle`'s order, and reads the opponent's army onto the heap: a `Battle` value with two 10-slot snapshots would not fit the 4 KB SBF stack frame.
 
 The player's Player must have a `budget` of at least `stake_lamports` (`BudgetTooLow`), whether the army queues or matches.
 
-A passed account counts as a Player when this program owns it, it is 68 bytes, it deserializes as `Player`, and its address is `[b"player", owner]` with its stored bump. The program then looks at each queue entry whose account was passed, whose status is Queued, and whose owner is not the player. A player therefore queues behind their own waiting armies instead of matching them.
+A passed account counts as a Player when this program owns it, it is 68 bytes, it deserializes as `Player`, and its address is `[b"player", owner]` with its stored bump. The program then walks the queue's first eight entries. Each entry's army must have been passed (`MissingAccount`). An entry that is not Queued, or whose owner is the player, is skipped, so a player queues behind their own waiting armies instead of matching them. For every other entry the owner's Player must have been passed (`MissingAccount`): a forged copy away from the PDA does not count.
 
-- If the entry's owner's Player was passed with a `budget` of at least `stake_lamports`, the entry is a candidate.
-- If the owner's Player was passed with less, the entry is evicted: it leaves the queue and becomes Idle, and the instruction logs `HZ_EVICT <army>`. Such an army could never be met, and left in place it would hold one of the 16 queue slots for good. Its owner can lock it again once the budget covers a stake.
-- If the owner's Player was not passed, the entry is skipped and stays queued. Only a passed, authentic Player is evidence for an eviction.
+- If the owner's Player has a `budget` of at least `stake_lamports`, the entry is a candidate.
+- If it has less, the entry is evicted: it leaves the queue and becomes Idle, and the instruction logs `HZ_EVICT <army>`. Such an army could never be met, and left in place it would hold one of the 16 queue slots for good. Its owner can lock it again once the budget covers a stake.
+
+Entries past the eighth are neither required nor looked at. See [Slot hash](matchmaking.md#slot-hash) for why the program sets the candidates.
 
 Evictions happen before the army is queued or the match opens, whichever follows.
 
@@ -469,7 +491,7 @@ Log: `HZ_RELEASE <outbox> <amount>`, only when `amount` is not 0.
 
 Solana. Accounts: admin signer writable, config, outbox init `[b"outbox", config]`, system program.
 
-The signer must be `config.admin` (`NotAdmin`). Every instruction that runs on Solana and reads Config (the admin instructions `create_battleground`, `init_treasury_outbox`, `delegate_config`, `delegate_battleground` and `delegate_treasury_outbox`, and `delegate_player` and `delegate_outbox` for the validator) reads it by hand rather than as a typed account, so it works whether or not Config is delegated. A delegated Config's Solana copy is owned by the delegation program and keeps its delegation-time data. The account must be owned by this program or by the delegation program (`BadPda`), carry the Config discriminator (`AccountDiscriminatorMismatch`), and sit at `[b"config"]` with its stored bump (`BadPda`). The read trusts that stale copy. That is sound only because Solana reads just `admin` and `validator`, and neither changes after `initialize`. The admin pays the rent. The treasury Outbox starts with `owner` = admin and `amount` 0. A second call fails because the account exists.
+The signer must be `config.admin` (`NotAdmin`). Every instruction that runs on Solana and reads Config (the admin instructions `create_battleground`, `init_treasury_outbox`, `delegate_config`, `delegate_battleground` and `delegate_treasury_outbox`, ) reads it by hand rather than as a typed account, so it works whether or not Config is delegated. A delegated Config's Solana copy is owned by the delegation program and keeps its delegation-time data. The account must be owned by this program or by the delegation program (`BadPda`), carry the Config discriminator (`AccountDiscriminatorMismatch`), and sit at `[b"config"]` with its stored bump (`BadPda`). The read trusts that stale copy. That is sound only because Solana reads just `admin`, and `accept_admin`, the one instruction that changes it, commits Config in the same transaction. Until the validator carries that commit out, the Solana copy still names the previous admin. The admin pays the rent. The treasury Outbox starts with `owner` = admin and `amount` 0. A second call fails because the account exists.
 
 ### `fund_treasury_outbox`
 
@@ -483,13 +505,15 @@ Log: `HZ_OUTBOX_FUND <outbox> <admin> <amount>`.
 
 Rollup. Accounts: admin signer writable, config writable, treasury outbox writable `[b"outbox", config]`, magic context writable, magic program.
 
-`withdraw` for the treasury Outbox, with Config in the Player's place. Config is committed, so it is an unchecked account read by hand, as in [`init_treasury_outbox`](#init_treasury_outbox), and must also be owned by this program (`BadPda`). The signer must be `config.admin` and the Outbox's `owner` (`NotAdmin`), and `amount` must not be 0 (`NothingToWithdraw`). The bundle commits Config, which stays delegated, and commits and undelegates the treasury Outbox. The admin signs as the intent's payer. The post-undelegate `release_outbox` pays the admin.
+`withdraw` for the treasury Outbox, with Config in the Player's place. Config is committed, so it is an unchecked account read by hand, as in [`init_treasury_outbox`](#init_treasury_outbox), and must also be owned by this program (`BadPda`). The signer must be `config.admin` (`NotAdmin`), and `amount` must not be 0 (`NothingToWithdraw`). When the Outbox's `owner` is another key, because it was funded under the previous admin and not claimed before `accept_admin`, the instruction rewrites `owner` to the signer before the commit is scheduled. The bundle commits Config, which stays delegated, and commits and undelegates the treasury Outbox. The admin signs as the intent's payer. The post-undelegate `release_outbox` pays the admin.
 
 Log: `HZ_CLAIM <outbox> <amount>`, with the amount read from the Outbox.
 
 ## Delegation
 
-Five Solana instructions delegate the program's PDAs to the rollup. None takes an argument: each reads `config.validator` by hand (see [`init_treasury_outbox`](#init_treasury_outbox)) and delegates to that rollup validator. The SDK's default identity is not the local rollup's, so the program never falls back to it. The commit frequency is the SDK's default, `DelegateConfig::default()`, which is `u32::MAX` ms (about 49.7 days): nothing schedules commits (see [Where each account lives](#where-each-account-lives)). The signer pays the rent of the delegation record and metadata.
+Five Solana instructions delegate the program's PDAs to the rollup. None takes an argument: each delegates to `VALIDATOR`, the rollup validator identity built into the program. `programs/horizon-zero/build.rs` reads it from `HZ_VALIDATOR` (base58) at build time. `scripts/deploy.mjs` sets it from `--validator`, and the local stack sets it to `mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev`. An SBF build without `inline-mock-magic` and without `HZ_VALIDATOR` fails, so a deployable build always names one. Host builds and the LiteSVM mock build, which delegate nothing, use the all-zero key. The SDK's default identity is not the local rollup's, so the program never falls back to it. The program cannot check the identity: a wrong one delegates every account to a validator that does not serve them, and nothing undelegates a Player. The bootstrap stops when Config's delegation record names another identity than the rollup's (see [Bootstrap](deployment.md#bootstrap)).
+
+Changing the validator takes a new build and an upgrade. Accounts already delegated stay with the old validator, and only new delegations go to the new one, so an upgrade that changes `HZ_VALIDATOR` splits the game across two rollups. Change it only on a fresh deployment. The commit frequency is the SDK's default, `DelegateConfig::default()`, which is `u32::MAX` ms (about 49.7 days): nothing schedules commits (see [Where each account lives](#where-each-account-lives)). The signer pays the rent of the delegation record and metadata.
 
 Each instruction CPIs the delegation program `DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh`, which takes the account over. The delegated account is an unchecked account, so Anchor does not write it back after the CPI. `#[delegate]` (`ephemeral-rollups-sdk` 0.17.3) sets the account order: before the delegated account `<a>` come its buffer `[b"buffer", a]` under this program, its delegation record `[b"delegation", a]` and its delegation metadata `[b"delegation-metadata", a]` under the delegation program, all writable. After the last listed account come this program's id, the delegation program and the system program. Before the CPI each instruction requires the account it delegates to be owned by this program (`BadPda`). That refuses an account that does not exist yet, which would otherwise be handed to the delegation program empty, and one that is already delegated.
 
@@ -499,15 +523,15 @@ Under `inline-mock-magic` the five instructions and `process_undelegation` are c
 
 ### `delegate_player`
 
-Solana. Accounts: owner signer writable, config, buffer, delegation record, delegation metadata, player writable `[b"player", owner]` (`ConstraintSeeds`), this program, delegation program, system program.
+Solana. Accounts: owner signer writable, buffer, delegation record, delegation metadata, player writable `[b"player", owner]` (`ConstraintSeeds`), this program, delegation program, system program.
 
-Delegates the signer's Player. Config is read by hand for the validator. The Player must be owned by this program (`BadPda`).
+Delegates the signer's Player. The Player must be owned by this program (`BadPda`).
 
 ### `delegate_outbox`
 
-Solana. Accounts: owner signer writable, config, buffer, delegation record, delegation metadata, outbox writable `[b"outbox", owner]` (`ConstraintSeeds`), this program, delegation program, system program.
+Solana. Accounts: owner signer writable, buffer, delegation record, delegation metadata, outbox writable `[b"outbox", owner]` (`ConstraintSeeds`), this program, delegation program, system program.
 
-Delegates the signer's Outbox again before a withdrawal, since every `withdraw` undelegates it. Config is read by hand for the validator. The Outbox is read by hand before the CPI: it must be owned by this program (`BadPda`, which an Outbox still delegated also gets), carry the Outbox discriminator, and have `amount` 0 (`OutboxBusy`). An Outbox that `withdraw` undelegated but `release_outbox` has not paid yet is refused, so the payment is never locked back into the rollup. `register_player` leaves the Outbox at 0, so the first delegation needs no release.
+Delegates the signer's Outbox again before a withdrawal, since every `withdraw` undelegates it. The Outbox is read by hand before the CPI: it must be owned by this program (`BadPda`, which an Outbox still delegated also gets), carry the Outbox discriminator, and have `amount` 0 (`OutboxBusy`). An Outbox that `withdraw` undelegated but `release_outbox` has not paid yet is refused, so the payment is never locked back into the rollup. `register_player` leaves the Outbox at 0, so the first delegation needs no release.
 
 ### `delegate_config`
 

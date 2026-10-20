@@ -41,7 +41,7 @@ let net = null;
 function solana() {
   net ??= connectSolana({
     rpcUrl: process.env.RPC_URL || LOCAL_RPC,
-    // The rollup must be the one serving the validator pinned in Config. Its WebSocket is the next port.
+    // The rollup must be the one serving the validator the program was built for. Its WebSocket is the next port.
     erRpcUrl: process.env.ER_RPC_URL || LOCAL_ER_RPC,
     // lock_army runs in the rollup, so the VRF queue is an ephemeral one.
     oracleQueue: new PublicKey(process.env.ORACLE_QUEUE || EPHEMERAL_TEST_QUEUE.toBase58()),

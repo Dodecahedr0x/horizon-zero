@@ -17,6 +17,8 @@
  *  At the end the validator (identity + fees vault) must not be out of pocket beyond its base fees.
  *  BOOKS lines print the Solana lamports of every account involved after each step.
  *  6. Both Outboxes are delegated again, and the indexer (when INDEXER_URL is set) shows the settled battle.
+ *  7. The admin hands over to the winner's wallet (set_admin, accept_admin) and back; each acceptance
+ *     commits Config, and its Solana copy must show the new admin.
  *
  * FEE lines record what each step cost the wallet. With `--probe` (off by default, about 40 s
  * longer) the script also checks and prints, as PROBE lines, what the rollup's RPC answers: blockhash
@@ -32,7 +34,14 @@
  */
 import { randomBytes } from "node:crypto";
 import { createRequire } from "node:module";
-import { deriveLamportsPda, deriveRentPda, lamportsDelegatedTransferIx, validatorFeesVaultPdaFromValidator } from "@magicblock-labs/ephemeral-rollups-sdk";
+import {
+  DelegationStatus,
+  deriveLamportsPda,
+  deriveRentPda,
+  getDelegationRecord,
+  lamportsDelegatedTransferIx,
+  validatorFeesVaultPdaFromValidator,
+} from "@magicblock-labs/ephemeral-rollups-sdk";
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SendTransactionError, Transaction } from "@solana/web3.js";
 import {
   BATTLEGROUNDS,
@@ -41,6 +50,7 @@ import {
   PROGRAM_ID,
   RACES,
   STANDARDS,
+  acceptAdminIx,
   armyPda,
   battlegroundPda,
   behaviorPda,
@@ -66,6 +76,7 @@ import {
   matchPda,
   outboxPda,
   playerPda,
+  setAdminIx,
   registerPlayerIx,
   resolvedMatch,
   settleMatchIx,
@@ -276,7 +287,8 @@ const configInfo = await base.getAccountInfo(configPda());
 check(configInfo, "Config exists on Solana: run the bootstrap (scripts/local-stack.mjs does)");
 const configOnBase = decodeConfig(configInfo.data);
 check(configOnBase, "the account at the Config address is a Config");
-check(configOnBase.validator === identity.toBase58(), "Config pins the rollup's identity");
+const configRecord = await getDelegationRecord(base, configPda());
+check(configRecord.status === DelegationStatus.Delegated && configRecord.validator.equals(identity), "Config is delegated to the rollup's identity, the one the program is built for");
 check(configOnBase.admin === admin.publicKey.toBase58(), "ADMIN_KEYPAIR is Config's admin");
 say(`rollup identity ${identity.toBase58()}, admin ${admin.publicKey.toBase58()}`);
 tracked.set("identity", identity);
@@ -605,6 +617,18 @@ if (programSub !== null) await er.removeProgramAccountChangeListener(programSub)
   const net = end.validator - startBooks.validator;
   console.log(`VALIDATOR run net=${net} identity_base_fees=${identityFeesTotal}`);
   check(net + identityFeesTotal >= 0n, `the validator is out of pocket by ${-(net + identityFeesTotal)} beyond its base fees`);
+}
+
+// 7. The admin hands over to the winner's wallet and back. Each accept_admin commits Config, so the
+// Solana admin instructions see the change. After the books: the commits cost the identity base fees.
+for (const [from, to] of [[admin, cashing], [cashing, admin]]) {
+  await send(er, "set_admin", [from], setAdminIx(from.publicKey, to.publicKey));
+  check(decodeConfig((await er.getAccountInfo(configPda())).data).pendingAdmin === to.publicKey.toBase58(), "set_admin records the proposal");
+  await send(er, "accept_admin", [to], acceptAdminIx(to.publicKey));
+  const { onBase } = await awaitCommitted(configPda(), "accept_admin");
+  const committed = decodeConfig(onBase.data);
+  check(committed.admin === to.publicKey.toBase58() && committed.pendingAdmin === null, "Config's Solana copy carries the new admin");
+  say(`admin handed to ${to.publicKey.toBase58()}, committed to Solana`);
 }
 say(`passed: outcome ${outcome}, fee ${fees}, battle ${battle.toBase58()}`);
 process.exit(0);

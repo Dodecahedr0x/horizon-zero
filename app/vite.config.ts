@@ -69,5 +69,8 @@ export default defineConfig({
       },
     },
   },
+  // app/server.js serves /assets/* from the repo's assets/ (unit models and portraits), so the
+  // bundle's own files go under /bundle/ and are read from app/dist like any other page file.
+  build: { assetsDir: "bundle" },
   resolve: { alias: { buffer: "buffer" } },
 });

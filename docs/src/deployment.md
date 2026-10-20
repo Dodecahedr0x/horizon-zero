@@ -8,13 +8,13 @@ Horizon Zero runs on three clusters. Local development and testing use a local S
 | devnet | `https://api.devnet.solana.com` | the MagicBlock rollup you bootstrap against | `5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc` (SDK `DEFAULT_EPHEMERAL_QUEUE`) | `pnpm deploy:devnet --er-url <rollup> --validator <identity>` |
 | mainnet | your mainnet RPC (default `https://api.mainnet-beta.solana.com`) | the MagicBlock rollup you bootstrap against | `5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc` | `pnpm deploy:mainnet --confirm-mainnet --er-url <rollup> --validator <identity>` |
 
-`lock_army` runs in the rollup, so every queue is an ephemeral one, whose oracle calls back into the rollup. The rollup must be the one serving the validator that `initialize` pins in Config: every delegation names that validator and nothing changes it. A deployment must set the game server's `ER_RPC_URL` (see [Client and dev mode](client.md)).
+`lock_army` runs in the rollup, so every queue is an ephemeral one, whose oracle calls back into the rollup. The rollup must be the one serving the validator the program is built for: `HZ_VALIDATOR` at build time (see [Delegation](accounts.md#delegation)), which every delegation names. A deployment must set the game server's `ER_RPC_URL` (see [Client and dev mode](client.md)).
 
 ## Local stack
 
 `pnpm localnet` (`scripts/local-stack.mjs`) needs `solana-test-validator` from the Anza CLI and `mb-stack` and `vrf-oracle` from `npm install -g @magicblock-labs/ephemeral-validator@0.14.10`. It stays in the foreground; Ctrl-C stops every process. In order, it:
 
-1. builds the program with default features and records the build (see [Build guard](#build-guard)). `--no-build` reuses `target/deploy/horizon_zero.so` only when it is that recorded build, and stops otherwise;
+1. builds the program with default features, `HZ_VALIDATOR=mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev`, the local rollup's identity, and `HZ_VRF_QUEUE=Sc9MJUngNbQXSXGP3F67KvKwVnhaYn6kcioxXNVowYT`, the test queue the local oracle serves, and records the build (see [Build guard](#build-guard)). `--no-build` reuses `target/deploy/horizon_zero.so` only when it is that recorded build for that identity and queue, and stops otherwise;
 2. creates `target/localnet/admin.json` if it is missing, then starts `mb-stack`: the base validator on `8899` with the delegation, VRF and eSPL programs and the VRF queues preloaded, and `horizon_zero.so` loaded at genesis as an upgradeable program whose upgrade authority is that admin (`--upgradeable-program <id> <so> <admin.json>`, which `mb-stack` passes through to `solana-test-validator`), the rollup on `7799` (ws `7800`), and the query-filtering front on `6699`. The upgrade authority is the one key `initialize` accepts, so the bootstrap admin can initialize. The rollup clones the program from the base layer on first use;
 3. starts `vrf-oracle --rpc-url http://127.0.0.1:7799 --websocket-url ws://127.0.0.1:7800`, which answers the ephemeral test queue (delegated to the rollup) with its built-in local key. No oracle watches the base layer: nothing asks for randomness there;
 4. airdrops 100 SOL to `target/localnet/admin.json` and runs the bootstrap below with `--espl-rent`;
@@ -49,13 +49,13 @@ Without `RPC_URL`, `ER_RPC_URL` and `ORACLE_QUEUE`, the game server (`app/server
 
 ## Bootstrap
 
-`app/scripts/bootstrap.mjs --url <solana rpc> --er-url <rollup rpc> --keypair <file>` makes a cluster playable on its rollup and is safe to repeat. Each step is skipped when it is already done:
+`app/scripts/bootstrap.mjs --url <solana rpc> --er-url <rollup rpc> --keypair <file> [--validator <identity>]` makes a cluster playable on its rollup and is safe to repeat. Each step is skipped when it is already done:
 
 1. with `--espl-rent` (local stack only): creates the eSPL program's `[b"rent"]` PDA `4RvdEGaUyChj3AketeBZoY1EotNtPveMFUXL8DVetrAp` with `initRentPdaIx` and funds it with 1 SOL. It pays the temporary account behind every top-up; `mb-stack` ships the program but not the PDA, and without it a top-up fails with "insufficient lamports 300000, need 890880". MagicBlock runs it on devnet and mainnet;
-2. `initialize(500, validator)`: the keypair becomes the admin. It must be the program's upgrade authority, or `initialize` fails with `NotUpgradeAuthority`; the script reads the authority from the program's ProgramData first and stops with both keys named when they differ (see [`initialize`](accounts.md#initializefee_bps-u16-validator-pubkey)). `validator` is `--validator`, or the rollup's `getIdentity` (`mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev` locally). On a later run, a Config pinned to another validator stops the script;
+2. `initialize(500)`: the keypair becomes the admin. It must be the program's upgrade authority, or `initialize` fails with `NotUpgradeAuthority`; the script reads the authority from the program's ProgramData first and stops with both keys named when they differ (see [`initialize`](accounts.md#initializefee_bps-u16)). The script first asks the rollup for its identity (`getIdentity`, `mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev` locally) and stops when `--validator` is given and differs. On a later run, a Config already delegated to another identity stops the script;
 3. `create_battleground` for each battleground in `content/catalog.json`: Outpost 0.01 SOL, Garrison 0.05 SOL, Citadel 0.1 SOL;
 4. `init_treasury_outbox`;
-5. `delegate_config`, `delegate_battleground` for each, and `delegate_treasury_outbox` (skipped while it holds an unreleased claim);
+5. `delegate_config`, then a check that Config's delegation record names the rollup's identity: a program built with another `HZ_VALIDATOR` stops the script here, before anything else is delegated. Then `delegate_battleground` for each, and `delegate_treasury_outbox` (skipped while it holds an unreleased claim);
 6. waits until the rollup returns Config and every battleground as this program's.
 
 It does not create standard behaviors: behaviors live in the rollup and a Player pays their rent, so the first player to use one creates it. The script fails when the program is not deployed on that cluster.
@@ -65,12 +65,14 @@ It does not create standard behaviors: behaviors live in the rollup and a Player
 `scripts/deploy.mjs <devnet|mainnet>` deploys or upgrades the program, then bootstraps:
 
 1. Mainnet requires `--confirm-mainnet`.
-2. Unless `--skip-bootstrap`, `--er-url <rollup rpc>` and `--validator <identity>` are required. Before anything is built or any SOL is spent, the script calls `getIdentity` on `--er-url`, prints it, and stops unless `--validator` equals it: the first bootstrap pins that validator in Config for good.
+2. `--er-url <rollup rpc>` and `--validator <identity>` are required, even with `--skip-bootstrap`: the build needs the identity. Before anything is built or any SOL is spent, the script calls `getIdentity` on `--er-url`, prints it, and stops unless `--validator` equals it.
 3. The program keypair `target/deploy/horizon_zero-keypair.json` must be `Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c`, the `declare_id!`. Keep that file; without it the program cannot be upgraded at the same address.
-4. `cargo-build-sbf` with default features, recorded as below. `--skip-build` reuses `target/deploy/horizon_zero.so` only when it is the recorded default build, and stops otherwise. `inline-mock-vrf` and `inline-mock-magic` never reach a real cluster.
+4. `cargo-build-sbf` with default features, `HZ_VALIDATOR` = `--validator` and `HZ_VRF_QUEUE` = `5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc`, recorded as below. `--skip-build` reuses `target/deploy/horizon_zero.so` only when it is the recorded default build for that validator and queue, and stops otherwise. `inline-mock-vrf` and `inline-mock-magic` never reach a real cluster.
 5. The script asks the RPC (`getAccountInfo`) whether the program exists, and stops if that call fails. When it exists, its upgrade authority (from `solana program show`, which must succeed) must be the `--keypair` wallet, or the script stops before sending anything.
 6. `solana program deploy` with `--keypair` (default `~/.config/solana/id.json`) as payer and `--upgrade-authority`, and `--with-compute-unit-price` when `--priority` is given.
-7. The bootstrap above with `--er-url`, `--validator` and the same `--keypair`, unless `--skip-bootstrap`. That wallet is the upgrade authority, so `initialize` accepts it and it becomes the admin.
+7. The bootstrap above with `--er-url`, `--validator` and the same `--keypair`, unless `--skip-bootstrap`. That wallet is the upgrade authority, so `initialize` accepts it and it becomes the admin. Hand the role to another key later with `set_admin` and `accept_admin` (see [`set_admin`](accounts.md#set_adminnew_admin-pubkey)); the new key must be able to sign rollup transactions.
+
+An upgrade that changes `--validator` splits the game: accounts already delegated stay with the old validator, and only new delegations go to the new one. Change the validator only on a fresh deployment.
 
 It ends by printing the game's variables (build with `VITE_DEV_MODE=false`; run the server with `RPC_URL`, `ER_RPC_URL`, and `ORACLE_QUEUE` = `5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc`) and the indexer's `SOLANA_RPC_URL`, the same rollup URL. `render.yaml` lists `RPC_URL` and `ER_RPC_URL` (set them in the dashboard) and `ORACLE_QUEUE` for the game service, and `SOLANA_RPC_URL` (the rollup) for the indexer.
 
@@ -80,6 +82,6 @@ An upgrade in place keeps every account, but the Battle layout is now 2155 bytes
 
 ## Build guard
 
-The LiteSVM suite's build (`--features inline-mock-vrf,inline-mock-magic`) writes the same `target/deploy/horizon_zero.so` as the default build. `scripts/program-build.mjs` keeps it off real validators: `buildDefault` runs `cargo-build-sbf` with default features and writes `target/deploy/horizon_zero.so.build.json` with the features and the SHA-256 of the `.so`; `assertDefaultBuild` refuses a `.so` with no record, or whose hash is not the recorded one, which is what any later mock build leaves. The local stack checks it on every start and `deploy.mjs` with `--skip-build`.
+The LiteSVM suite's build (`--features inline-mock-vrf,inline-mock-magic`) writes the same `target/deploy/horizon_zero.so` as the default build. `scripts/program-build.mjs` keeps it off real validators: `buildDefault` runs `cargo-build-sbf` with default features and the given `HZ_VALIDATOR` and `HZ_VRF_QUEUE`, and writes `target/deploy/horizon_zero.so.build.json` with the features, the validator, the queue and the SHA-256 of the `.so`; `assertDefaultBuild` refuses a `.so` with no record, one whose hash is not the recorded one, which is what any later mock build leaves, and one built for another validator or queue than the one it is asked for. `cargo-build-sbf` alone, without `HZ_VALIDATOR` or without `HZ_VRF_QUEUE`, refuses to build the default program (`programs/horizon-zero/build.rs`). CI's LiteSVM job builds the mock features, which need neither: the mock build pins the test queue `Sc9MJUngNbQXSXGP3F67KvKwVnhaYn6kcioxXNVowYT`; its localnet job builds through the local stack, which sets it. The local stack checks it on every start and `deploy.mjs` with `--skip-build`.
 
 On every network, a battle settles through `settle_match`, which any wallet may send once the VRF callback has seeded the battle. The callback only seeds the battle, so every battle fits; see [Settlement and fee](matchmaking.md#settlement-and-fee).

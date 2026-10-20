@@ -300,6 +300,7 @@ export function describeStep(line, sideA, sideB) {
     case "round":
       return "Round ends";
     case "end":
+      if (step.work) return step.winner === 0 ? "Side A wins on hp left. Work limit reached." : step.winner === 1 ? "Side B wins on hp left. Work limit reached." : "Draw. Work limit reached.";
       if (step.winner === 0) return "Side A wins.";
       if (step.winner === 1) return "Side B wins.";
       return step.limit ? "Draw. Round limit reached." : "Draw.";

@@ -1790,6 +1790,7 @@ name = "horizon-zero"
 version = "0.1.0"
 dependencies = [
  "anchor-lang",
+ "bs58",
  "combat",
  "ephemeral-rollups-sdk",
  "ephemeral-vrf-sdk",

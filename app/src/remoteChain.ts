@@ -1,6 +1,7 @@
 import { Transaction } from "@solana/web3.js";
 import type { WalletContextState } from "@solana/wallet-adapter-react";
 import type { ChainAdapter } from "./devChain";
+import { checkSigning, UnexpectedTransactionError } from "./txCheck";
 
 /** One step of a server call (app/chain/http.mjs). */
 type Step =
@@ -37,7 +38,8 @@ function rebuild(error: Extract<Step, { error: unknown }>["error"]) {
 
 /**
  * The Solana adapter. The game server reads the chain and builds every transaction (see
- * app/chain/solana.ts); the browser only signs them with the wallet. No RPC URL reaches the page.
+ * app/chain/solana.ts); the browser only signs them with the wallet, after `checkSigning` has
+ * matched each one against the call that asked for it. No RPC URL reaches the page.
  */
 export function createRemoteChain(wallet: WalletContextState): ChainAdapter {
   function owner() {
@@ -53,10 +55,17 @@ export function createRemoteChain(wallet: WalletContextState): ChainAdapter {
       const { session, tx } = step.sign;
       let signed: string;
       try {
-        if (!wallet.signTransaction) throw new Error("This wallet cannot sign transactions");
-        const done = await wallet.signTransaction(Transaction.from(Buffer.from(tx, "base64")));
+        if (!wallet.signTransaction || !wallet.publicKey) throw new Error("This wallet cannot sign transactions");
+        const unsigned = Transaction.from(Buffer.from(tx, "base64"));
+        checkSigning(unsigned, wallet.publicKey, method, args);
+        const done = await wallet.signTransaction(unsigned);
         signed = done.serialize().toString("base64");
       } catch (err) {
+        if (err instanceof UnexpectedTransactionError) {
+          // Tell the server the call is over, but report the refusal here whatever it answers.
+          await post("/sign", { session, refused: err.message }).catch(() => undefined);
+          throw err;
+        }
         // The server ends the call with this error, so the page reads it as it would have before.
         step = await post("/sign", { session, refused: err instanceof Error && err.message ? err.message : "The wallet did not sign" });
         continue;

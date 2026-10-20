@@ -18,8 +18,10 @@ test("every line kind parses into named fields", () => {
   assert.deepEqual([cast.from, cast.to], [{ col: 0, row: 2 }, { col: 0, row: 4 }]);
   assert.ok(targetsSelf(parseTraceLine("C 0 1 0 1 0 4 2 1 1 3 1 3 1")));
   assert.equal(parseTraceLine("X 0 1 3").effect, "reach");
-  assert.deepEqual(parseTraceLine("E 1"), { kind: "end", line: "E 1", winner: 1, limit: false });
-  assert.deepEqual(parseTraceLine("E draw limit"), { kind: "end", line: "E draw limit", winner: null, limit: true });
+  assert.deepEqual(parseTraceLine("E 1"), { kind: "end", line: "E 1", winner: 1, limit: false, work: false });
+  assert.deepEqual(parseTraceLine("E 0 work"), { kind: "end", line: "E 0 work", winner: 0, limit: false, work: true });
+  assert.deepEqual(parseTraceLine("E draw limit"), { kind: "end", line: "E draw limit", winner: null, limit: true, work: false });
+  assert.deepEqual(parseTraceLine("E draw work"), { kind: "end", line: "E draw work", winner: null, limit: false, work: true });
   assert.equal(parseTraceLine("R").kind, "round");
   assert.equal(parseTraceLine("Q 1").kind, "unknown");
 });

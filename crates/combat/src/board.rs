@@ -1,7 +1,7 @@
 //! The grid: geometry, the rubble a seed places, and tile lookups during a battle.
 
 use crate::{mix, Side, MAX_COLS, MAX_ROWS, MAX_TILES, ZONE_DEPTH};
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 
 /// Columns and rows of one battleground. Starting zones are the top and bottom
 /// `ZONE_DEPTH` rows and are not stored separately.
@@ -113,6 +113,9 @@ pub(crate) struct Field {
     blocked: Vec<bool>,
     open: Vec<u32>,
     walks: RefCell<Walks>,
+    /// The battle's work so far, in the units [`crate::WORK_LIMIT`] counts (see `Battle::charge`).
+    /// Here because the walks charge it from `&self` methods.
+    pub(crate) work: Cell<u32>,
     #[cfg(feature = "cu-profile")]
     pub(crate) profile_fill: crate::profile::Profile,
 }
@@ -149,6 +152,12 @@ struct Walk {
     done: bool,
 }
 
+/// Work charged per walking-distance question, per wave started (clearing its distances), and per
+/// row one step of a wave scans. See [`crate::WORK_LIMIT`].
+const WORK_WALK: u32 = 44;
+const WORK_START_WALK: u32 = 64;
+const WORK_WAVE_ROW: u32 = 8;
+
 /// Walking distance of a tile the goal cannot be reached from.
 pub(crate) const UNREACHABLE: u16 = u16::MAX;
 
@@ -166,6 +175,7 @@ impl Field {
             blocked: grid,
             open,
             walks: RefCell::default(),
+            work: Cell::new(0),
             #[cfg(feature = "cu-profile")]
             profile_fill: crate::profile::Profile::default(),
         }
@@ -179,6 +189,7 @@ impl Field {
     /// allies often share one.
     pub(crate) fn walking_distances<const N: usize>(&self, goal: (i32, i32), tiles: [(i32, i32); N]) -> [u16; N] {
         let mut out = [UNREACHABLE; N];
+        self.charge(WORK_WALK);
         if self.is_blocked(goal) {
             return out;
         }
@@ -221,6 +232,7 @@ impl Field {
 
     fn start_walk(&self, walk: &mut Walk, goal: (i32, i32)) {
         let tiles = (self.cols * self.rows) as usize;
+        self.charge(WORK_START_WALK);
         if walk.steps.len() != tiles {
             walk.steps = vec![UNREACHABLE; tiles];
         } else {
@@ -242,6 +254,7 @@ impl Field {
     fn grow_walk(&self, walk: &mut Walk) {
         let (lo, hi) = (walk.lo, walk.hi);
         let (next_lo, next_hi) = (lo.saturating_sub(1), (hi + 1).min(self.rows as usize - 1));
+        self.charge(WORK_WAVE_ROW * (next_hi - next_lo + 1) as u32);
         let [first, second] = &mut walk.waves;
         let (from, to) = if walk.current == 0 { (&*first, second) } else { (&*second, first) };
         let cols = self.cols as usize;
@@ -282,6 +295,10 @@ impl Field {
         walk.distance += 1;
         walk.current ^= 1;
         (walk.lo, walk.hi) = (grown_lo, grown_hi);
+    }
+
+    pub(crate) fn charge(&self, units: u32) {
+        self.work.set(self.work.get().saturating_add(units));
     }
 
     /// Off-board tiles count as blocked.

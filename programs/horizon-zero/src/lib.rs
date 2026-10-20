@@ -35,6 +35,11 @@ pub const MAGIC_CONTEXT: Pubkey = Pubkey::new_from_array(ephemeral_rollups_sdk::
 pub const DELEGATION_PROGRAM: Pubkey =
     Pubkey::new_from_array(ephemeral_rollups_sdk::consts::DELEGATION_PROGRAM_ID.to_bytes());
 
+// `VALIDATOR`, the rollup validator identity every delegate instruction delegates to, and
+// `ORACLE_QUEUE`, the only VRF oracle queue `lock_army` asks, from `HZ_VALIDATOR` and
+// `HZ_VRF_QUEUE` at build time (see build.rs). Changing either takes a new build and an upgrade.
+include!(concat!(env!("OUT_DIR"), "/keys.rs"));
+
 /// How long a battle waits for its VRF seed before `cancel_match` may end it, in seconds.
 pub const CANCEL_AFTER_SECS: i64 = 600;
 
@@ -51,16 +56,14 @@ fn program_identity_bump() -> u8 {
 pub mod horizon_zero {
     use super::*;
 
-    /// `validator` is the rollup validator every delegate instruction delegates to. Nothing changes it.
     /// Only the program's upgrade authority may call it (see `Initialize`), so nobody can front-run
-    /// the deployer and become the admin.
-    pub fn initialize(ctx: Context<Initialize>, fee_bps: u16, validator: Pubkey) -> Result<()> {
+    /// the deployer and become the admin. `set_admin` and `accept_admin` hand the role on later.
+    pub fn initialize(ctx: Context<Initialize>, fee_bps: u16) -> Result<()> {
         require!(fee_bps <= fees::MAX_FEE_BPS, HorizonError::FeeTooHigh);
-        require!(validator != Pubkey::default(), HorizonError::BadValidator);
         ctx.accounts.config.admin = ctx.accounts.admin.key();
         ctx.accounts.config.fee_bps = fee_bps;
         ctx.accounts.config.fees = 0;
-        ctx.accounts.config.validator = validator;
+        ctx.accounts.config.pending_admin = Pubkey::default();
         ctx.accounts.config.bump = ctx.bumps.config;
         let (identity, bump) = Pubkey::find_program_address(&[b"identity"], &ID);
         require_keys_eq!(identity, ctx.accounts.identity.key(), HorizonError::BadPda);
@@ -76,6 +79,36 @@ pub mod horizon_zero {
         ctx.accounts.config.fee_bps = fee_bps;
         msg!("HZ_FEE {}", fee_bps);
         Ok(())
+    }
+
+    /// Rollup, admin only: proposes `new_admin`, who takes over by signing `accept_admin`. The
+    /// all-zero key withdraws a proposal. A later proposal replaces an earlier one. Runs where
+    /// Config is writable, like `set_fee`.
+    pub fn set_admin(ctx: Context<AdminConfig>, new_admin: Pubkey) -> Result<()> {
+        ctx.accounts.config.pending_admin = new_admin;
+        msg!("HZ_ADMIN_PROPOSED {}", new_admin);
+        Ok(())
+    }
+
+    /// Rollup, signed by the proposed admin: makes the signer Config's admin, clears the proposal,
+    /// and commits Config so the admin instructions that run on Solana, which read the committed
+    /// copy, see the new admin. Signing here proves the new key can act in the rollup, which every
+    /// admin instruction there needs. Config is delegated by then, so it runs in the rollup only.
+    pub fn accept_admin<'info>(ctx: Context<'info, AcceptAdmin<'info>>) -> Result<()> {
+        let info = ctx.accounts.config.to_account_info();
+        require_keys_eq!(*info.owner, ID, HorizonError::BadPda);
+        let mut config = read_config(&info)?;
+        let signer = ctx.accounts.new_admin.key();
+        require_keys_eq!(config.pending_admin, signer, HorizonError::NotPendingAdmin);
+        // A Config from a build that stored the validator at this offset reads it as a proposal
+        // after an in-place upgrade. The rollup validator never becomes admin.
+        require_keys_neq!(signer, VALIDATOR, HorizonError::NotPendingAdmin);
+        config.admin = signer;
+        config.pending_admin = Pubkey::default();
+        // By hand, before the commit is scheduled: the rollup refuses writes after it.
+        config.try_serialize(&mut &mut info.try_borrow_mut_data()?[..])?;
+        msg!("HZ_ADMIN {}", signer);
+        schedule_commit(&ctx.accounts.new_admin.to_account_info(), &info, &ctx.accounts.magic)
     }
 
     pub fn create_battleground(
@@ -250,6 +283,8 @@ pub mod horizon_zero {
             &ctx.accounts.army.key(),
             ctx.accounts.army.bump,
         )?;
+        // Any VRF-owned queue would take the request; only the pinned one's oracles answer it here.
+        require_keys_eq!(ctx.accounts.oracle_queue.key(), ORACLE_QUEUE, HorizonError::BadQueue);
         require!(ctx.accounts.oracle_queue.owner == &VRF_PROGRAM_ID, HorizonError::BadQueue);
 
         let stake = ctx.accounts.battleground.stake_lamports;
@@ -494,8 +529,14 @@ pub mod horizon_zero {
         require_admin(&config, &ctx.accounts.admin.key())?;
         require_keys_eq!(*config.owner, ID, HorizonError::BadPda);
         let outbox = ctx.accounts.outbox.to_account_info();
-        let state = read_funded_outbox(&outbox)?;
-        require_keys_eq!(state.owner, ctx.accounts.admin.key(), HorizonError::NotAdmin);
+        let mut state = read_funded_outbox(&outbox)?;
+        let admin = ctx.accounts.admin.key();
+        if state.owner != admin {
+            // Funded under the previous admin and not claimed before `accept_admin`: the claim
+            // pays the current admin. Written by hand before the undelegation is scheduled.
+            state.owner = admin;
+            state.try_serialize(&mut &mut outbox.try_borrow_mut_data()?[..])?;
+        }
         msg!("HZ_CLAIM {} {}", outbox.key(), state.amount);
         schedule_release(&ctx.accounts.admin.to_account_info(), &config, &outbox, state.owner, &ctx.accounts.magic)
     }
@@ -515,55 +556,53 @@ pub mod horizon_zero {
         Ok(())
     }
 
-    /// Solana: delegates the owner's Player to Config's rollup validator.
+    /// Solana: delegates the owner's Player to the rollup validator.
     #[cfg(not(feature = "inline-mock-magic"))]
     pub fn delegate_player(ctx: Context<DelegatePlayer>) -> Result<()> {
-        let config = read_config(&ctx.accounts.config)?;
         require_owned(&ctx.accounts.player)?;
         let owner = ctx.accounts.owner.key();
-        ctx.accounts.delegate_player(&ctx.accounts.owner, &[b"player", owner.as_ref()], delegation(&config))?;
+        ctx.accounts.delegate_player(&ctx.accounts.owner, &[b"player", owner.as_ref()], delegation())?;
         Ok(())
     }
 
-    /// Solana: delegates the owner's Outbox to Config's rollup validator, before each withdrawal. An Outbox that
+    /// Solana: delegates the owner's Outbox to the rollup validator, before each withdrawal. An Outbox that
     /// still holds an unreleased withdrawal is refused, so the payment is not locked back into the
     /// rollup.
     #[cfg(not(feature = "inline-mock-magic"))]
     pub fn delegate_outbox(ctx: Context<DelegateOutbox>) -> Result<()> {
-        let config = read_config(&ctx.accounts.config)?;
         require!(read_outbox(&ctx.accounts.outbox)?.amount == 0, HorizonError::OutboxBusy);
         let owner = ctx.accounts.owner.key();
-        ctx.accounts.delegate_outbox(&ctx.accounts.owner, &[b"outbox", owner.as_ref()], delegation(&config))?;
+        ctx.accounts.delegate_outbox(&ctx.accounts.owner, &[b"outbox", owner.as_ref()], delegation())?;
         Ok(())
     }
 
-    /// Solana, admin only: delegates Config to its own rollup validator.
+    /// Solana, admin only: delegates Config to the rollup validator.
     #[cfg(not(feature = "inline-mock-magic"))]
     pub fn delegate_config(ctx: Context<DelegateConfig>) -> Result<()> {
-        let config = require_admin(&ctx.accounts.config, &ctx.accounts.admin.key())?;
+        require_admin(&ctx.accounts.config, &ctx.accounts.admin.key())?;
         require_owned(&ctx.accounts.config)?;
-        ctx.accounts.delegate_config(&ctx.accounts.admin, &[b"config"], delegation(&config))?;
+        ctx.accounts.delegate_config(&ctx.accounts.admin, &[b"config"], delegation())?;
         Ok(())
     }
 
-    /// Solana, admin only: delegates battleground `battleground_id` to Config's rollup validator.
+    /// Solana, admin only: delegates battleground `battleground_id` to the rollup validator.
     #[cfg(not(feature = "inline-mock-magic"))]
     pub fn delegate_battleground(ctx: Context<DelegateBattleground>, battleground_id: u8) -> Result<()> {
-        let config = require_admin(&ctx.accounts.config, &ctx.accounts.admin.key())?;
+        require_admin(&ctx.accounts.config, &ctx.accounts.admin.key())?;
         require_owned(&ctx.accounts.battleground)?;
         let seeds: &[&[u8]] = &[b"battleground", &[battleground_id]];
-        ctx.accounts.delegate_battleground(&ctx.accounts.admin, seeds, delegation(&config))?;
+        ctx.accounts.delegate_battleground(&ctx.accounts.admin, seeds, delegation())?;
         Ok(())
     }
 
-    /// Solana, admin only: delegates the treasury Outbox to Config's rollup validator, before each claim. Same
+    /// Solana, admin only: delegates the treasury Outbox to the rollup validator, before each claim. Same
     /// rule as `delegate_outbox`: an unreleased claim is refused.
     #[cfg(not(feature = "inline-mock-magic"))]
     pub fn delegate_treasury_outbox(ctx: Context<DelegateTreasuryOutbox>) -> Result<()> {
-        let config = require_admin(&ctx.accounts.config, &ctx.accounts.admin.key())?;
+        require_admin(&ctx.accounts.config, &ctx.accounts.admin.key())?;
         require!(read_outbox(&ctx.accounts.outbox)?.amount == 0, HorizonError::OutboxBusy);
         let key = ctx.accounts.config.key();
-        ctx.accounts.delegate_outbox(&ctx.accounts.admin, &[b"outbox", key.as_ref()], delegation(&config))?;
+        ctx.accounts.delegate_outbox(&ctx.accounts.admin, &[b"outbox", key.as_ref()], delegation())?;
         Ok(())
     }
 }
@@ -578,12 +617,12 @@ fn require_owned(info: &AccountInfo) -> Result<()> {
     Ok(())
 }
 
-/// What every delegate instruction asks the delegation program for: the rollup validator pinned in
-/// Config (the SDK's default identity is not the local rollup's), and the SDK's default commit
-/// frequency, `u32::MAX` ms, so nothing schedules commits.
+/// What every delegate instruction asks the delegation program for: the rollup validator built
+/// into the program (the SDK's default identity is not the local rollup's), and the SDK's default
+/// commit frequency, `u32::MAX` ms, so nothing schedules commits.
 #[cfg(not(feature = "inline-mock-magic"))]
-fn delegation(config: &Config) -> ephemeral_rollups_sdk::cpi::DelegateConfig {
-    ephemeral_rollups_sdk::cpi::DelegateConfig { validator: Some(config.validator), ..Default::default() }
+fn delegation() -> ephemeral_rollups_sdk::cpi::DelegateConfig {
+    ephemeral_rollups_sdk::cpi::DelegateConfig { validator: Some(VALIDATOR), ..Default::default() }
 }
 
 /// The shared step of `fund_outbox` and `fund_treasury_outbox`: moves `amount` from `source` to an
@@ -609,8 +648,8 @@ fn fill_outbox(
 /// Solana copy is owned by the delegation program, and a typed `Account<Config>` would refuse it;
 /// the data stays the same. The owner must be this program or the delegation program, and the
 /// address the `[b"config"]` PDA.
-/// It trusts the last committed Config, which is sound only for the fields Solana reads, `admin` and
-/// `validator`, because nothing changes either after `initialize`.
+/// It trusts the last committed Config, which is sound only for the one field Solana reads, `admin`:
+/// `accept_admin`, the only instruction that changes it, commits Config in the same transaction.
 fn read_config(info: &AccountInfo) -> Result<Config> {
     require!(*info.owner == ID || *info.owner == DELEGATION_PROGRAM, HorizonError::BadPda);
     let config = Config::try_deserialize(&mut &info.try_borrow_data()?[..])?;
@@ -691,6 +730,32 @@ fn schedule_release<'info>(
         .commit(std::slice::from_ref(source))
         .commit_and_undelegate(std::slice::from_ref(outbox))
         .add_post_undelegate_actions([release])
+        .build_and_invoke()?;
+    }
+    Ok(())
+}
+
+/// Schedules a plain commit of `config` (it stays delegated), paid by `payer`, so Solana's copy
+/// carries the admin `accept_admin` just wrote. Under `inline-mock-magic` it does nothing: nothing
+/// is delegated there.
+fn schedule_commit<'info>(
+    payer: &AccountInfo<'info>,
+    config: &AccountInfo<'info>,
+    magic: &MagicAccounts<'info>,
+) -> Result<()> {
+    #[cfg(feature = "inline-mock-magic")]
+    {
+        let _ = (payer, config, magic);
+    }
+    #[cfg(not(feature = "inline-mock-magic"))]
+    {
+        use ephemeral_rollups_sdk::ephem::{FoldableIntentBuilder, MagicIntentBundleBuilder};
+        MagicIntentBundleBuilder::new(
+            payer.clone(),
+            magic.magic_context.to_account_info(),
+            magic.magic_program.to_account_info(),
+        )
+        .commit(std::slice::from_ref(config))
         .build_and_invoke()?;
     }
     Ok(())
@@ -814,6 +879,8 @@ fn open_matched<'info>(
     stake: u64,
     candidates: Vec<(Pubkey, usize)>,
 ) -> Result<()> {
+    // The candidates are the queue's front window, not the locker's choice. The pick reads the
+    // most recent slot hash at execution, which the locker sees only after it has sent the lock.
     let hash = recent_slot_hash(&ctx.accounts.slot_hashes.to_account_info())?;
     let pick = (u64::from_le_bytes(hash[..8].try_into().unwrap()) as usize) % candidates.len();
     let (opponent_key, opponent_player_at) = candidates[pick];
@@ -978,6 +1045,10 @@ fn load_units(race: u8, units: &[UnitInput], accounts: &[AccountInfo], budget: u
     Ok(stored)
 }
 
+/// How many queue entries, from the front, a lock must pass and may meet. Eight armies and eight
+/// distinct owners' Players are what a legacy transaction holds next to `lock_army`'s own accounts.
+pub const MATCH_WINDOW: usize = 8;
+
 /// What `queued_opponents` found in the battleground queue.
 struct QueueScan {
     /// Armies a locker may meet, each with the index of its owner's Player in the accounts.
@@ -987,8 +1058,10 @@ struct QueueScan {
 }
 
 /// The queued armies a locker may meet, each with the index of its owner's Player in `accounts`,
-/// and the queued armies to evict: their owner's Player was passed and no longer covers the stake.
-/// An army whose owner's Player was not passed is neither, so it stays queued.
+/// and the queued armies to evict: their owner's Player no longer covers the stake. The program,
+/// not the locker, sets the candidates: the first [`MATCH_WINDOW`] queue entries. Each of them must
+/// be passed, with its owner's Player unless the locker owns it (`MissingAccount`), so a locker
+/// cannot leave out the armies it would rather not meet.
 fn queued_opponents(
     ground: &Account<Battleground>,
     player: Pubkey,
@@ -1008,17 +1081,16 @@ fn queued_opponents(
         }
     }
     let (mut found, mut evict) = (Vec::new(), Vec::new());
-    for key in ground.queue[..ground.queue_len as usize].iter() {
-        if let Some(account) = accounts.iter().find(|account| account.key == key) {
-            let army = Army::try_deserialize(&mut &account.try_borrow_data()?[..])?;
-            if army.owner == player || army.status != ArmyStatus::Queued {
-                continue;
-            }
-            match players.iter().find(|(owner, _, _)| *owner == army.owner) {
-                Some(&(_, at, budget)) if budget >= stake => found.push((*key, at)),
-                Some(_) => evict.push(*key),
-                None => {}
-            }
+    for key in ground.queue[..ground.queue_len as usize].iter().take(MATCH_WINDOW) {
+        let account = accounts.iter().find(|account| account.key == key).ok_or(HorizonError::MissingAccount)?;
+        let army = Army::try_deserialize(&mut &account.try_borrow_data()?[..])?;
+        if army.owner == player || army.status != ArmyStatus::Queued {
+            continue;
+        }
+        match players.iter().find(|(owner, _, _)| *owner == army.owner) {
+            Some(&(_, at, budget)) if budget >= stake => found.push((*key, at)),
+            Some(_) => evict.push(*key),
+            None => return err!(HorizonError::MissingAccount),
         }
     }
     Ok(QueueScan { found, evict })
@@ -1249,6 +1321,18 @@ pub struct AdminConfig<'info> {
     pub admin: Signer<'info>,
     #[account(mut, seeds = [b"config"], bump = config.bump, has_one = admin @ HorizonError::NotAdmin)]
     pub config: Account<'info, Config>,
+}
+
+#[derive(Accounts)]
+pub struct AcceptAdmin<'info> {
+    /// Config's `pending_admin`, checked in the handler. Pays the commit intent.
+    #[account(mut)]
+    pub new_admin: Signer<'info>,
+    /// CHECK: committed here, so read and written by hand (see `read_config`, which checks the
+    /// address); Anchor must not write a typed Config back after the scheduling CPI
+    #[account(mut)]
+    pub config: UncheckedAccount<'info>,
+    pub magic: MagicAccounts<'info>,
 }
 
 #[derive(Accounts)]
@@ -1533,8 +1617,6 @@ pub struct DelegatePlayer<'info> {
     /// Pays the delegation rent.
     #[account(mut)]
     pub owner: Signer<'info>,
-    /// CHECK: read by hand (see `read_config`) for the rollup validator
-    pub config: UncheckedAccount<'info>,
     /// CHECK: the owner's Player, by its seeds; the delegation program takes it over
     #[account(mut, del, seeds = [b"player", owner.key().as_ref()], bump)]
     pub player: UncheckedAccount<'info>,
@@ -1547,8 +1629,6 @@ pub struct DelegateOutbox<'info> {
     /// Pays the delegation rent.
     #[account(mut)]
     pub owner: Signer<'info>,
-    /// CHECK: read by hand (see `read_config`) for the rollup validator
-    pub config: UncheckedAccount<'info>,
     /// CHECK: the owner's Outbox, by its seeds; read by hand (see `read_outbox`)
     #[account(mut, del, seeds = [b"outbox", owner.key().as_ref()], bump)]
     pub outbox: UncheckedAccount<'info>,

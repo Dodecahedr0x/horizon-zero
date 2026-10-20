@@ -121,7 +121,7 @@ fn still_units_draw_when_the_round_limit_is_reached() {
     let rounds = events.iter().filter(|event| matches!(event, TraceEvent::Round)).count();
     assert_eq!(rounds, MAX_ROUNDS as usize);
     assert!(events.iter().all(|event| !matches!(event, TraceEvent::Move { .. } | TraceEvent::Attack { .. } | TraceEvent::Cast { .. } | TraceEvent::Death { .. })));
-    assert_eq!(events.last().copied(), Some(TraceEvent::End { winner: None, limit: true }));
+    assert_eq!(events.last().copied(), Some(TraceEvent::End { winner: None, limit: true, work: false }));
     assert_eq!(events.last().unwrap().to_line(), "E draw limit");
 }
 
@@ -133,7 +133,7 @@ fn a_wipe_ends_before_the_round_limit() {
     let rounds = events.iter().filter(|event| matches!(event, TraceEvent::Round)).count();
     assert!(rounds > 0 && rounds < MAX_ROUNDS as usize);
     assert!(events.iter().any(|event| matches!(event, TraceEvent::Death { side: Side::B, .. })));
-    assert_eq!(events.last().copied(), Some(TraceEvent::End { winner: Some(Side::A), limit: false }));
+    assert_eq!(events.last().copied(), Some(TraceEvent::End { winner: Some(Side::A), limit: false, work: false }));
     assert_eq!(events.last().unwrap().to_line(), "E 0");
 }
 
@@ -911,4 +911,55 @@ fn playable_boards_stay_within_the_row_and_tile_caps() {
     for (cols, rows) in [(13, 10), (12, 11), (11, 11), (8, 15), (6, 20), (32, 32), (33, 4), (0, 4), (4, 3)] {
         assert!(!Geometry { cols, rows }.playable(), "{cols} x {rows}");
     }
+}
+
+/// Ten units packed against the edge, re-reading their target every step: the shape the audit
+/// found running `settle_match` out of compute. The work limit stops such a battle, and the side
+/// with the larger share of its starting hp left wins, as the trace's hp lines tell it.
+#[test]
+fn a_battle_out_of_work_goes_to_the_larger_hp_share() {
+    let packed_body = BehaviorBody::parse(&[1, 1, 3, 0, 2, 1, 0, 3, 1, 1, 2, 1, 1, 1, 0, 1, 0, 0, 0, 0]).unwrap();
+    let packed: Vec<SnapshotUnit> = [(1u8, 9u8, 1u8), (4, 1, 0), (1, 0, 0), (1, 3, 0), (3, 11, 1), (1, 5, 0), (3, 10, 1), (4, 7, 0), (3, 8, 0), (1, 9, 0)]
+        .iter()
+        .map(|&(kind, col, row)| catalog_unit(AshbornKind::from_u8(kind).unwrap(), packed_body, col, row))
+        .collect();
+    let kinds = [AshbornKind::Vanguard, AshbornKind::Archer, AshbornKind::Skirmisher, AshbornKind::Guard, AshbornKind::Warden];
+    let honest: Vec<SnapshotUnit> = (0..10u8).map(|at| catalog_unit(kinds[at as usize % 5], behavior_kite_cast(), at + 1, at % 2)).collect();
+    let board = Geometry { cols: 12, rows: 10 };
+    let mut stopped = 0;
+    for byte in 0..16u8 {
+        let seed = [byte; 32];
+        let (winner, events) = simulate(&honest, &packed, seed, board);
+        let (same, work) = simulate_work(&honest, &packed, seed, board);
+        assert_eq!(same, winner);
+        let Some(&TraceEvent::End { winner: ended, work: out_of_work, limit }) = events.last() else { panic!("no end") };
+        assert_eq!(ended, winner);
+        assert_eq!(out_of_work, work >= WORK_LIMIT);
+        if !out_of_work {
+            continue;
+        }
+        stopped += 1;
+        assert!(!limit);
+        // Overrun past the limit is at most one step of one element.
+        assert!(work < WORK_LIMIT + 2_000, "work {work}");
+        let mut hp: Vec<Vec<i32>> = [&honest, &packed].iter().map(|side| side.iter().map(|unit| unit.hp as i32).collect()).collect();
+        let start: Vec<i64> = hp.iter().map(|side| side.iter().map(|&left| left as i64).sum()).collect();
+        for event in &events {
+            match *event {
+                TraceEvent::Attack { target_side, target_index, target_hp, .. } | TraceEvent::Cast { target_side, target_index, target_hp, .. } => {
+                    hp[target_side.id() as usize][target_index as usize] = target_hp
+                }
+                TraceEvent::Death { side, index } => hp[side.id() as usize][index as usize] = 0,
+                _ => {}
+            }
+        }
+        let left: Vec<i64> = hp.iter().map(|side| side.iter().map(|&left| left.max(0) as i64).sum()).collect();
+        let expected = match (left[0] * start[1]).cmp(&(left[1] * start[0])) {
+            core::cmp::Ordering::Greater => Some(Side::A),
+            core::cmp::Ordering::Less => Some(Side::B),
+            core::cmp::Ordering::Equal => None,
+        };
+        assert_eq!(winner, expected, "seed byte {byte}");
+    }
+    assert!(stopped > 0, "no battle reached the work limit");
 }

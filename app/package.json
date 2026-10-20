@@ -7,7 +7,7 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "start": "node --env-file-if-exists=../.env server.js",
-    "test": "node --test src/golden.test.mjs src/codec.test.mjs src/money.test.mjs local-ledger.test.mjs ../content/trace.test.mjs ../content/interpret.test.mjs"
+    "test": "node --test server.test.mjs src/golden.test.mjs src/codec.test.mjs src/txCheck.test.mjs src/money.test.mjs local-ledger.test.mjs ../content/trace.test.mjs ../content/interpret.test.mjs"
   },
   "dependencies": {
     "@magicblock-labs/ephemeral-rollups-sdk": "0.17.3",

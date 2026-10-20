@@ -1,12 +1,13 @@
 /**
  * Brings a cluster where horizon_zero is deployed to a playable state on its ephemeral rollup:
- * Config (fee 500 bps, pinned to the rollup's validator), the battlegrounds in content/catalog.json,
- * the treasury Outbox, then the delegation of Config, every battleground and the treasury Outbox.
- * It waits until the rollup returns Config. Every step is skipped when it is already done, so this
- * is safe to run after each deploy.
+ * Config (fee 500 bps), the battlegrounds in content/catalog.json, the treasury Outbox, then the
+ * delegation of Config, every battleground and the treasury Outbox. The program delegates to the
+ * validator it was built for (HZ_VALIDATOR); the script stops as soon as Config's delegation names
+ * another identity than the rollup's. It waits until the rollup returns Config. Every step is skipped
+ * when it is already done, so this is safe to run after each deploy.
  *
  *   node app/scripts/bootstrap.mjs --url <solana rpc> --er-url <rollup rpc> --keypair <file>
- *     [--validator <identity>]   default: the rollup's getIdentity
+ *     [--validator <identity>]   must equal the rollup's getIdentity when given
  *     [--fee-bps 500]            used by initialize only
  *     [--espl-rent]              local stack only: create and fund the eSPL rent PDA top-ups need
  *
@@ -18,7 +19,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import { pathToFileURL } from "node:url";
-import { initRentPdaIx } from "@magicblock-labs/ephemeral-rollups-sdk";
+import { DelegationStatus, getDelegationRecord, initRentPdaIx } from "@magicblock-labs/ephemeral-rollups-sdk";
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import {
   BATTLEGROUNDS,
@@ -64,11 +65,22 @@ export async function upgradeAuthority(base) {
   return new PublicKey(info.data.subarray(13, 45));
 }
 
-/** The identity a rollup signs with: the validator Config pins and every delegation names. */
+/** The identity a rollup signs with: the validator the program is built for, which every delegation names. */
 export async function rollupIdentity(er) {
   const response = await er._rpcRequest("getIdentity", []);
   if (!response.result?.identity) throw new Error(`the rollup at ${er.rpcEndpoint} did not return its identity`);
   return new PublicKey(response.result.identity);
+}
+
+/**
+ * Throws when `account` is delegated to another validator than `identity`: the program was built
+ * with a different HZ_VALIDATOR than the rollup this bootstrap targets. Not delegated: nothing to check.
+ */
+export async function assertDelegatedTo(base, account, identity, label) {
+  const record = await getDelegationRecord(base, account);
+  if (record.status === DelegationStatus.Delegated && !record.validator.equals(identity)) {
+    throw new Error(`${label} is delegated to ${record.validator.toBase58()}, but the rollup is ${identity.toBase58()}: the program was built with another HZ_VALIDATOR`);
+  }
 }
 
 async function waitFor(label, seconds, check) {
@@ -98,7 +110,8 @@ export async function bootstrap(base, er, admin, { validator, feeBps = FEE_BPS, 
   }
 
   const config = configPda();
-  const identity = validator ?? (await rollupIdentity(er));
+  const identity = await rollupIdentity(er);
+  if (validator && !validator.equals(identity)) throw new Error(`--validator ${validator.toBase58()} is not the rollup's identity ${identity.toBase58()}`);
   const existing = await base.getAccountInfo(config);
   // Every later step is an admin instruction: say so plainly rather than let the program answer NotAdmin.
   let storedAdmin = admin.publicKey.toBase58();
@@ -112,9 +125,7 @@ export async function bootstrap(base, er, admin, { validator, feeBps = FEE_BPS, 
     if (!stored) throw new Error(`the account at ${config.toBase58()} is not a Config`);
     storedAdmin = stored.admin;
     log(`config: already initialized, admin ${stored.admin}`);
-    if (stored.validator !== identity.toBase58()) {
-      throw new Error(`Config pins validator ${stored.validator}, but the rollup is ${identity.toBase58()}`);
-    }
+    await assertDelegatedTo(base, config, identity, "Config");
   } else {
     // initialize refuses any signer but the upgrade authority (NotUpgradeAuthority): say which key it wants.
     const authority = await upgradeAuthority(base);
@@ -122,8 +133,8 @@ export async function bootstrap(base, er, admin, { validator, feeBps = FEE_BPS, 
     if (!authority.equals(admin.publicKey)) {
       throw new Error(`initialize needs the program's upgrade authority ${authority.toBase58()}; the keypair is ${admin.publicKey.toBase58()}`);
     }
-    await send(base, admin, [initializeIx(admin.publicKey, feeBps, identity)]);
-    log(`config: initialized, admin ${admin.publicKey.toBase58()}, fee ${feeBps} bps, validator ${identity.toBase58()}`);
+    await send(base, admin, [initializeIx(admin.publicKey, feeBps)]);
+    log(`config: initialized, admin ${admin.publicKey.toBase58()}, fee ${feeBps} bps`);
   }
 
   for (const ground of BATTLEGROUNDS) {
@@ -148,7 +159,9 @@ export async function bootstrap(base, er, admin, { validator, feeBps = FEE_BPS, 
   if (await owned(config)) {
     asAdmin("delegating Config");
     await send(base, admin, [delegateConfigIx(admin.publicKey)]);
-    log("config: delegated");
+    // The first delegation shows which validator the deployed build names: stop before the rest.
+    await assertDelegatedTo(base, config, identity, "Config");
+    log(`config: delegated to ${identity.toBase58()}`);
   }
   for (const ground of BATTLEGROUNDS) {
     if (!(await owned(battlegroundPda(ground.id)))) continue;

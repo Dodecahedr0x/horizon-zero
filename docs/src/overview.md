@@ -87,7 +87,9 @@ Stakes stay on the Players until `settle_match`. The winner of a resolved battle
 
 A player registers once with `register_player`, which creates their Player account and deposits lamports into it, and moves lamports into the budget with `fund_budget`. Behaviors, armies and battles are ephemeral rollup accounts whose rent the Player's free lamports pay. A queued army can `unlock_army`; it holds no stake, so nothing moves. A fighting army cannot. `settle_match` sets both armies back to Idle. An Idle army can be deleted with `close_army`, which returns its rent to the owner's Player.
 
-Config, each Battleground, each Player and each Outbox are created on Solana and delegated to the rollup with `delegate_config`, `delegate_battleground`, `delegate_player` and `delegate_outbox` (the treasury Outbox with `delegate_treasury_outbox`). Each delegates to the rollup validator that `initialize` pins in Config. Nothing commits on a timer. Money leaves the rollup only through an Outbox, and only then does the program commit the account the money left: the Player on each withdrawal, Config on each fee claim. See [Where each account lives](accounts.md#where-each-account-lives).
+Config, each Battleground, each Player and each Outbox are created on Solana and delegated to the rollup with `delegate_config`, `delegate_battleground`, `delegate_player` and `delegate_outbox` (the treasury Outbox with `delegate_treasury_outbox`). Each delegates to the rollup validator built into the program at build time (`HZ_VALIDATOR`). Nothing commits on a timer. Money leaves the rollup only through an Outbox, and only then does the program commit the account the money left: the Player on each withdrawal, Config on each fee claim. The only other commit is Config's when a new admin accepts the role.
+
+The admin hands the role on in two steps: `set_admin` proposes a key, and that key takes over by signing `accept_admin` in the rollup. See [Where each account lives](accounts.md#where-each-account-lives).
 
 A player withdraws with `fund_outbox` and `withdraw` in one rollup transaction: the first moves lamports from the Player to the wallet's Outbox, taking free lamports, then winnings, then budget, never locked stakes. The second, in one intent bundle, commits the Player (which stays delegated) and commits and undelegates the Outbox, and `release_outbox` then pays the wallet on Solana. Before the next withdrawal the client delegates the Outbox again. The admin claims fees the same way with `fund_treasury_outbox` and `claim_fees`. See [Money in and out](matchmaking.md#money-in-and-out).
 
@@ -138,7 +140,7 @@ With 1000 battles a cell moves by about 1.5 points from one sample to the next. 
 
 Each battleground is its own grid. An army holds at most 10 units, one tile each. The cap was 6 until Rootborn: with 6, Citadel's budget of 32 bought six Ashborn units that left points unspent while Rootborn spent all of it, and Rootborn won almost every Citadel battle. A battle lasts at most 12 rounds. Distance is integer Manhattan. The VRF seed changes initiative, tie-breaks, and which tiles between the starting zones are blocked. It does not change deployment.
 
-`lock_army` chooses the opponent from the recent slot hash before it requests randomness. The VRF callback only stores the seed that `simulate` uses; `settle_match`, which anyone may send, plays the battle and pays out.
+`lock_army` chooses the opponent from the queue's first eight entries, which the locker must all pass, with the recent slot hash before it requests randomness. The VRF callback only stores the seed that `simulate` uses; `settle_match`, which anyone may send, plays the battle and pays out.
 
 Program id: `Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c`.
 

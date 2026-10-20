@@ -28,6 +28,7 @@ import {
   horizonErrorCode,
   lockArmyIx,
   lockOpens,
+  MATCH_WINDOW,
   matchPda,
   nameBehavior,
   outboxPda,
@@ -57,10 +58,6 @@ const RELEASE_WAIT_MS = 30_000;
 const ACTION_WAIT_MS = 5_000;
 // How many army indexes past the indexer's highest createArmy checks in the rollup.
 const ARMY_INDEX_PROBE = 64;
-// A legacy transaction fits about 33 distinct accounts. lock_army's fixed accounts, the program and
-// the compute-budget program take 15; candidates and their Players share the rest.
-const LOCK_ACCOUNT_LIMIT = 32;
-const LOCK_FIXED_ACCOUNTS = 15;
 
 /** A program error, named from `HorizonError`. */
 export class ProgramError extends Error {
@@ -480,21 +477,20 @@ export function createSolanaChain(wallet: Signer, net: SolanaNet): ChainAdapter 
     const groundInfo = await er.getAccountInfo(ground);
     const state = groundInfo ? decodeBattleground(groundInfo.data) : null;
     if (!state) throw new Error("Battleground is missing");
-    // Offer the queued armies of other wallets, in queue order, with their owners' Players so the
-    // program can match a funded one and evict an unfunded one.
-    const queued = state.queue.map((key) => new PublicKey(key));
+    // The program requires the queue's first MATCH_WINDOW entries, with their owners' Players, and
+    // picks among them: a lock offers exactly those, the wallet's own queued armies included. A
+    // legacy transaction holds lock_army's accounts plus eight armies and eight Players.
+    const queued = state.queue.slice(0, MATCH_WINDOW).map((key) => new PublicKey(key));
     const heads = queued.length ? await er.getMultipleAccountsInfo(queued) : [];
     const candidates: { army: PublicKey; owner: PublicKey }[] = [];
     const candidateInfos: (AccountInfo<Buffer> | null)[] = [];
     const owners = new Set<string>();
     for (const [i, info] of heads.entries()) {
       const head = info ? decodeArmyHead(info.data) : null;
-      if (!head || head.status !== 1 || head.owner === owner.toBase58()) continue;
-      const added = owners.has(head.owner) ? 1 : 2;
-      if (LOCK_FIXED_ACCOUNTS + candidates.length + owners.size + added > LOCK_ACCOUNT_LIMIT) break;
+      if (!head) throw new Error("A queued army is missing from the rollup; try again");
       candidates.push({ army: queued[i], owner: new PublicKey(head.owner) });
       candidateInfos.push(info);
-      owners.add(head.owner);
+      if (head.owner !== owner.toBase58()) owners.add(head.owner);
     }
     // The program matches a candidate whose owner's budget covers the stake. Only then does the
     // lock create the battle, and only then may the battle be passed writable (see lockArmyIx).

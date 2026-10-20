@@ -21,7 +21,7 @@ export type TraceStep =
   | { kind: "defend" | "death"; line: string; actor: TraceUnit }
   | { kind: "expire"; line: string; actor: TraceUnit; effectId: number; effect: string }
   | { kind: "round"; line: string }
-  | { kind: "end"; line: string; winner: number | null; limit: boolean }
+  | { kind: "end"; line: string; winner: number | null; limit: boolean; work: boolean }
   | { kind: "unknown"; line: string };
 export function parseTraceLine(line: string): TraceStep;
 export function targetsSelf(step: TraceStep): boolean;

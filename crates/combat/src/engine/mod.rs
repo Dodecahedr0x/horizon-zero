@@ -6,7 +6,18 @@ mod target;
 
 use crate::board::{blocked_tiles, deploy, Field, Geometry};
 use crate::trace::{Trace, TraceEvent};
-use crate::{mix, BehaviorBody, Cast, Effect, Side, SnapshotUnit, Stop, MAX_ROUNDS, MAX_ROWS, MAX_UNITS};
+use crate::{mix, BehaviorBody, Cast, Effect, Side, SnapshotUnit, Stop, MAX_ROUNDS, MAX_ROWS, MAX_UNITS, WORK_LIMIT};
+
+/// Work charged per turn and per element in the actor's behavior, per step taken or tried, per
+/// action tried, per fighter a target rule looks at, and per seeded tie-break hash. One unit is
+/// about 14 compute units on chain; the weights come from a regression of `settle_match` cost.
+/// See [`WORK_LIMIT`].
+const WORK_TURN: u32 = 33;
+const WORK_ELEMENT: u32 = 5;
+const WORK_STEP: u32 = 60;
+const WORK_ACTION: u32 = 18;
+const WORK_CANDIDATE: u32 = 1;
+const WORK_HASH: u32 = 14;
 
 /// Lasting effects one unit can carry at once. One more replaces nothing and is dropped.
 pub const MAX_STATUSES: usize = 4;
@@ -133,20 +144,25 @@ impl<'t> Battle<'t> {
 /// between the zones and does not move the deployment.
 pub fn simulate(side_a: &[SnapshotUnit], side_b: &[SnapshotUnit], seed: [u8; 32], board: Geometry) -> (Option<Side>, Vec<TraceEvent>) {
     let mut trace = Trace::recording();
-    let winner = run(side_a, side_b, seed, board, &mut trace);
+    let (winner, _) = run(side_a, side_b, seed, board, &mut trace);
     (winner, trace.events)
 }
 
 /// The same battle as [`simulate`] without keeping the trace. The program calls this: its heap
 /// is 32 KiB and never frees, so it must not hold hundreds of events it does not read.
 pub fn simulate_winner(side_a: &[SnapshotUnit], side_b: &[SnapshotUnit], seed: [u8; 32], board: Geometry) -> Option<Side> {
+    run(side_a, side_b, seed, board, &mut Trace::discarding()).0
+}
+
+/// The winner and the work the battle did, in [`WORK_LIMIT`]'s units. For tuning the limit.
+pub fn simulate_work(side_a: &[SnapshotUnit], side_b: &[SnapshotUnit], seed: [u8; 32], board: Geometry) -> (Option<Side>, u32) {
     run(side_a, side_b, seed, board, &mut Trace::discarding())
 }
 
-fn run(side_a: &[SnapshotUnit], side_b: &[SnapshotUnit], seed: [u8; 32], board: Geometry, trace: &mut Trace) -> Option<Side> {
+fn run(side_a: &[SnapshotUnit], side_b: &[SnapshotUnit], seed: [u8; 32], board: Geometry, trace: &mut Trace) -> (Option<Side>, u32) {
     if !board.playable() {
-        trace.push(TraceEvent::End { winner: None, limit: false });
-        return None;
+        trace.push(TraceEvent::End { winner: None, limit: false, work: false });
+        return (None, 0);
     }
     #[cfg(feature = "cu-profile")]
     let profile = crate::profile::Profile::default();
@@ -179,6 +195,9 @@ fn run(side_a: &[SnapshotUnit], side_b: &[SnapshotUnit], seed: [u8; 32], board: 
             fighter.defense = 0;
         }
         for &(idx, _) in &order {
+            if battle.exhausted() {
+                break;
+            }
             if !battle.fighters[idx].alive() {
                 continue;
             }
@@ -186,6 +205,9 @@ fn run(side_a: &[SnapshotUnit], side_b: &[SnapshotUnit], seed: [u8; 32], board: 
                 break;
             }
             battle.act(idx);
+        }
+        if battle.exhausted() {
+            break;
         }
         profiled!(battle.profile, Expire, battle.expire_statuses());
         battle.trace.push(TraceEvent::Round);
@@ -196,16 +218,20 @@ fn run(side_a: &[SnapshotUnit], side_b: &[SnapshotUnit], seed: [u8; 32], board: 
     let winner = match (a_alive, b_alive) {
         (true, false) => Some(Side::A),
         (false, true) => Some(Side::B),
+        // Out of work with both sides standing: the larger share of starting hp left wins. Ending
+        // in a draw instead would let an army built to exhaust the meter turn a loss into a refund.
+        (true, true) if battle.exhausted() => battle.healthier(),
         _ => None,
     };
-    let limit = winner.is_none() && a_alive && b_alive;
-    battle.trace.push(TraceEvent::End { winner, limit });
+    let work = a_alive && b_alive && battle.exhausted();
+    let limit = a_alive && b_alive && !work;
+    battle.trace.push(TraceEvent::End { winner, limit, work });
     #[cfg(feature = "cu-profile")]
     {
         battle.profile.absorb(&battle.field.profile_fill);
         battle.profile.log();
     }
-    winner
+    (winner, battle.field.work.get())
 }
 
 /// Deploys one side. A unit with no hp, outside its zone, or on an occupied tile is skipped.
@@ -228,6 +254,31 @@ impl Battle<'_> {
     /// A fighter's side and roster index, as trace events name it.
     pub(crate) fn who(&self, index: usize) -> (Side, u8) {
         (self.fighters[index].side, self.fighters[index].index)
+    }
+
+    /// Adds to the battle's work. See [`WORK_LIMIT`].
+    pub(crate) fn charge(&self, units: u32) {
+        self.field.charge(units);
+    }
+
+    pub(crate) fn exhausted(&self) -> bool {
+        self.field.work.get() >= WORK_LIMIT
+    }
+
+    /// The side with the larger share of its starting hp still standing, or `None` on a tie.
+    fn healthier(&self) -> Option<Side> {
+        let share = |side: Side| {
+            self.fighters
+                .iter()
+                .filter(|fighter| fighter.side == side)
+                .fold((0i64, 0i64), |(left, start), fighter| (left + fighter.hp.max(0) as i64, start + fighter.max_hp as i64))
+        };
+        let ((a_left, a_start), (b_left, b_start)) = (share(Side::A), share(Side::B));
+        match (a_left * b_start).cmp(&(b_left * a_start)) {
+            core::cmp::Ordering::Greater => Some(Side::A),
+            core::cmp::Ordering::Less => Some(Side::B),
+            core::cmp::Ordering::Equal => None,
+        }
     }
 
     pub(crate) fn alive_count(&self, side: Side) -> usize {
@@ -254,11 +305,15 @@ impl Battle<'_> {
 
     /// One fighter's turn: each element moves, then tries its actions, then a spare point defends.
     fn act(&mut self, actor: usize) {
+        self.charge(WORK_TURN + WORK_ELEMENT * self.fighters[actor].behavior.len as u32);
         // Spent steps, not remaining ones: a sprint cast mid-turn raises the pool it is checked against.
         let mut moved = 0;
         let mut action_points = self.fighters[actor].actions;
         // One element at a time: copying the whole behavior each turn costs more than the loop.
         for slot in 0..self.fighters[actor].behavior.len as usize {
+            if self.exhausted() {
+                return;
+            }
             let element = &self.fighters[actor].behavior.elements[slot].clone();
             let Some(movement) = element.movement else {
                 profiled!(self.profile, Actions, self.try_actions(actor, element, &mut action_points));
@@ -266,7 +321,11 @@ impl Battle<'_> {
             };
             let mut step = 0;
             while moved < self.fighters[actor].movement_points() {
+                if self.exhausted() {
+                    return;
+                }
                 moved += 1;
+                self.charge(WORK_STEP);
                 let stepped = profiled!(self.profile, Move, self.take_step(actor, movement, step));
                 let points = action_points;
                 let fired = profiled!(self.profile, Actions, self.try_actions(actor, element, &mut action_points));

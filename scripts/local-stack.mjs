@@ -14,8 +14,9 @@
 // the upgrade authority. mb-stack passes its extra arguments to solana-test-validator, so this is
 // `--upgradeable-program <id> <so> <admin>`. The rollup clones it on first use. vrf-oracle from the same
 // package watches the rollup and answers the ephemeral test queue, where lock_army asks for its seed.
-// The bootstrap creates and funds the eSPL rent PDA top-ups need, initializes Config pinned to the
-// rollup's identity, and delegates Config, the battlegrounds and the treasury Outbox.
+// The program is built for the local rollup's identity (LOCAL_VALIDATOR, as HZ_VALIDATOR). The
+// bootstrap creates and funds the eSPL rent PDA top-ups need, initializes Config, and delegates
+// Config, the battlegrounds and the treasury Outbox to that identity.
 // The ledger is reset on every start, so the indexer gets a fresh database under target/localnet.
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -32,6 +33,8 @@ const args = new Set(process.argv.slice(2));
 export const PROGRAM_ID = "Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c";
 // ephemeral_vrf_sdk::consts::DEFAULT_EPHEMERAL_TEST_QUEUE, served by the vrf-oracle that watches the rollup.
 export const EPHEMERAL_TEST_QUEUE = "Sc9MJUngNbQXSXGP3F67KvKwVnhaYn6kcioxXNVowYT";
+// The identity mb-stack's ephemeral validator signs with. The local build delegates to it.
+export const LOCAL_VALIDATOR = "mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev";
 const MB_PACKAGE = "@magicblock-labs/ephemeral-validator@0.14.10";
 
 const port = (name, fallback) => Number(process.env[name] || fallback);
@@ -160,11 +163,11 @@ async function main() {
     // Default features: inline-mock-vrf and inline-mock-magic are LiteSVM-only builds and must not
     // reach a real validator. The LiteSVM suite's mock build overwrites the same .so, so build here.
     log("building programs/horizon-zero with default features");
-    buildDefault(root, log);
+    buildDefault(root, { validator: LOCAL_VALIDATOR, oracleQueue: EPHEMERAL_TEST_QUEUE }, log);
   }
   const so = path.join(root, SO);
   try {
-    assertDefaultBuild(root);
+    assertDefaultBuild(root, { validator: LOCAL_VALIDATOR, oracleQueue: EPHEMERAL_TEST_QUEUE });
   } catch (err) {
     process.stderr.write(`[local] ${err.message}; run without --no-build\n`);
     process.exit(1);
@@ -200,7 +203,7 @@ async function main() {
 
   run("solana", ["airdrop", "100", "-k", admin, "-u", BASE_URL], { stdio: "ignore" });
   log("bootstrapping: eSPL rent PDA, config, battlegrounds, treasury Outbox, delegations");
-  run("node", ["app/scripts/bootstrap.mjs", "--url", BASE_URL, "--er-url", ER_URL, "--keypair", admin, "--espl-rent"]);
+  run("node", ["app/scripts/bootstrap.mjs", "--url", BASE_URL, "--er-url", ER_URL, "--keypair", admin, "--validator", LOCAL_VALIDATOR, "--espl-rent"]);
 
   if (indexing) {
     // A fresh database: the ledger was just reset, and rows from the last run name accounts that

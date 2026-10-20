@@ -55,6 +55,7 @@ impl Battle<'_> {
             if *action_points <= 0 {
                 break;
             }
+            self.charge(super::WORK_ACTION);
             fired |= match action.verb {
                 Verb::Cast => self.try_cast(actor, action.target, action_points) && self.fighters[actor].cast.aim != Aim::Caster,
                 Verb::Attack => self.try_attack(actor, action.target, action_points),

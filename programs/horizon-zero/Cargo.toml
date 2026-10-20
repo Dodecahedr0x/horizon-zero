@@ -33,5 +33,8 @@ ephemeral-vrf-sdk = { version = "0.17.3", features = ["anchor"] }
 ephemeral-rollups-sdk = { version = "0.17.3", features = ["anchor"] }
 combat = { path = "../../crates/combat" }
 
+[build-dependencies]
+bs58 = "0.5.1"
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

@@ -2,10 +2,11 @@
 //
 //   node scripts/deploy.mjs devnet  [--keypair ~/.config/solana/id.json] [--url <rpc>]
 //   node scripts/deploy.mjs mainnet --confirm-mainnet [--keypair <path>] [--url <rpc>] [--priority <micro-lamports>]
+//   required:    --er-url <rollup rpc> and --validator <its identity>: the identity must be what the
+//                rollup's getIdentity returns. It is built into the program as HZ_VALIDATOR, and every
+//                delegation goes to it.
 //   extra flags: --skip-build (reuse target/deploy/horizon_zero.so, only if it is the default-features
-//                build this script or the local stack recorded), --skip-bootstrap,
-//                --er-url <rollup rpc> and --validator <its identity> (both required unless --skip-bootstrap;
-//                the identity must be what the rollup's getIdentity returns)
+//                build this script recorded for that same validator), --skip-bootstrap
 //
 // The program id is the address of target/deploy/horizon_zero-keypair.json, which must be
 // Hm19JfKaKCRphRwF7DbxhJWmLpHgMG1SnEnKGRyN9Z7c. The --keypair wallet pays, holds the upgrade
@@ -61,13 +62,13 @@ if (!CLUSTERS[cluster]) fail("usage: node scripts/deploy.mjs <devnet|mainnet> [-
 if (cluster === "mainnet" && !has("--confirm-mainnet")) fail("mainnet spends real SOL; pass --confirm-mainnet to go ahead");
 
 const url = value("--url", CLUSTERS[cluster]);
-// The rollup Config is pinned to: bootstrap delegates every account to its validator identity.
+// The program is built for one rollup: every delegation goes to its validator identity. A wrong
+// rollup is caught before anything is built or any SOL is spent: the operator names the identity
+// they expect, and it must be the one the rollup reports.
 const erUrl = value("--er-url", "");
-if (!erUrl && !has("--skip-bootstrap")) fail("--er-url <rollup rpc> is required: Config pins that rollup's validator for good");
-// Config pins the validator once and for all, so a wrong rollup is caught before any SOL is
-// spent: the operator names the identity they expect, and it must be the one the rollup reports.
+if (!erUrl) fail("--er-url <rollup rpc> is required: the program is built for that rollup's validator");
 let validator = "";
-if (!has("--skip-bootstrap")) {
+{
   let identity;
   try {
     const response = await fetch(erUrl, {
@@ -82,7 +83,7 @@ if (!has("--skip-bootstrap")) {
   if (!identity) fail(`the rollup at ${erUrl} did not return its identity`);
   process.stdout.write(`[deploy] rollup ${erUrl} identity ${identity}\n`);
   validator = value("--validator", "");
-  if (!validator) fail(`pass --validator ${identity} to confirm: initialize pins it in Config and nothing changes it`);
+  if (!validator) fail(`pass --validator ${identity} to confirm: the build delegates every account to it`);
   if (validator !== identity) fail(`--validator ${validator} is not the identity ${identity} that ${erUrl} reports`);
 }
 const keypair = value("--keypair", "~/.config/solana/id.json").replace(/^~(?=$|\/)/, os.homedir());
@@ -96,8 +97,9 @@ if (programAddress !== PROGRAM_ID) fail(`program keypair is ${programAddress}, b
 // the real VRF callback and skip the rollup's ephemeral accounts and delegation. A reused .so must
 // be the default build recorded next to it (a LiteSVM mock build overwrites the same file).
 try {
-  if (has("--skip-build")) assertDefaultBuild(root);
-  else buildDefault(root, (line) => process.stdout.write(`[deploy] ${line}\n`));
+  const keys = { validator, oracleQueue: ORACLE_QUEUE };
+  if (has("--skip-build")) assertDefaultBuild(root, keys);
+  else buildDefault(root, keys, (line) => process.stdout.write(`[deploy] ${line}\n`));
 } catch (err) {
   fail(has("--skip-build") ? `${err.message}; drop --skip-build` : err.message);
 }
@@ -149,7 +151,7 @@ if (!has("--skip-bootstrap")) {
   run("node", ["app/scripts/bootstrap.mjs", "--url", url, "--er-url", erUrl, "--keypair", keypair, "--validator", validator]);
 }
 
-const rollup = erUrl || "<rollup RPC>";
+const rollup = erUrl;
 process.stdout.write(`
 [deploy] done. Build the game with VITE_DEV_MODE=false and run its server for this cluster with:
   RPC_URL=${url}
