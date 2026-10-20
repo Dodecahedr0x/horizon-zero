@@ -324,7 +324,9 @@ for (const wallet of wallets) {
 }
 say("both Players and Outboxes are live in the rollup");
 
-// 2. Top up 0.05 SOL each through the eSPL program, then fund a 0.02 SOL budget.
+// 2. Top up 0.05 SOL each through the eSPL program, then fund a 0.02 SOL budget. The fees vault is
+// read first: the rollup may commit a drained eSPL PDA, and finalize credit the vault, mid-loop.
+const vaultBeforeTopUps = (await validatorBalance()).vault;
 for (const [i, wallet] of wallets.entries()) {
   const owner = wallet.publicKey;
   const playerBefore = (await erPlayer(owner)).lamports;
@@ -348,7 +350,7 @@ say(`both Players hold ${sol(TOP_UP)} more in the rollup, ${sol(BUDGET)} of it a
 // The rollup commits the drained eSPL lamports PDAs back to Solana on its own schedule; finalize
 // sends their decrease, the top-ups, to the validator's fees vault.
 {
-  const vaultBefore = (await validatorBalance()).vault;
+  const vaultBefore = vaultBeforeTopUps;
   await until("the eSPL lamports PDAs settle on Solana", 120, async () => {
     const infos = await base.getMultipleAccountsInfo([tracked.get("espl0"), tracked.get("espl1")], "confirmed");
     return infos.every((info) => !info || info.lamports === 0) ? true : null;
