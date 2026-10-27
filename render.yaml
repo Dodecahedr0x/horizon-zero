@@ -3,7 +3,10 @@ services:
     name: horizon-zero
     runtime: node
     plan: starter
-    buildCommand: corepack enable && pnpm install --frozen-lockfile && pnpm --filter app build
+    # Node 24 matches CI. An open engines range makes Render install Current (the failed
+    # build used 26.12.1). corepack enable rewrites /usr/bin/pnpm, which is read-only on
+    # the Node image. npx runs pnpm 10 from the npm cache.
+    buildCommand: npx --yes pnpm@10 install --frozen-lockfile && npx --yes pnpm@10 --filter app build
     startCommand: node app/server.js
     envVars:
       - key: INDEXER_URL

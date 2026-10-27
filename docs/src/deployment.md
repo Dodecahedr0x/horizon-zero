@@ -74,7 +74,7 @@ It does not create standard behaviors: behaviors live in the rollup and a Player
 
 An upgrade that changes `--validator` splits the game: accounts already delegated stay with the old validator, and only new delegations go to the new one. Change the validator only on a fresh deployment.
 
-It ends by printing the game's variables (build with `VITE_DEV_MODE=false`; run the server with `RPC_URL`, `ER_RPC_URL`, and `ORACLE_QUEUE` = `5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc`) and the indexer's `SOLANA_RPC_URL`, the same rollup URL. `render.yaml` lists `RPC_URL` and `ER_RPC_URL` (set them in the dashboard) and `ORACLE_QUEUE` for the game service, and `SOLANA_RPC_URL` (the rollup) for the indexer.
+It ends by printing the game's variables (build with `VITE_DEV_MODE=false`; run the server with `RPC_URL`, `ER_RPC_URL`, and `ORACLE_QUEUE` = `5hBR571xnXppuCPveTrctfTU7tJLSN94nq7kv7FRK5Tc`) and the indexer's `SOLANA_RPC_URL`, the same rollup URL. `render.yaml` lists `RPC_URL` and `ER_RPC_URL` (set them in the dashboard) and `ORACLE_QUEUE` for the game service, and `SOLANA_RPC_URL` (the rollup) for the indexer. The game service builds with Node 24 (`.node-version`, and `engines.node` of `>=22.18 <25` in the root `package.json`). Render installs the newest Node that satisfies an open range, which selected 26.12.1. The build command is `npx --yes pnpm@10 install --frozen-lockfile && npx --yes pnpm@10 --filter app build`. `corepack enable` tries to replace `/usr/bin/pnpm` on the Node image, and that path is read-only.
 
 ### Upgrading a live program
 
