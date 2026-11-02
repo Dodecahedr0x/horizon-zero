@@ -1,4 +1,4 @@
-import { useId, useState, type ReactNode } from "react";
+import { useId, useRef, useState, type ReactNode } from "react";
 import type { PlayerBalance, ProtocolConfig } from "./devChain";
 import { parseSol, sol, type Tone } from "./money";
 
@@ -19,6 +19,8 @@ function AmountAction({ label, action, max, busy, disabledReason, placeholder, o
   children?: ReactNode;
 }) {
   const [amount, setAmount] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
   const id = useId();
   const lamports = parseSol(amount);
   const over = lamports !== null && max !== undefined && lamports > max;
@@ -31,7 +33,18 @@ function AmountAction({ label, action, max, busy, disabledReason, placeholder, o
           <span className="select__label">{label}</span>
           <input inputMode="decimal" placeholder={placeholder ?? "0.05"} value={amount} disabled={!!disabledReason} aria-invalid={!!hint} aria-describedby={described} onChange={(event) => setAmount(event.target.value)} />
         </label>
-        <button type="button" className="hz-button" disabled={busy || !!disabledReason || !lamports || over} title={disabledReason} aria-describedby={described} onClick={() => lamports && onSubmit(lamports).then((tone) => tone !== "error" && setAmount(""))}>{action}</button>
+        <button type="button" className="hz-button" disabled={busy || submitting || !!disabledReason || !lamports || over} title={disabledReason} aria-busy={submitting} aria-describedby={described} onClick={async () => {
+          if (!lamports || submittingRef.current) return;
+          submittingRef.current = true;
+          setSubmitting(true);
+          try {
+            const tone = await onSubmit(lamports);
+            if (tone !== "error") setAmount("");
+          } finally {
+            submittingRef.current = false;
+            setSubmitting(false);
+          }
+        }}>{submitting ? `${action}…` : action}</button>
       </div>
       {hint && <p id={`${id}-hint`} className="wallet-action__hint">{hint}</p>}
       {children && <div id={`${id}-note`} className="wallet-action__notes">{children}</div>}

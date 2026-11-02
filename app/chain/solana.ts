@@ -514,7 +514,11 @@ export function createSolanaChain(wallet: Signer, net: SolanaNet): ChainAdapter 
       return me().toBase58();
     },
     async behaviors() {
-      const rows = await read<{ pubkey: string; creator: string; body: number[] }[]>("/behaviors");
+      const accounts = await er.getProgramAccounts(PROGRAM_ID, { filters: [{ dataSize: 119 }] });
+      const rows = accounts.map(({ pubkey, account: { data } }) => ({
+        pubkey: pubkey.toBase58(), creator: new PublicKey(data.subarray(8, 40)).toBase58(),
+        body: [...data.subarray(41, 41 + data[40])],
+      }));
       return rows.map((row) => {
         const elements = parseBehavior(row.body || []) || [];
         return { pubkey: row.pubkey, creator: row.creator, name: nameBehavior(elements), elements };
@@ -522,25 +526,27 @@ export function createSolanaChain(wallet: Signer, net: SolanaNet): ChainAdapter 
     },
     battlegrounds,
     async armies(owner) {
-      const indexed = await read<ArmyRow[]>(`/armies?owner=${new PublicKey(owner).toBase58()}`);
+      const accounts = await er.getProgramAccounts(PROGRAM_ID, {
+        filters: [{ dataSize: 1360 }, { memcmp: { offset: 8, bytes: new PublicKey(owner).toBase58() } }],
+      });
       const known = await battlegrounds();
-      // The indexer learns of a closed army or a new status late; the rollup knows at once.
-      const live = indexed.length ? await er.getMultipleAccountsInfo(indexed.map((row) => new PublicKey(row.pubkey))) : [];
-      return indexed.flatMap((row, i) => {
-        const head = live[i] ? decodeArmyHead(live[i]!.data) : null;
+      return accounts.flatMap(({ pubkey, account: { data } }) => {
+        const head = decodeArmyHead(data);
         if (!head) return [];
         return [{
-          pubkey: row.pubkey,
+          pubkey: pubkey.toBase58(),
           owner: head.owner,
           battleground: head.battleground,
           battlegroundId: known.find((ground) => ground.pubkey === head.battleground)?.battlegroundId ?? 0,
-          race: row.race,
-          index: row.idx,
+          race: data[72],
+          index: data.readUInt32LE(73),
           status: head.status,
-          units: (row.units || []).map((unit) => ({
-            ...unit,
-            elements: unit.elements || parseBehavior(unit.body || []) || [],
-          })),
+          units: Array.from({ length: Math.min(data[77], 10) }, (_, i) => {
+            const at = 78 + i * 128;
+            return { kind: data[at], behavior: new PublicKey(data.subarray(at + 1, at + 33)).toBase58(),
+              col: data[at + 111], row: data[at + 112],
+              elements: parseBehavior([...data.subarray(at + 34, at + 34 + data[at + 33])]) || [] };
+          }),
         }];
       });
     },
@@ -707,15 +713,20 @@ export function createSolanaChain(wallet: Signer, net: SolanaNet): ChainAdapter 
     },
     async matches(owner) {
       const mine = await read<IndexedMatch[]>(`/matches?player=${new PublicKey(owner).toBase58()}&limit=20`);
-      return mine.map(fromIndexer);
+      const live = await er.getProgramAccounts(PROGRAM_ID, { filters: [{ dataSize: 2155 }] });
+      const rows = new Map(mine.map((row) => [row.pubkey, fromIndexer(row)]));
+      for (const { pubkey, account } of live) {
+        const battle = decodeBattle(pubkey, account.data);
+        if (battle && (battle.playerA === owner || battle.playerB === owner)) rows.set(battle.pubkey, battle);
+      }
+      return [...rows.values()];
     },
     async match(pubkey) {
       const key = new PublicKey(pubkey);
       const indexed = await read<IndexedMatch | null>(`/matches/${key.toBase58()}`).catch(() => null);
-      if (indexed) return fromIndexer(indexed);
       // A battle the indexer has not seen yet, still open in the rollup.
       const info = await er.getAccountInfo(key);
-      return info ? decodeBattle(key, info.data) : null;
+      return (info ? decodeBattle(key, info.data) : null) ?? (indexed ? fromIndexer(indexed) : null);
     },
   };
 }
