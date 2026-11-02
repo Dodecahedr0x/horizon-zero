@@ -1,5 +1,7 @@
 # Testing
 
+On Linux CI, the localnet job raises its shell's soft and hard open-file limits to 1,000,000 with `sudo prlimit` before starting the stack. Both validators inherit that limit; the ephemeral validator refuses to initialize its ledger when it cannot obtain it. Startup errors remain visible through `RUST_LOG=error`, and failed jobs print and upload localnet logs for seven days.
+
 Two CI jobs live in `.github/workflows/ci.yml`. Both install Anza `v4.2.1` and Node 24, whose default type stripping lets the tests and scripts import `app/src/codec.ts` directly.
 
 ## Combat, wasm, and LiteSVM
