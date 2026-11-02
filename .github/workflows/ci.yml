@@ -70,6 +70,9 @@ jobs:
           rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal
           cargo build
       - name: Local MagicBlock stack, a VRF-seeded battle, a withdrawal and a fee claim
+        env:
+          # The validator launcher defaults to quiet, hiding startup failures.
+          RUST_LOG: error
         run: |
           pnpm install
           npm install -g @magicblock-labs/ephemeral-validator@0.14.10
