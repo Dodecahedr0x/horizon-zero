@@ -1,6 +1,6 @@
 # Asset studio
 
-The game's Warden portrait uses `assets/units/ashborn/warden/warden.portrait.svg`, containing a transparent full-body raster restored from the cropped approved PNG. It includes the head, boots, and entire shield. The original approved PNG and 3D model remain the studio's source assets. Other game portraits use their approved PNGs. Development and production serve SVG portraits as `image/svg+xml`.
+Approved unit PNGs must show the full character, including the head, feet, and equipment, on a transparent background. The game's shared portrait component fits these images inside their frames with `object-fit: contain`. The Warden's approved PNG was regenerated to restore its cropped head and boots; it uses the same asset path and display rules as every other unit.
 
 `tools/asset-studio` is a local review tool for `assets/`. It is not a Render service. `render.yaml` does not mention it. The process listens on `127.0.0.1` and `PORT` or `4712`. When that address is already serving this studio, a later start logs the URL and waits for a signal. The first process keeps the port. When another program holds the port, this process prints the listen error and exits. It answers 403 to any request whose `Host` is not `127.0.0.1:<port>` or `localhost:<port>`, or that carries an `Origin` other than those two, so another website (or a DNS-rebound name) cannot delete folders, rewrite the catalog, or start paid generations through it. A JSON body over 1 MiB fails with 400.
 

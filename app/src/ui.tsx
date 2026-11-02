@@ -4,8 +4,7 @@ import { BATTLEGROUNDS, raceById, unitSpec } from "./codec";
 export function unitImage(race: number, kind: number) {
   const slug = (raceById(race) || raceById(0))?.slug;
   const name = unitSpec(race, kind)?.name.toLowerCase();
-  const file = slug === "ashborn" && name === "warden" ? "warden.portrait.svg" : `${name}.approved.png`;
-  return slug && name ? `/assets/units/${slug}/${name}/${file}` : "";
+  return slug && name ? `/assets/units/${slug}/${name}/${name}.approved.png` : "";
 }
 
 export function swatch(race: number, kind: number) {

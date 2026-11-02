@@ -36,7 +36,7 @@ export default defineConfig({
           }
           const file = path.resolve(assets, decodeURIComponent((req.url || "/").split("?")[0].slice(1)));
           if (!file.startsWith(assets) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) return next();
-          res.setHeader("Content-Type", file.endsWith(".glb") ? "model/gltf-binary" : file.endsWith(".svg") ? "image/svg+xml" : "application/octet-stream");
+          res.setHeader("Content-Type", file.endsWith(".glb") ? "model/gltf-binary" : "application/octet-stream");
           fs.createReadStream(file).pipe(res);
         });
         // The production server (app/server.js) answers /chain/*; this does the same in dev, so the
