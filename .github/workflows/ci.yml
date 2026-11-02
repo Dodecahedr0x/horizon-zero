@@ -70,7 +70,31 @@ jobs:
           rustup toolchain install "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" --profile minimal
           cargo build
       - name: Local MagicBlock stack, a VRF-seeded battle, a withdrawal and a fee claim
+        env:
+          # The validator launcher defaults to quiet, hiding startup failures.
+          RUST_LOG: error
         run: |
           pnpm install
           npm install -g @magicblock-labs/ephemeral-validator@0.14.10
+          # Both validators require a million open files; hosted runners cap the hard limit at 65536.
+          sudo prlimit --pid "$$" --nofile=1000000:1000000
+          test "$(ulimit -n)" -ge 1000000
           pnpm localnet:check
+      - name: Print localnet diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          shopt -s globstar nullglob
+          for file in target/localnet/**/*.log; do
+            echo "::group::$file"
+            tail -n 200 "$file"
+            echo "::endgroup::"
+          done
+      - name: Upload localnet diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: localnet-diagnostics
+          path: target/localnet/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
