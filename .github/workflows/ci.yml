@@ -76,6 +76,9 @@ jobs:
         run: |
           pnpm install
           npm install -g @magicblock-labs/ephemeral-validator@0.14.10
+          # Both validators require a million open files; hosted runners cap the hard limit at 65536.
+          sudo prlimit --pid "$$" --nofile=1000000:1000000
+          test "$(ulimit -n)" -ge 1000000
           pnpm localnet:check
       - name: Print localnet diagnostics
         if: failure()
