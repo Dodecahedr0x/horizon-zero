@@ -74,3 +74,21 @@ jobs:
           pnpm install
           npm install -g @magicblock-labs/ephemeral-validator@0.14.10
           pnpm localnet:check
+      - name: Print localnet diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          shopt -s globstar nullglob
+          for file in target/localnet/**/*.log; do
+            echo "::group::$file"
+            tail -n 200 "$file"
+            echo "::endgroup::"
+          done
+      - name: Upload localnet diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: localnet-diagnostics
+          path: target/localnet/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
