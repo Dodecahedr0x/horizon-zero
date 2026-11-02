@@ -252,7 +252,7 @@ export function BehaviorList({ behaviors, onNew }: { behaviors: Behavior[]; onNe
   );
 }
 
-export function BehaviorEditor({ elements, onChange, onCreate, disabledReason }: { elements: ElementSpec[]; onChange: (elements: ElementSpec[]) => void; onCreate: () => void; disabledReason?: string }) {
+export function BehaviorEditor({ elements, onChange, onCreate, disabledReason, busy = false }: { elements: ElementSpec[]; onChange: (elements: ElementSpec[]) => void; onCreate: () => void; disabledReason?: string; busy?: boolean }) {
   const [trial, setTrial] = useState(false);
   const valid = elements.length > 0 && !!encodeBehavior(elements);
   return (
@@ -278,7 +278,7 @@ export function BehaviorEditor({ elements, onChange, onCreate, disabledReason }:
       <button type="button" className="hz-button hz-button--block" disabled={!valid} onClick={() => setTrial(true)}>
         <span className="hz-diamond hz-diamond--ember" />Simulate
       </button>
-      <button type="button" className="hz-button hz-button--primary hz-button--block" disabled={!valid || !!disabledReason} title={disabledReason} onClick={onCreate}>Create behavior</button>
+      <button type="button" className="hz-button hz-button--primary hz-button--block" disabled={busy || !valid || !!disabledReason} title={disabledReason} onClick={onCreate}>{busy ? "Processing…" : "Create behavior"}</button>
       {trial && <TrialSheet elements={elements} onClose={() => setTrial(false)} />}
     </section>
   );

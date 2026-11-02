@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { Board, type Piece } from "./board";
 import { BATTLEGROUNDS, CANCEL_AFTER_SECS, RACES, STANDARDS, ZONE_DEPTH, behaviorLabel, cancellable, encodeBehavior, raceById, unitSpec, type ElementSpec } from "./codec";
 import type { Army, Behavior, ChainAdapter, DraftUnit, Match, PlayerBalance, ProtocolConfig } from "./devChain";
@@ -109,7 +109,11 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
   const [sound, setSound] = useState(soundEnabled);
   const [touring, setTouring] = useState(false);
   const [doomed, setDoomed] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [working, setWorking] = useState(false);
+  const [loading, setLoading] = useState(connected);
+  const [progress, setProgress] = useState("");
+  const actionInFlight = useRef(false);
+  const busy = working || loading;
   // The clock the battle log compares open times with, to offer Cancel once a seed is overdue.
   const [now, setNow] = useState(() => Date.now());
   // undefined until the first read; null when the wallet has no Player yet.
@@ -134,23 +138,29 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
   }
 
   // A read started for one wallet or backend must not land after the page has moved to another.
-  const chainNow = useRef(chain);
-  chainNow.current = chain;
+  const chainNow = useRef<ChainAdapter | null>(connected ? chain : null);
+  chainNow.current = connected ? chain : null;
+  const refreshVersion = useRef(0);
 
   async function refresh() {
     const at = chain;
+    const version = ++refreshVersion.current;
+    const current = () => chainNow.current === at && refreshVersion.current === version;
     const me = await chain.owner();
-    if (chainNow.current !== at) return;
+    if (!current()) return;
     setOwner(me);
-    const known = await chain.behaviors();
-    if (chainNow.current !== at) return;
-    setBehaviors(known);
-    setBehaviorKey((current) => current || known[0]?.pubkey || "");
-    const [mine, fought] = await Promise.all([chain.armies(me), chain.matches(me).catch(() => [] as Match[])]);
-    if (chainNow.current !== at) return;
-    setArmies(mine);
-    setMatches(fought);
-    await Promise.all([refreshLocked(), refreshPlayer()]);
+    const results = await Promise.allSettled([
+      chain.behaviors().then((known) => {
+        if (!current()) return;
+        setBehaviors(known);
+        setBehaviorKey((key) => known.some((item) => item.pubkey === key) ? key : known[0]?.pubkey || "");
+      }),
+      chain.armies(me).then((mine) => { if (current()) setArmies(mine); }),
+      chain.matches(me).then((fought) => { if (current()) setMatches(fought); }),
+      refreshLocked(), refreshPlayer(),
+    ]);
+    const failed = results.find((result) => result.status === "rejected");
+    if (current() && failed?.status === "rejected") throw failed.reason;
   }
 
   // A failed read leaves the Player unknown (not "no Player"), so nothing offers to register again.
@@ -182,17 +192,29 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
     setOwner("");
     setPlayer(undefined);
     setConfig(null);
-    if (connected) refresh().catch((err) => chainNow.current === chain && setError(err.message));
+    setBehaviors([]);
+    setBehaviorKey("");
+    setArmies([]);
+    setMatches([]);
+    setLocked({});
+    setArena(null);
+    refreshVersion.current++;
+    let alive = true;
+    setLoading(connected);
+    if (connected) refresh()
+      .catch((err) => alive && chainNow.current === chain && setError(err.message))
+      .finally(() => alive && setLoading(false));
+    return () => { alive = false; };
   }, [connected, chain]);
 
   // Other players lock and match too; keep the counts current while the page is open.
   useEffect(() => {
     if (!connected) return;
     const timer = window.setInterval(() => {
-      if (document.visibilityState === "visible") refreshLocked().catch(() => {});
+      if (document.visibilityState === "visible" && !busy) refresh().catch((err) => chainNow.current === chain && setError(err.message));
     }, 15_000);
     return () => window.clearInterval(timer);
-  }, [connected, chain]);
+  }, [connected, chain, busy]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 15_000);
@@ -229,11 +251,16 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
    * Runs one action, then refreshes. Returns how the action ended; a refresh that fails afterwards
    * does not turn a landed action into a failure.
    */
-  async function run(action: () => Promise<void>): Promise<Tone> {
+  async function run(action: () => Promise<void>, label = "Processing your action…", refreshAfter = true): Promise<Tone> {
+    if (actionInFlight.current || loading) return "error";
+    actionInFlight.current = true;
     setError("");
     setNotice("");
-    setBusy(true);
+    setWorking(true);
+    setProgress(label);
     try {
+      // Allow the loading state to paint before local simulation starts computing.
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
       let tone: Tone = "success";
       try {
         await action();
@@ -242,13 +269,18 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
         if (tone === "error") return tone;
       }
       try {
-        await refresh();
+        if (refreshAfter) {
+          setProgress("Refreshing your armies and balances…");
+          await refresh();
+        }
       } catch {
-        setNotice((current) => (current ? `${current} The balances could not be refreshed.` : "Done; the balances could not be refreshed."));
+        setNotice((current) => (current ? `${current} Some data could not be refreshed; the page will retry.` : "Done; some data could not be refreshed; the page will retry."));
       }
       return tone;
     } finally {
-      setBusy(false);
+      actionInFlight.current = false;
+      setWorking(false);
+      setProgress("");
     }
   }
 
@@ -392,17 +424,14 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
   }
 
   async function watch(item: Match) {
-    setError("");
-    try {
+    await run(async () => {
       const traced = await replay(item);
       openArena({ match: item, mySide: item.playerA === owner ? 0 : 1, lines: traced, simulated: false });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "The replay failed");
-    }
+    }, "Loading battle replay…", false);
   }
 
   async function simulate() {
-    setError("");
+    await run(async () => {
     const body = (key: string) => encodeBehavior(behaviors.find((item) => item.pubkey === key)?.elements ?? []) || [];
     const mine = draft.map((unit) => matchUnit(raceId, unit.kind, body(unit.behavior), unit.col, unit.row));
     const foeRace = RACES[crypto.getRandomValues(new Uint8Array(1))[0] % RACES.length]?.id ?? raceId;
@@ -410,19 +439,20 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
     const seed = randomSeed();
     const result = await simulateTrial({ cols: ground.cols, rows: ground.rows, a: mine, b: foe, seed });
     if (result.error) {
-      setError(result.error);
-      return;
+      throw new Error(result.error);
     }
     const outcome = result.winner === 0 ? 1 : result.winner === 1 ? 2 : 3;
     const simulated = { pubkey: "simulation", unitsA: mine, unitsB: foe, cols: ground.cols, rows: ground.rows, seed, outcome, status: 1, stake: "0" } as unknown as Match;
     play("defend");
     openArena({ match: simulated, mySide: 0, lines: result.lines, simulated: true });
+    }, "Simulating your army…", false);
   }
 
   async function lock(army: Army) {
     await run(async () => {
       // On chain a lock that finds a foe waits for the VRF seed and settles before it returns.
       if (!devMode) setNotice("Locking. If a foe is waiting, the battle waits for its seed and settles; this can take up to a minute.");
+      setProgress("Locking your army · waiting for matchmaking and any battle settlement…");
       const opened = await chain.lock(army);
       if (!opened) {
         setNotice(`Your host waits at the gate of the ${BATTLEGROUNDS[army.battlegroundId]?.name}. The battle opens when a foe locks there.`);
@@ -518,7 +548,20 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
         <span className="mark"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.5 14.5 8 8 14.5 1.5 8Z" /></svg>Horizon Zero</span>
         <nav className="tabs" data-tour="tabs" role="tablist" aria-label="Screens">
           {SCREENS.map((item) => (
-            <button key={item} type="button" role="tab" className="tab" aria-selected={screen === item} onClick={() => { setScreen(item); setForging(false); }}>{item}</button>
+            <button key={item} id={`tab-${item}`} type="button" role="tab" className="tab" aria-selected={screen === item} aria-controls={`screen-${item}`} tabIndex={screen === item ? 0 : -1}
+              onKeyDown={(event) => {
+                const index = SCREENS.indexOf(item);
+                const next = event.key === "ArrowRight" ? SCREENS[(index + 1) % SCREENS.length] : event.key === "ArrowLeft" ? SCREENS[(index + SCREENS.length - 1) % SCREENS.length] : event.key === "Home" ? SCREENS[0] : event.key === "End" ? SCREENS[SCREENS.length - 1] : null;
+                if (!next) return;
+                event.preventDefault();
+                setScreen(next);
+                setForging(false);
+                document.getElementById(`tab-${next}`)?.focus();
+              }}
+              onClick={() => { setScreen(item); setForging(false); }}>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d={item === "battle" ? "m4 3 7 7-3 3-7-7V3h3Zm16 0-7 7 3 3 7-7V3h-3ZM6 12l6 6m-9-3 6 6m9-9-6 6m9-3-6 6" : item === "army" ? "M9 4h6l2 4-5 4-5-4 2-4ZM5 21v-4a7 7 0 0 1 14 0v4M9 21v-5m6 5v-5M3 9h2m14 0h2" : "M5 4h14v16H5V4Zm4 4h6m-6 4h6m-6 4h3"} /></svg>
+              <span>{item}</span>
+            </button>
           ))}
         </nav>
         <div className="masthead__end">
@@ -529,7 +572,20 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
         </div>
       </header>
 
-      <main className="screen">
+      <main className={`screen screen--${screen}`} id={`screen-${screen}`} role="tabpanel" aria-labelledby={`tab-${screen}`}>
+        {!(screen === "battle" && match) && (
+          <header className="screen-intro">
+            <div>
+              <h1>{screen === "battle" ? "Choose your next battle." : screen === "army" ? "Build a host. Make it yours." : "Give every soldier a plan."}</h1>
+              <p>{screen === "battle" ? "Muster your army, lock it into a battleground, and watch your orders unfold." : screen === "army" ? "Choose your soldiers and their orders, then arrange your starting formation." : "Behaviors decide how your soldiers move and fight. Start with a standard, or forge your own."}</p>
+            </div>
+            {screen !== "behaviors" && <span className="screen-intro__ground">{ground.name}<small>{ground.budget} budget · {ground.stake / 1e9} SOL stake</small></span>}
+          </header>
+        )}
+        <div className="activity" role="status" aria-live="polite" aria-atomic="true" hidden={!loading && !working}>
+          <span className="activity__spinner" aria-hidden="true" />
+          <span>{loading ? "Loading your armies, behaviors and balances…" : progress}</span>
+        </div>
         {error && <p className="hz-error" role="alert">{error}</p>}
         {notice && !error && <p className="notice" role="status"><span className="hz-diamond" />{notice}</p>}
 
@@ -593,88 +649,96 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
               </section>
             )}
 
-            <Section title="Latest battles" tour="log" aside={<span className="panel__count">{matches.length}</span>}>
-              <ol className="log" aria-label="Latest battles">
-                {matches.map((item) => {
-                  const side = item.playerA === owner ? 0 : 1;
-                  const outcome = outcomeFor(item, side);
-                  const mine = side === 0 ? item.unitsA : item.unitsB;
-                  const theirs = side === 0 ? item.unitsB : item.unitsA;
-                  return (
-                    <li key={item.pubkey} className={`log__row log__row--${outcome}`}>
-                      <span className="log__outcome">{item.status === 2 ? "Ready to settle" : OUTCOME_LABEL[outcome]}</span>
-                      <span className="log__ground">{groundOf(item)?.name || `${item.cols}×${item.rows}`}</span>
-                      <span className="log__armies">
-                        <span className="log__side">{mine.map((unit, index) => <UnitArt key={index} race={unit.race || 0} kind={unit.kind} />)}</span>
-                        <span className="log__vs">vs</span>
-                        <span className="log__side">{theirs.map((unit, index) => <UnitArt key={index} race={unit.race || 0} kind={unit.kind} />)}</span>
-                      </span>
-                      {item.status === 2
-                        ? <button type="button" className="hz-button mini" disabled={busy} title="The seed has landed; settle the battle to pay the stakes" onClick={() => run(() => chain.settle(item))}>Settle</button>
-                        : !devMode && cancellable(item, Math.floor(now / 1000))
-                          ? <button type="button" className="hz-button mini" disabled={busy} title={CANCEL_TITLE} aria-label={`Cancel: ${CANCEL_TITLE}`} onClick={() => run(async () => { await chain.cancel(item); setNotice("The battle is cancelled. Both stakes are back in their budgets."); })}>Cancel</button>
-                          : <button type="button" className="hz-button mini quiet" disabled={outcome === "pending" || outcome === "cancelled"} onClick={() => watch(item)}>Watch</button>}
-                    </li>
-                  );
-                })}
-                {!matches.length && <li className="log__empty">No battle yet. Lock a full army below; the fight opens when a foe locks on the same battleground.</li>}
-              </ol>
-            </Section>
-
-            {player === undefined && connected && (
-              <Section title="Wallet">
-                <p className="panel__note">Loading your player.</p>
-              </Section>
-            )}
-            {player === null && (
-              <Section title="Create your player">
-                <CreatePlayer busy={busy} fees={!devMode} onRegister={(lamports) => run(async () => { await chain.register(lamports); setNotice("Your player is ready. Fund your budget to lock an army."); })} />
-              </Section>
-            )}
-            {player && (
-              <Section title="Wallet">
-                <WalletPanel
-                  player={player}
-                  stake={Number(ground.stake)}
-                  groundName={ground.name}
-                  busy={busy}
-                  fees={!devMode}
-                  onTopUp={(lamports) => run(() => chain.topUp(lamports))}
-                  onFund={(lamports) => run(() => chain.fundBudget(lamports))}
-                  onWithdraw={(lamports) => run(async () => { await chain.withdraw(lamports); setNotice("The withdrawal has been paid to your wallet."); })}
-                  onRelease={() => release("player")}
-                  onSegregate={(segregate) => run(() => chain.setSegregation(segregate))}
-                />
-              </Section>
-            )}
-
-            <Section
-              title="Your armies"
-              tour="armies"
-              aside={<button type="button" className="hz-button hz-button--primary" data-tour="create" onClick={() => { setScreen("army"); setSelected(null); }}>Create an army</button>}
-            >
-              <GroundPicker value={battlegroundId} onChange={pickBattleground} counts={readyCounts} locked={locked} />
-              <div className="armies">
-                {ready.map((army) => (
-                  <ArmyCard
-                    key={army.pubkey}
-                    army={army}
-                    budget={ground.budget}
-                    behaviors={behaviors}
-                    actions={(
-                      <>
-                        {army.status === 1
-                          ? <button type="button" className="hz-button" disabled={busy} onClick={() => run(() => chain.unlock(army))}>Unlock</button>
-                          : <button type="button" className="hz-button hz-button--primary" disabled={busy || army.status !== 0 || !canStake} title={needsPlayer ?? (!canStake ? "Your budget must cover one stake" : undefined)} onClick={() => lock(army)}><span className="hz-diamond hz-diamond--ember" />Lock · {ground.stake / 1e9} SOL</button>}
-                        {deleteControls(army)}
-                      </>
-                    )}
-                  />
-                ))}
-                {!ready.length && <p className="empty">No full army for the {ground.name} yet. An army is ready once its budget is spent or nothing more fits.</p>}
+            <div className="battle-layout">
+              <div className="battle-roster">
+                <Section
+                  title="Your armies"
+                  tour="armies"
+                  aside={<button type="button" className="hz-button hz-button--primary" data-tour="create" onClick={() => { setScreen("army"); setSelected(null); }}>Create an army</button>}
+                >
+                  <GroundPicker value={battlegroundId} onChange={pickBattleground} counts={readyCounts} locked={locked} />
+                  <div className="armies">
+                    {ready.map((army) => (
+                      <ArmyCard
+                        key={army.pubkey}
+                        army={army}
+                        budget={ground.budget}
+                        behaviors={behaviors}
+                        actions={(
+                          <>
+                            {army.status === 1
+                              ? <button type="button" className="hz-button" disabled={busy} onClick={() => run(() => chain.unlock(army), "Unlocking your army…")}>Unlock</button>
+                              : <button type="button" className="hz-button hz-button--primary" disabled={busy || army.status !== 0 || !canStake} title={needsPlayer ?? (!canStake ? "Your budget must cover one stake" : undefined)} onClick={() => lock(army)}><span className="hz-diamond hz-diamond--ember" />Lock · {ground.stake / 1e9} SOL</button>}
+                            {deleteControls(army)}
+                          </>
+                        )}
+                      />
+                    ))}
+                    {!ready.length && <p className="empty">No full army for the {ground.name} yet. An army is ready once its budget is spent or nothing more fits.</p>}
+                  </div>
+                  {unfinished > 0 && <p className="panel__note">{unfinished} unfinished {unfinished === 1 ? "army waits" : "armies wait"} in the Army tab.</p>}
+                </Section>
               </div>
-              {unfinished > 0 && <p className="panel__note">{unfinished} unfinished {unfinished === 1 ? "army waits" : "armies wait"} in the Army tab.</p>}
-            </Section>
+              <aside className="battle-supplies" aria-label="Player and wallet">
+
+                {player === undefined && connected && (
+                  <Section title="Wallet">
+                    <p className="panel__note">Loading your player.</p>
+                  </Section>
+                )}
+                {player === null && (
+                  <Section title="Create your player">
+                    <CreatePlayer busy={busy} fees={!devMode} onRegister={(lamports) => run(async () => { await chain.register(lamports); setNotice("Your player is ready. Fund your budget to lock an army."); }, "Creating your player…")} />
+                  </Section>
+                )}
+                {player && (
+                  <Section title="Wallet">
+                    <WalletPanel
+                      player={player}
+                      stake={Number(ground.stake)}
+                      groundName={ground.name}
+                      busy={busy}
+                      fees={!devMode}
+                      onTopUp={(lamports) => run(() => chain.topUp(lamports), "Topping up your balance…")}
+                      onFund={(lamports) => run(() => chain.fundBudget(lamports), "Funding your stake budget…")}
+                      onWithdraw={(lamports) => run(async () => { await chain.withdraw(lamports); setNotice("The withdrawal has been paid to your wallet."); }, "Withdrawing to your wallet…")}
+                      onRelease={() => release("player")}
+                      onSegregate={(segregate) => run(() => chain.setSegregation(segregate), "Updating winnings preferences…")}
+                    />
+                  </Section>
+                )}
+
+              </aside>
+              <div className="battle-history">
+                <Section title="Latest battles" tour="log" aside={<span className="panel__count">{matches.length}</span>}>
+                  <ol className="log" aria-label="Latest battles">
+                    {matches.map((item) => {
+                      const side = item.playerA === owner ? 0 : 1;
+                      const outcome = outcomeFor(item, side);
+                      const mine = side === 0 ? item.unitsA : item.unitsB;
+                      const theirs = side === 0 ? item.unitsB : item.unitsA;
+                      return (
+                        <li key={item.pubkey} className={`log__row log__row--${outcome}`}>
+                          <span className="log__outcome">{item.status === 2 ? "Ready to settle" : OUTCOME_LABEL[outcome]}</span>
+                          <span className="log__ground">{groundOf(item)?.name || `${item.cols}×${item.rows}`}</span>
+                          <span className="log__armies">
+                            <span className="log__side">{mine.map((unit, index) => <UnitArt key={index} race={unit.race || 0} kind={unit.kind} />)}</span>
+                            <span className="log__vs">vs</span>
+                            <span className="log__side">{theirs.map((unit, index) => <UnitArt key={index} race={unit.race || 0} kind={unit.kind} />)}</span>
+                          </span>
+                          {item.status === 2
+                            ? <button type="button" className="hz-button mini" disabled={busy} title="The seed has landed; settle the battle to pay the stakes" onClick={() => run(() => chain.settle(item), "Settling the battle…")}>Settle</button>
+                            : !devMode && cancellable(item, Math.floor(now / 1000))
+                              ? <button type="button" className="hz-button mini" disabled={busy} title={CANCEL_TITLE} aria-label={`Cancel: ${CANCEL_TITLE}`} onClick={() => run(async () => { await chain.cancel(item); setNotice("The battle is cancelled. Both stakes are back in their budgets."); }, "Cancelling the battle…")}>Cancel</button>
+                              : <button type="button" className="hz-button mini quiet" disabled={busy || outcome === "pending" || outcome === "cancelled"} onClick={() => watch(item)}>Watch</button>}
+                        </li>
+                      );
+                    })}
+                    {!matches.length && <li className="log__empty">No battle yet. Lock a full army from Your armies; the fight opens when a foe locks on the same battleground.</li>}
+                  </ol>
+                </Section>
+              </div>
+            </div>
 
             {config && owner && config.admin === owner && (
               <Section title="Protocol fees">
@@ -682,8 +746,8 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
                   config={config}
                   busy={busy}
                   treasury={!devMode}
-                  onSetFee={(bps) => run(async () => { await chain.setFee(bps); setNotice(`The fee is now ${bps} bps for battles opened from here on.`); })}
-                  onClaim={() => run(async () => { await chain.claimFees(); setNotice("The fees have been paid to the admin wallet."); })}
+                  onSetFee={(bps) => run(async () => { await chain.setFee(bps); setNotice(`The fee is now ${bps} bps for battles opened from here on.`); }, "Updating the protocol fee…")}
+                  onClaim={() => run(async () => { await chain.claimFees(); setNotice("The fees have been paid to the admin wallet."); }, "Claiming protocol fees…")}
                   onRelease={() => release("treasury")}
                 />
               </Section>
@@ -693,102 +757,120 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
 
         {screen === "army" && (
           <>
-            <Section title="Muster" tour="muster" aside={<span className={cost > ground.budget ? "tally over" : full ? "tally is-full" : "tally"}>{cost}<small> / {ground.budget}</small></span>}>
+            <Section title="Army budget" tour="muster" aside={<span className={cost > ground.budget ? "tally over" : full ? "tally is-full" : "tally"}>{cost}<small> / {ground.budget}</small></span>}>
               <GroundPicker value={battlegroundId} onChange={pickBattleground} locked={locked} />
               <div className="budget" role="meter" aria-label="Cost against budget" aria-valuemin={0} aria-valuemax={ground.budget} aria-valuenow={cost} style={{ gridTemplateColumns: `repeat(${ground.budget}, minmax(0, 1fr))` }}>
                 {Array.from({ length: ground.budget }, (_, index) => <i key={index} className={index < cost ? "on" : ""} />)}
               </div>
-              <div className="fields">
-                <Select label="Race" value={raceId} options={RACES.map((item) => ({ value: item.id, label: item.name }))} onChange={pickRace} />
-                <Select label={selectedUnit ? "Behavior of the selected soldier" : "Behavior"} value={behaviorKey} options={behaviorOptions} onChange={pickBehavior} placeholder="Forge a behavior first" />
-              </div>
-              <p className="caption">{selectedUnit ? "Change the selected soldier" : "Pick a soldier"}</p>
-              <div className="tray" role="group" aria-label="Soldier">
-                {kinds.map((item) => {
-                  const base = selectedUnit ? cost - (unitSpec(raceId, selectedUnit.kind)?.cost || 0) : cost;
-                  return (
-                    <button
-                      key={item.id}
-                      type="button"
-                      className="pick"
-                      style={swatch(raceId, item.id)}
-                      aria-pressed={item.id === kind}
-                      aria-label={`${item.name}, cost ${item.cost}, ${item.hp} HP, attack ${item.atk}, range ${item.range}, speed ${item.speed}`}
-                      disabled={base + item.cost > ground.budget && item.id !== kind}
-                      onClick={() => pickKind(item.id)}
-                    >
-                      <UnitArt race={raceId} kind={item.id} className="pick__art" />
-                      <Gem value={item.cost} />
-                      <span className="pick__name">{item.name}</span>
-                      <span className="pick__stat">HP {item.hp} · Atk {item.atk} · Rng {item.range} · Spd {item.speed}</span>
-                    </button>
-                  );
-                })}
-              </div>
-              <p className="panel__note">Your zone is the back two rows of the {ground.name}. Tap an empty tile to place the soldier. Drag a placed soldier to another tile to move it, or onto another soldier to swap them. Tap a placed soldier to change its type or behavior.</p>
-              <div className="zone" style={{ gridTemplateColumns: `repeat(${ground.cols}, minmax(0, 1fr))` }} data-zone={`${ground.cols}x${ZONE_DEPTH}`}>
-                {Array.from({ length: ZONE_DEPTH }, (_, row) => Array.from({ length: ground.cols }, (_, col) => {
-                  const index = draft.findIndex((unit) => unit.col === col && unit.row === row);
-                  const unit = index === -1 ? null : draft[index];
-                  const classes = ["tile"];
-                  if (unit) classes.push("filled");
-                  if (index === selected) classes.push("selected");
-                  else if (!unit && selected !== null) classes.push("target");
-                  if (drag && drag.index === index) classes.push("dragging");
-                  if (drag && drag.over?.col === col && drag.over?.row === row && drag.index !== index) classes.push("drop");
-                  return (
-                    <button
-                      key={`${col}-${row}`}
-                      type="button"
-                      className={classes.join(" ")}
-                      style={unit ? swatch(raceId, unit.kind) : undefined}
-                      data-col={col}
-                      data-row={row}
-                      aria-pressed={unit ? index === selected : undefined}
-                      aria-label={unit ? `${unitSpec(raceId, unit.kind)?.name} at ${col},${row}` : `zone ${col},${row}`}
-                      onClick={() => place(col, row)}
-                      onPointerDown={unit ? (event) => startDrag(event, index) : undefined}
-                      onPointerMove={unit ? moveDrag : undefined}
-                      onPointerUp={unit ? endDrag : undefined}
-                      onPointerCancel={unit ? endDrag : undefined}
-                    >
-                      {unit && <UnitArt race={raceId} kind={unit.kind} />}
-                    </button>
-                  );
-                }))}
-              </div>
-              {drag && draft[drag.index] && (
-                <div className="drag-ghost" style={{ left: drag.x, top: drag.y, ...swatch(raceId, draft[drag.index].kind) }} aria-hidden="true">
-                  <UnitArt race={raceId} kind={draft[drag.index].kind} />
-                </div>
-              )}
-              {selectedUnit && selected !== null && (
-                <div className="editing" role="status">
-                  <UnitArt race={raceId} kind={selectedUnit.kind} />
-                  <p><strong>{unitSpec(raceId, selectedUnit.kind)?.name}</strong> at {selectedUnit.col},{selectedUnit.row} follows <em>{behaviorName(behaviors, selectedUnit.behavior)}</em>. Pick another soldier or behavior above, or tap or drag to an empty tile to move it.</p>
-                  <div className="editing__actions">
-                    <button type="button" className="hz-button mini quiet" onClick={() => removeUnit(selected)}>Remove</button>
-                    <button type="button" className="hz-button mini" onClick={() => setSelected(null)}>Done</button>
+              <div className="muster-workspace">
+                <div className="muster-catalog">
+                  <div className="fields">
+                    <Select label="Race" value={raceId} options={RACES.map((item) => ({ value: item.id, label: item.name }))} onChange={pickRace} />
+                    <Select label={selectedUnit ? "Behavior of the selected soldier" : "Behavior"} value={behaviorKey} options={behaviorOptions} onChange={pickBehavior} placeholder="Forge a behavior first" />
+                  </div>
+                  <p className="caption">{selectedUnit ? "Change the selected soldier" : "Pick a soldier"}</p>
+                  <div className="tray" role="group" aria-label="Soldier">
+                    {kinds.map((item) => {
+                      const base = selectedUnit ? cost - (unitSpec(raceId, selectedUnit.kind)?.cost || 0) : cost;
+                      return (
+                        <button
+                          key={item.id}
+                          type="button"
+                          className="pick"
+                          style={swatch(raceId, item.id)}
+                          aria-pressed={item.id === kind}
+                          aria-label={`${item.name}, cost ${item.cost}, ${item.hp} HP, attack ${item.atk}, range ${item.range}, speed ${item.speed}`}
+                          disabled={base + item.cost > ground.budget && item.id !== kind}
+                          onClick={() => pickKind(item.id)}
+                        >
+                          <UnitArt race={raceId} kind={item.id} className="pick__art" />
+                          <Gem value={item.cost} />
+                          <span className="pick__name">{item.name}</span>
+                          <span className="pick__stats">
+                            <span><small>HP</small>{item.hp}</span><span><small>ATK</small>{item.atk}</span><span><small>RNG</small>{item.range}</span><span><small>SPD</small>{item.speed}</span>
+                          </span>
+                        </button>
+                      );
+                    })}
                   </div>
                 </div>
-              )}
-              <ul className="draft">
-                {draft.map((unit, index) => (
-                  <li key={`${unit.col}-${unit.row}`}>
-                    <button type="button" className={selected === index ? "draft__row is-selected" : "draft__row"} aria-pressed={selected === index} onClick={() => selectUnit(selected === index ? null : index)}>
-                      <UnitArt race={raceId} kind={unit.kind} />
-                      <span className="draft__name">{unitSpec(raceId, unit.kind)?.name}<small>{behaviorName(behaviors, unit.behavior)} · tile {unit.col},{unit.row}</small></span>
-                      <Gem value={unitSpec(raceId, unit.kind)?.cost || 0} />
-                    </button>
-                  </li>
-                ))}
-              </ul>
-              <p className={full ? "muster-hint is-full" : "muster-hint"}>
-                {!draft.length ? `Spend the ${ground.budget} budget to field an army.` : full ? "The army is full and ready to save." : `${ground.budget - cost} budget left. Keep adding soldiers until nothing more fits (the cheapest costs ${cheapest}).`}
-              </p>
-              <div className="muster-actions">
-                <button type="button" className="hz-button" data-tour="simulate" disabled={!draft.length || busy} onClick={() => simulate()}><span className="hz-diamond hz-diamond--ember" />Simulate against a random army</button>
-                <button type="button" className="hz-button hz-button--primary" disabled={!full || busy || !!needsPlayer} title={needsPlayer} onClick={() => run(async () => { await chain.createArmy(battlegroundId, draft, raceId); setDraft([]); setSelected(null); setNotice(`The host is mustered for the ${ground.name}. Lock it from the Battle tab.`); })}>Save army</button>
+                <div className="muster-formation">
+                  <div className="formation-heading">
+                    <h3>Starting formation</h3>
+                    <span>{draft.length} / {MAX_UNITS} soldiers</span>
+                  </div>
+                  <p className="panel__note">{selectedUnit ? "Choose an empty tile to move this soldier, or change its type and behavior in the soldier controls." : full ? "Your formation is full. Select a soldier to adjust its position or orders." : <><strong>{unitSpec(raceId, kind)?.name}</strong> selected. Choose an empty tile to place it.</>}</p>
+                  <div className="formation-field">
+                    <span className="formation-label">Back row</span>
+                    <div className="zone" style={{ gridTemplateColumns: `repeat(${ground.cols}, minmax(0, 1fr))`, "--zone-cols": ground.cols } as CSSProperties} data-zone={`${ground.cols}x${ZONE_DEPTH}`}>
+                      {Array.from({ length: ZONE_DEPTH }, (_, row) => Array.from({ length: ground.cols }, (_, col) => {
+                        const index = draft.findIndex((unit) => unit.col === col && unit.row === row);
+                        const unit = index === -1 ? null : draft[index];
+                        const classes = ["tile"];
+                        if (unit) classes.push("filled");
+                        if (index === selected) classes.push("selected");
+                        else if (!unit && selected !== null) classes.push("target");
+                        if (drag && drag.index === index) classes.push("dragging");
+                        if (drag && drag.over?.col === col && drag.over?.row === row && drag.index !== index) classes.push("drop");
+                        return (
+                          <button
+                            key={`${col}-${row}`}
+                            type="button"
+                            className={classes.join(" ")}
+                            style={unit ? swatch(raceId, unit.kind) : undefined}
+                            data-col={col}
+                            data-row={row}
+                            aria-pressed={unit ? index === selected : undefined}
+                            aria-label={unit ? `${unitSpec(raceId, unit.kind)?.name} at ${col},${row}` : `zone ${col},${row}`}
+                            onClick={() => place(col, row)}
+                            onPointerDown={unit ? (event) => startDrag(event, index) : undefined}
+                            onPointerMove={unit ? moveDrag : undefined}
+                            onPointerUp={unit ? endDrag : undefined}
+                            onPointerCancel={unit ? endDrag : undefined}
+                          >
+                            {unit && <UnitArt race={raceId} kind={unit.kind} />}
+                          </button>
+                        );
+                      }))}
+                    </div>
+                    <span className="formation-label formation-label--front">Front row · toward the foe <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v11m-4-4 4 4 4-4" /></svg></span>
+                  </div>
+                  <p className="formation-help">Drag to move or swap soldiers. Select a soldier to edit its orders.</p>
+                  {drag && draft[drag.index] && (
+                    <div className="drag-ghost" style={{ left: drag.x, top: drag.y, ...swatch(raceId, draft[drag.index].kind) }} aria-hidden="true">
+                      <UnitArt race={raceId} kind={draft[drag.index].kind} />
+                    </div>
+                  )}
+                  {selectedUnit && selected !== null && (
+                    <div className="editing" role="status">
+                      <UnitArt race={raceId} kind={selectedUnit.kind} />
+                      <p><strong>{unitSpec(raceId, selectedUnit.kind)?.name}</strong> at {selectedUnit.col},{selectedUnit.row} follows <em>{behaviorName(behaviors, selectedUnit.behavior)}</em>. Pick another soldier or behavior above, or tap or drag to an empty tile to move it.</p>
+                      <div className="editing__actions">
+                        <button type="button" className="hz-button mini quiet" onClick={() => removeUnit(selected)}>Remove</button>
+                        <button type="button" className="hz-button mini" onClick={() => setSelected(null)}>Done</button>
+                      </div>
+                    </div>
+                  )}
+                  <ul className="draft">
+                    {draft.map((unit, index) => (
+                      <li key={`${unit.col}-${unit.row}`}>
+                        <button type="button" className={selected === index ? "draft__row is-selected" : "draft__row"} aria-pressed={selected === index} onClick={() => selectUnit(selected === index ? null : index)}>
+                          <UnitArt race={raceId} kind={unit.kind} />
+                          <span className="draft__name">{unitSpec(raceId, unit.kind)?.name}<small>{behaviorName(behaviors, unit.behavior)} · tile {unit.col},{unit.row}</small></span>
+                          <Gem value={unitSpec(raceId, unit.kind)?.cost || 0} />
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                  <p className={full ? "muster-hint is-full" : "muster-hint"}>
+                    {!draft.length ? `Spend the ${ground.budget} budget to field an army.` : full ? "The army is full and ready to save." : `${ground.budget - cost} budget left. Keep adding soldiers until nothing more fits (the cheapest costs ${cheapest}).`}
+                  </p>
+                  {needsPlayer && <p className="muster-account-note">{player === null ? <>You can simulate without a player. To save your army, <button type="button" onClick={() => setScreen("battle")}>create your player on the Battle tab</button>.</> : "Loading your player before you can save. You can still simulate your army."}</p>}
+                  <div className="muster-actions">
+                    <button type="button" className="hz-button" data-tour="simulate" disabled={!draft.length || busy} onClick={() => simulate()}><span className="hz-diamond hz-diamond--ember" />{working && progress === "Simulating your army…" ? "Simulating…" : "Simulate army"}</button>
+                    <button type="button" className="hz-button hz-button--primary" disabled={!full || busy || !!needsPlayer} title={needsPlayer ?? (!full ? "Fill the army budget or add soldiers until nothing more fits" : undefined)} onClick={() => run(async () => { await chain.createArmy(battlegroundId, draft, raceId); setDraft([]); setSelected(null); setNotice(`The host is mustered for the ${ground.name}. Lock it from the Battle tab.`); }, "Saving your army…")}>{working && progress === "Saving your army…" ? "Saving army…" : "Save army"}</button>
+                  </div>
+                </div>
               </div>
             </Section>
 
@@ -824,9 +906,10 @@ export function App({ chain, connected, wallet, identity }: { chain: ChainAdapte
           <Section title="New behavior" aside={<button type="button" className="hz-button mini quiet" onClick={() => setForging(false)}>All behaviors</button>}>
             <BehaviorEditor
               elements={draftElements}
+              busy={busy}
               disabledReason={needsPlayer}
               onChange={setDraftElements}
-              onCreate={() => run(() => chain.createBehavior(draftElements)).then((tone) => {
+              onCreate={() => run(() => chain.createBehavior(draftElements), "Saving your behavior…").then((tone) => {
                 if (tone !== "success") return;
                 setForging(false);
                 setNotice("The behavior is forged.");
